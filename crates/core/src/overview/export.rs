@@ -339,51 +339,67 @@ impl std::str::FromStr for SizeValve {
     }
 }
 
-/// How far the merge valve's threshold reaches past the tile it fits
-/// (#768). Applies only with [`SizeValve::Merge`] and a size cap.
+/// How far the size valve's threshold reaches past the tile it fits (#768).
 ///
-/// DIVERGENCE FROM TIPPECANOE: tippecanoe fits each tile alone, so the
-/// merge density can jump at a tile edge where one tile needed merging and
-/// its neighbour did not. [`MergeScope::Smooth`] predicts each tile's need
-/// from the export scan and starts the eight tiles around a merged one
-/// from half its threshold, so the density steps down over a tile
-/// instead. [`MergeScope::Tile`] is tippecanoe's behaviour.
+/// Applies with a size cap: to the merge valve's merge threshold
+/// ([`SizeValve::Merge`]) and to the gap threshold that thins point tiles
+/// under [`SizeValve::Drop`].
+///
+/// DIVERGENCE FROM TIPPECANOE: tippecanoe's `--drop-densest-as-needed` and
+/// `--coalesce-densest-as-needed` keep one gap threshold per zoom: a tile
+/// too big raises it, and the zoom is rebuilt at the largest any tile
+/// needed (`tile.cpp`, `traverse_zooms`), so sparse tiles beside a dense
+/// one are thinned too. [`ValveScope::Zoom`] is that threshold, predicted
+/// from the export scan, in one pass. [`ValveScope::Tile`] fits each tile
+/// alone, as tylertoo did before #768, so the density can jump at a tile
+/// edge where one tile needed thinning and its neighbour did not.
+/// [`ValveScope::Smooth`] predicts each tile's need and starts the tiles
+/// around it from half that threshold, so the density steps down over a
+/// tile and the rest of the zoom keeps its features.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
-pub enum MergeScope {
-    /// Neighbours of a tile that merges start from a fading floor of its
-    /// predicted merge threshold (the default).
+pub enum ValveScope {
+    /// The default. Under `merge`, the eight tiles around a tile predicted
+    /// over its cap start from a fading floor of its merge threshold. Under
+    /// `drop`, a point tile predicted over its cap first drops the points
+    /// closer than its own predicted gap threshold, or than half an over-cap
+    /// neighbour's, whichever is larger; a point tile that fits keeps all.
     #[default]
     Smooth,
-    /// Each tile merges only as much as it needs on its own.
+    /// Each tile is thinned only as much as it needs on its own.
     Tile,
+    /// Each tile starts from the largest threshold predicted at its zoom.
+    /// Not shard-invariant, so refused with `--tile-range`.
+    Zoom,
 }
 
-impl MergeScope {
+impl ValveScope {
     /// The value as the CLI spells it.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Smooth => "smooth",
             Self::Tile => "tile",
+            Self::Zoom => "zoom",
         }
     }
 }
 
-impl std::fmt::Display for MergeScope {
+impl std::fmt::Display for ValveScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-impl std::str::FromStr for MergeScope {
+impl std::str::FromStr for ValveScope {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "smooth" => Ok(Self::Smooth),
             "tile" => Ok(Self::Tile),
+            "zoom" => Ok(Self::Zoom),
             other => Err(format!(
-                "unknown merge scope {other:?}: expected smooth or tile"
+                "unknown valve scope {other:?}: expected smooth, tile or zoom"
             )),
         }
     }
@@ -458,16 +474,16 @@ pub struct ExportOptions {
     ))]
     #[cfg_attr(feature = "cli", arg(help = "How to reduce a tile over its cap: `merge` merges dense lines and polygons, drops singles, halves the extent down to 512, then drops whole features if needed. Merges keep the target's attributes and are never split into their sources. In a tile of lines or polygons, only a lone feature still over the cap at the extent floor is written over it, with a warning. `drop` removes features and keeps each survivor's attributes. Point tiles use dropping in both modes", long_help = None))]
     pub size_valve: SizeValve,
-    /// How far `merge` reaches past the tile it fits (#768). Default
-    /// [`MergeScope::Smooth`].
+    /// How far the size valve's threshold reaches past the tile it fits
+    /// (#768). Default [`ValveScope::Smooth`].
     #[serde(with = "super::config::spelled")]
     #[cfg_attr(feature = "cli", arg(
         long,
-        value_name = "smooth|tile",
-        default_value_t = ExportOptions::default().merge_scope
+        value_name = "smooth|tile|zoom",
+        default_value_t = ExportOptions::default().valve_scope
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "How far `--size-valve merge` reaches: `smooth` predicts each tile's merge threshold from the export scan and starts the tiles around a merging tile from a threshold that fades over the next tile, so merge density steps down gradually instead of at a tile edge. `tile` merges each tile only as much as it needs on its own, as tippecanoe does", long_help = None))]
-    pub merge_scope: MergeScope,
+    #[cfg_attr(feature = "cli", arg(help = "How far the size valve's threshold reaches past the tile it fits: `smooth` predicts each tile's threshold from the export scan. Under `--size-valve merge` the tiles around a merging tile start from a threshold that fades over the next tile; under `--size-valve drop` a point tile over its cap drops its closest points down to its own predicted threshold or half an over-cap neighbour's. Density then steps down over a tile instead of at its edge. `tile` thins each tile only as much as it needs on its own. `zoom` starts every tile from the largest threshold predicted at its zoom, like tippecanoe's one threshold per zoom; not with --tile-range", long_help = None))]
+    pub valve_scope: ValveScope,
     /// Tile encoding, MVT by default. Each finished MVT tile is converted
     /// to MLT with mlt-core before gzip and both size caps, so the caps
     /// measure MLT bytes. MLT uses PMTiles tile type 6 and metadata format
@@ -747,7 +763,7 @@ with_setters!(ExportOptions {
     with_tile_size_limit => tile_size_limit: Option<usize>,
     with_compressed_tile_size_limit => compressed_tile_size_limit: Option<usize>,
     with_size_valve => size_valve: SizeValve,
-    with_merge_scope => merge_scope: MergeScope,
+    with_valve_scope => valve_scope: ValveScope,
     with_tile_format => tile_format: TileFormat,
     with_mlt_profile => mlt_profile: MltProfile,
     with_coverage_fill => coverage_fill: bool,
@@ -776,7 +792,7 @@ impl Default for ExportOptions {
             tile_size_limit: Some(DEFAULT_TILE_SIZE_LIMIT),
             compressed_tile_size_limit: Some(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT),
             size_valve: SizeValve::Merge,
-            merge_scope: MergeScope::Smooth,
+            valve_scope: ValveScope::Smooth,
             tile_format: TileFormat::Mvt,
             mlt_profile: MltProfile::Web,
             coverage_fill: false,
@@ -903,6 +919,15 @@ impl ExportOptions {
             return Err(ConfigError::TileBufferTooWide {
                 buffer: self.tile_buffer,
                 max: MAX_TILE_BUFFER_PX,
+            });
+        }
+        if self.valve_scope == ValveScope::Zoom && self.tile_range.is_some() {
+            // A zoom's largest need comes from tiles a shard never reads.
+            return Err(ConfigError::InvalidSpec {
+                option: "--valve-scope / valve_scope",
+                message: "--valve-scope zoom takes each zoom's largest predicted need over the \
+                          whole input, which a shard (--tile-range) cannot see; use smooth or tile"
+                    .into(),
             });
         }
         // #427: fail fast on a bad spill dir, the convert side's rule.
@@ -2829,9 +2854,9 @@ fn export_pmtiles_validated(
             variable_depth::VdScan::new(&meta, reader.geo_metadata_json(), level_zooms.clone())
         })
         .transpose()?;
-    // #768: the predictor's share of the scan, for `--merge-scope smooth`.
-    let mut predict = (options.merge_scope == MergeScope::Smooth && valve_merges(options))
-        .then(|| valve_predict::Scan::new(num_levels));
+    // #768: the predictor's share of the scan, for `--valve-scope smooth`
+    // and `zoom`.
+    let mut predict = valve_predicts(options).then(|| valve_predict::Scan::new(num_levels));
     let mut scans = scan_all_levels(
         &reader,
         BandRead {
@@ -2846,7 +2871,7 @@ fn export_pmtiles_validated(
         predict.as_mut(),
         diagnostics,
     )?;
-    // #768: the merge floors, from the whole scan (before a shard restricts
+    // #768: the valve floors, from the whole scan (before a shard restricts
     // it). Each tile's need comes from its own members alone, so a shard,
     // which holds every row of the tiles in its range and of their
     // neighbours (`shard::SHARD_READ_MARGIN_TILES`), predicts the floors the
@@ -2863,7 +2888,7 @@ fn export_pmtiles_validated(
                 &p,
             )?
         }
-        None => valve_predict::MergeFloors::new(),
+        None => valve_predict::ValveFloors::default(),
     };
 
     // #498: a sharded build's export owns a slice of the tile space, not all
@@ -3749,16 +3774,16 @@ fn resolve_export_columns(
     })
 }
 
-/// #768 `--merge-scope smooth`: each tile's predicted need, priced by real
-/// encodes of samples of its own members, and the floors they put on their
-/// neighbours ([`valve_predict::floors`]).
+/// #768 `--valve-scope smooth|zoom`: each tile's predicted need, priced by
+/// real encodes of samples of its own members, and the floors they put on
+/// the tiles ([`valve_predict::Scan::floors`]).
 fn predict_floors(
     reader: &OverviewReader,
     cols: (&PublishedNames, Option<&ResolvedFeatureId>),
     crs: Crs,
     (options, level_zooms): (&ExportOptions, &[u8]),
     p: &valve_predict::Scan,
-) -> Result<valve_predict::MergeFloors, ExportError> {
+) -> Result<valve_predict::ValveFloors, ExportError> {
     let t = Instant::now();
     // Every tile that can be over is priced by a small sample of its own
     // members; those it puts near a cap, by a larger one.
@@ -3785,9 +3810,9 @@ fn predict_floors(
     )?;
     bytes.extend(sample(&candidates, rows)?);
     let need = p.predict(level_zooms, &bytes, options);
-    let floors = valve_predict::floors(&need);
+    let floors = p.floors(options.valve_scope, &need, (level_zooms, &bytes), options);
     log::info!(
-        "[export] merge floors: {} tiles priced ({} by a larger sample), {} predicted over a cap, {} floors, {:.2}s",
+        "[export] valve floors: {} tiles priced ({} by a larger sample), {} predicted over a cap, {} floors, {:.2}s",
         bytes.len(),
         candidates.len(),
         need.len(),
@@ -4166,8 +4191,8 @@ struct ExportLevelCtx<'a> {
     member_bytes: Option<u64>,
     /// #802: the finest level's junction pins ([`finest_level_pins`]).
     pins: Option<&'a JunctionNodes>,
-    /// #768: the merge floors, with `--merge-scope smooth`.
-    floors: Option<&'a valve_predict::MergeFloors>,
+    /// #768: the valve floors, with `--valve-scope smooth|zoom`.
+    floors: Option<&'a valve_predict::ValveFloors>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -5648,8 +5673,8 @@ struct LevelCtx<'a> {
     tiles: Option<&'a BTreeMap<u64, usize>>,
     /// #802: the finest level's junction pins ([`finest_level_pins`]).
     pins: Option<&'a JunctionNodes>,
-    /// #768: the merge floors, with `--merge-scope smooth`.
-    floors: Option<&'a valve_predict::MergeFloors>,
+    /// #768: the valve floors, with `--valve-scope smooth|zoom`.
+    floors: Option<&'a valve_predict::ValveFloors>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -10248,9 +10273,9 @@ impl<T: TileFeature + ?Sized> TileFeature for &T {
 struct TileEncoding<'a> {
     options: &'a ExportOptions,
     layers: &'a [(u16, String)],
-    /// #768: every tile's merge floor (`--merge-scope smooth`).
-    floors: Option<&'a valve_predict::MergeFloors>,
-    /// The merge floor of the tile being encoded.
+    /// #768: every tile's valve floor (`--valve-scope smooth|zoom`).
+    floors: Option<&'a valve_predict::ValveFloors>,
+    /// The valve floor of the tile being encoded.
     floor: u64,
 }
 
@@ -10265,8 +10290,8 @@ impl<'a> TileEncoding<'a> {
         }
     }
 
-    /// With the export's merge floors.
-    fn with_floors(self, floors: Option<&'a valve_predict::MergeFloors>) -> Self {
+    /// With the export's valve floors.
+    fn with_floors(self, floors: Option<&'a valve_predict::ValveFloors>) -> Self {
         Self {
             floors: floors.filter(|f| !f.is_empty()),
             ..self
@@ -10275,10 +10300,7 @@ impl<'a> TileEncoding<'a> {
 
     /// For tile `(zoom, x, y)`: its own floor.
     fn for_tile(self, zoom: u8, x: u32, y: u32) -> Self {
-        let floor = self
-            .floors
-            .and_then(|f| f.get(&(zoom, x, y)).copied())
-            .unwrap_or(0);
+        let floor = self.floors.map_or(0, |f| f.get((zoom, x, y)));
         Self { floor, ..self }
     }
 }
@@ -10852,6 +10874,12 @@ fn with_fill(
 /// Whether the size valve can merge anything: [`SizeValve::Merge`] with a
 /// size limit in force. Otherwise no gap is ever compared, and the read
 /// skips measuring them (#745).
+/// #768: whether the export scan predicts valve floors: under
+/// `--valve-scope smooth` or `zoom`, with a cap in force.
+fn valve_predicts(opts: &ExportOptions) -> bool {
+    opts.valve_scope != ValveScope::Tile && opts.has_tile_size_cap()
+}
+
 fn valve_merges(opts: &ExportOptions) -> bool {
     opts.size_valve == SizeValve::Merge && opts.has_tile_size_cap()
 }
@@ -10926,6 +10954,61 @@ fn drop_keep(keep: usize, fit: f64, cut: u32) -> usize {
 /// One grid unit per pixel on a 512-pixel tile before losing whole features.
 const MIN_VALVE_EXTENT: u32 = 512;
 
+/// The drop valve. Under `--size-valve drop` a point tile with a #768 floor
+/// first drops the members closer than it to the member before them
+/// ([`drop_below_floor`]); then [`drop_members_to_fit`].
+fn drop_to_fit(
+    gzip_cache: &Arc<TileGzipCache>,
+    members: &[Member],
+    tb: &TileBounds,
+    opts: &TileEncoding<'_>,
+    fill: &[FillFeature],
+    fill_tally: &mut FillTally,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> TileMvt {
+    if opts.floor == 0 || opts.size_valve != SizeValve::Drop || !is_point_like(members) {
+        return drop_members_to_fit(gzip_cache, members, tb, opts, fill, fill_tally, diagnostics);
+    }
+    let above = drop_below_floor(members, opts.floor);
+    let mut mvt = drop_members_to_fit(gzip_cache, &above, tb, opts, fill, fill_tally, diagnostics);
+    let shed = members.len() - above.len();
+    mvt.valve.dropped += shed;
+    mvt.oversized |= shed > 0;
+    mvt
+}
+
+/// #768: the members of a point tile whose gap to the tile's member before
+/// them in file order ([`valve_predict::point_gaps`]) is at or above
+/// `floor`, in their order. The floor is the tile's own predicted need, or
+/// an over-cap neighbour's halved ([`valve_predict::Scan::drop_floors`]):
+/// it thins an over-cap tile toward a denser neighbour, and the stride
+/// ladder after it still holds the cap when the floor kept too many.
+///
+/// DIVERGENCE FROM TIPPECANOE: `--drop-densest-as-needed` drops below one
+/// gap threshold per zoom and raises it until every tile fits. Here the
+/// threshold is per tile, predicted before any encode and smoothed over
+/// over-cap neighbours, so a tile that fits keeps all its points; a tile
+/// still over after it is thinned by stride, not a higher threshold.
+/// `--valve-scope zoom` starts every point tile from its zoom's largest
+/// predicted need.
+fn drop_below_floor(members: &[Member], floor: u64) -> Vec<&Member> {
+    let mut order: Vec<usize> = (0..members.len()).collect();
+    order.sort_by_key(|&i| members[i].seq);
+    // A date-line pair (#342) is one point: its first copy stands for it.
+    let first = |m: &Member| m.geometry().coords_iter().next().map(|c| (c.x, c.y));
+    let gaps =
+        valve_predict::point_gaps(order.iter().map(|&i| (members[i].band, first(&members[i]))));
+    let mut keep = vec![false; members.len()];
+    for (&i, gap) in order.iter().zip(gaps) {
+        keep[i] = gap >= floor;
+    }
+    members
+        .iter()
+        .zip(keep)
+        .filter_map(|(m, k)| k.then_some(m))
+        .collect()
+}
+
 /// The drop valve: while the tile is over its limit, keep a proportional
 /// count of members and re-encode. `select_kept_members` decides which
 /// survive.
@@ -10934,9 +11017,9 @@ const MIN_VALVE_EXTENT: u32 = 512;
 /// whose survivors still encoded too big was written over its limit (45 of
 /// 1,286 tiles on the FTW Moldova benchmark). The first pass is unchanged,
 /// so a tile that fit after one pass is byte-identical to before.
-fn drop_to_fit(
+fn drop_members_to_fit<M: TileFeature + std::borrow::Borrow<Member>>(
     gzip_cache: &Arc<TileGzipCache>,
-    members: &[Member],
+    members: &[M],
     tb: &TileBounds,
     opts: &TileEncoding<'_>,
     fill: &[FillFeature],
@@ -11117,7 +11200,7 @@ fn merge_to_fit(
         })
     };
     let mut gaps: Option<Vec<u64>> = None;
-    // #768: `--merge-scope smooth` starts the ladder at the tile's floor.
+    // #768: `--valve-scope smooth` starts the ladder at the tile's floor.
     let mut mingap = opts.floor;
     let mut keep_fraction = 1.0_f64;
     let mut prev_fit: Option<f64> = None;
@@ -11382,10 +11465,16 @@ fn account_merged_sources(
 /// ones a caller pins an order for. The default [`FeatureOrder::Input`] keeps
 /// the vertex-count order, which is the pre-#280 behaviour and byte-identical
 /// to it.
-fn shed_to_fit<'a>(members: &'a [Member], keep: usize, opts: &ExportOptions) -> Vec<&'a Member> {
+fn shed_to_fit<'a, M: TileFeature + std::borrow::Borrow<Member>>(
+    members: &'a [M],
+    keep: usize,
+    opts: &ExportOptions,
+) -> Vec<&'a M> {
     let mut kept = select_kept_members(members, keep);
     if let FeatureOrder::Column { name, descending } = &opts.feature_order {
-        kept.sort_by(|a, b| compare_by_feature_order(a, b, name, *descending));
+        kept.sort_by(|a, b| {
+            compare_by_feature_order((*a).borrow(), (*b).borrow(), name, *descending)
+        });
     }
     kept
 }
@@ -19802,15 +19891,46 @@ mod tests {
 
     /// #768: `smooth` is the default; both values round-trip their spelling.
     #[test]
-    fn merge_scope_defaults_to_smooth_and_parses_its_spelling() {
-        assert_eq!(ExportOptions::default().merge_scope, MergeScope::Smooth);
-        for scope in [MergeScope::Smooth, MergeScope::Tile] {
-            assert_eq!(scope.as_str().parse::<MergeScope>(), Ok(scope));
+    fn valve_scope_defaults_to_smooth_and_parses_its_spelling() {
+        assert_eq!(ExportOptions::default().valve_scope, ValveScope::Smooth);
+        for scope in [ValveScope::Smooth, ValveScope::Tile, ValveScope::Zoom] {
+            assert_eq!(scope.as_str().parse::<ValveScope>(), Ok(scope));
         }
-        assert!("neighbours".parse::<MergeScope>().is_err());
+        assert!("neighbours".parse::<ValveScope>().is_err());
     }
 
-    /// #768: `--merge-scope smooth` starts a tile's merge ladder at its
+    /// #768: `tile` predicts nothing, so every tile is fitted alone as
+    /// before; `smooth` and `zoom` predict under either valve, with a cap.
+    /// `zoom` needs the whole input, so a shard refuses it.
+    #[test]
+    fn valve_scope_tile_predicts_nothing_and_zoom_refuses_a_shard() {
+        for valve in [SizeValve::Merge, SizeValve::Drop] {
+            let opts = |scope| ExportOptions {
+                size_valve: valve,
+                valve_scope: scope,
+                ..Default::default()
+            };
+            assert!(!valve_predicts(&opts(ValveScope::Tile)));
+            assert!(valve_predicts(&opts(ValveScope::Smooth)));
+            assert!(valve_predicts(&opts(ValveScope::Zoom)));
+            let uncapped = ExportOptions {
+                tile_size_limit: None,
+                compressed_tile_size_limit: None,
+                ..opts(ValveScope::Smooth)
+            };
+            assert!(!valve_predicts(&uncapped));
+        }
+        let shard = |scope| ExportOptions {
+            valve_scope: scope,
+            tile_range: Some(crate::shard::TileRange::parse("5..12").unwrap()),
+            ..Default::default()
+        };
+        let err = shard(ValveScope::Zoom).check().unwrap_err();
+        assert!(err.to_string().contains("--valve-scope zoom"), "{err}");
+        assert!(shard(ValveScope::Smooth).check().is_ok());
+    }
+
+    /// #768: `--valve-scope smooth` starts a tile's merge ladder at its
     /// floor, so a tile that fits on its own still merges the gaps under
     /// its floor, in one encode; with no floor it merges nothing.
     #[test]
@@ -19832,7 +19952,10 @@ mod tests {
             size_valve: SizeValve::Merge,
             ..Default::default()
         };
-        let floors = valve_predict::MergeFloors::from([((10, 512, 511), 101)]);
+        let floors = valve_predict::ValveFloors {
+            tiles: HashMap::from([((10, 512, 511), 101)]),
+            ..Default::default()
+        };
         let encode = |floors| {
             encode_tile_layers(
                 &test_gzip_cache(),
@@ -19853,6 +19976,178 @@ mod tests {
         // Gaps 1..=100 sit under the floor of 101.
         assert_eq!((floored.merged, floored.passes), (100, 1), "{floored:?}");
         assert_eq!(floored.over_limit, 0, "{floored:?}");
+    }
+
+    /// #768: a point tile over its cap beside a denser over-cap one is
+    /// thinned toward it under the default `--valve-scope smooth`: the denser
+    /// tile's predicted need, halved one ring out, drops its close pairs,
+    /// more than its own need would. A tile that fits on its own beside the
+    /// dense one gets no floor and keeps every point (true Africa beside the
+    /// Mediterranean on the planet).
+    #[test]
+    fn an_over_cap_point_tile_beside_a_denser_one_thins_toward_it() {
+        let zooms = [10u8];
+        let opts = ExportOptions {
+            size_valve: SizeValve::Drop,
+            ..Default::default()
+        };
+        assert_eq!(opts.valve_scope, ValveScope::Smooth);
+        // East of the dense tile (540, 483): 12,544 points on a 0.0012 by
+        // 0.001 degree grid, each with a partner 1e-5 degrees after it.
+        let pairs: Vec<Option<TileBounds>> = (0..25_088u32)
+            .map(|i| {
+                let (cell, partner) = (i / 2, i % 2);
+                let x = 10.2 + f64::from(cell % 112) * 0.0012 + f64::from(partner) * 1e-5;
+                let y = 10.0 + f64::from(cell / 112) * 0.001;
+                Some(TileBounds::new(x, y, x, y))
+            })
+            .collect();
+        // West, in (539, 483): 2,000 points that fit on their own.
+        let sparse: Vec<Option<TileBounds>> = (0..2_000u32)
+            .map(|i| {
+                let (x, y) = (
+                    9.6 + f64::from(i % 50) * 0.004,
+                    10.0 + f64::from(i / 50) * 0.002,
+                );
+                Some(TileBounds::new(x, y, x, y))
+            })
+            .collect();
+        let dense = valve_predict::dense_points(70_000);
+        let mut scan = valve_predict::Scan::new(1);
+        scan.batch(0, &dense, 0..=0, &zooms, &opts);
+        scan.batch(1, &pairs, 0..=0, &zooms, &opts);
+        scan.batch(2, &sparse, 0..=0, &zooms, &opts);
+        scan.flush(&zooms, &opts);
+        // Every priced tile at 100 bytes a member raw.
+        let bytes: HashMap<(usize, u64), MemberBytes> = scan
+            .priced()
+            .iter()
+            .map(|t| ((t.level, t.key), (100.0, 20.0)))
+            .collect();
+        assert_eq!(bytes.len(), 3);
+        let need = scan.predict(&zooms, &bytes, &opts);
+        let (a, b) = ((10, 540, 483), (10, 541, 483));
+        assert!(need.contains_key(&a) && need.contains_key(&b), "{need:?}");
+        let floors = scan.floors(opts.valve_scope, &need, (&zooms, &bytes), &opts);
+        assert_eq!(floors.get(b), need[&a] / 2);
+        assert!(floors.get(b) > need[&b], "the denser neighbour binds");
+        assert_eq!(
+            floors.get((10, 539, 483)),
+            0,
+            "a tile that fits keeps its points"
+        );
+        assert_eq!(floors.get((10, 542, 483)), 0, "one ring only");
+
+        // The over-cap tile, encoded as the export does with its floor.
+        let members: Vec<Member> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| Member {
+                band: 1,
+                ..point_member(r.unwrap().lng_min, r.unwrap().lat_min, i as u64)
+            })
+            .collect();
+        let encode = |floors: Option<&valve_predict::ValveFloors>| {
+            encode_tile_layers(
+                &test_gzip_cache(),
+                &members,
+                &TileCoord::new(541, 483, 10).bounds(),
+                &TileEncoding::single(&opts)
+                    .with_floors(floors)
+                    .for_tile(10, 541, 483),
+                &[],
+                &mut FillTally::default(),
+                &crate::diagnostics::Diagnostics::default(),
+            )
+        };
+        let thinned = encode(Some(&floors));
+        assert_eq!(thinned.valve.dropped, 12_544, "{:?}", thinned.valve);
+        assert_eq!(thinned.valve.over_limit, 0);
+        // `tile` sets no floors: the tile is the plain drop valve's, which
+        // keeps all 25,088 points (they encode under the cap).
+        let alone = encode(None);
+        assert_eq!(alone.valve.dropped, 0, "{:?}", alone.valve);
+        let plain = drop_members_to_fit(
+            &test_gzip_cache(),
+            &members,
+            &TileCoord::new(541, 483, 10).bounds(),
+            &TileEncoding::single(&opts),
+            &[],
+            &mut FillTally::default(),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert_eq!(alone.data, plain.data);
+    }
+
+    /// #768: a point floor that keeps too many still ends under the cap.
+    /// The stride ladder finishes the tile from what the floor kept.
+    #[test]
+    fn a_point_floor_short_of_the_need_still_keeps_the_cap() {
+        let tb = crate::tile::tile_bounds(0, 0, 0);
+        let members: Vec<Member> = (0..400u64)
+            .map(|i| {
+                let x = -170.0 + 0.85 * i as f64 + ((i * 7919) % 13) as f64 * 0.01;
+                point_member(x, 0.37 * i as f64 - 70.0, i)
+            })
+            .collect();
+        let mut gaps: Vec<u64> = valve_predict::point_gaps(members.iter().map(|m| {
+            (
+                m.band,
+                m.geometry().coords_iter().next().map(|c| (c.x, c.y)),
+            )
+        }))
+        .collect();
+        gaps.sort_unstable();
+        // Drops about a fifth of the points.
+        let floor = gaps[80];
+        let below = gaps.iter().filter(|&&g| g < floor).count();
+        assert!(below > 0);
+        let opts = ExportOptions {
+            size_valve: SizeValve::Drop,
+            tile_size_limit: None,
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let floors = valve_predict::ValveFloors {
+            tiles: HashMap::from([((0, 0, 0), floor)]),
+            ..Default::default()
+        };
+        let drop_at = |floors: Option<&valve_predict::ValveFloors>, opts: &ExportOptions| {
+            encode_tile_layers(
+                &test_gzip_cache(),
+                &members,
+                &tb,
+                &TileEncoding::single(opts)
+                    .with_floors(floors)
+                    .for_tile(0, 0, 0),
+                &[],
+                &mut FillTally::default(),
+                &crate::diagnostics::Diagnostics::default(),
+            )
+        };
+        let cap = drop_at(None, &opts).data.len() * 6 / 10;
+        let capped = ExportOptions {
+            tile_size_limit: Some(cap),
+            ..opts.clone()
+        };
+        let mvt = drop_at(Some(&floors), &capped);
+        assert_eq!(mvt.valve.over_limit, 0, "{:?}", mvt.valve);
+        assert!(mvt.data.len() <= cap);
+        assert!(mvt.valve.dropped > below, "{:?}", mvt.valve);
+        // Under a looser cap the floor alone fits the tile: it drops exactly
+        // the points under it, where the stride alone would drop fewer.
+        let loose = ExportOptions {
+            tile_size_limit: Some(cap * 3 / 2),
+            ..opts.clone()
+        };
+        assert_eq!(drop_at(Some(&floors), &loose).valve.dropped, below);
+        assert!(drop_at(None, &loose).valve.dropped < below);
+        // Under merge, a point tile ignores the floor: it is a merge floor.
+        let merge = ExportOptions {
+            size_valve: SizeValve::Merge,
+            ..opts
+        };
+        assert_eq!(drop_at(Some(&floors), &merge).valve.dropped, 0);
     }
 
     /// #873: the margin starts on the second cut, so a tile that fits on

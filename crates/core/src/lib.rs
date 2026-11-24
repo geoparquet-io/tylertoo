@@ -174,7 +174,7 @@ pub use overview::{
 // Export: overview GeoParquet -> PMTiles.
 pub use overview::export::{
     export_pmtiles, ExportError, ExportOptions, ExportReport, FeatureIdColumnProblem, FeatureOrder,
-    InvalidFeatureIdReason, MergeScope, SizeValve, SkippedPropertyColumn, VariableDepthReport,
+    InvalidFeatureIdReason, SizeValve, SkippedPropertyColumn, ValveScope, VariableDepthReport,
     ZoomReport,
 };
 // Check: validate an overview file against the spec.

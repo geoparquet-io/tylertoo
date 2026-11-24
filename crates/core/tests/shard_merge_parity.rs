@@ -43,9 +43,11 @@ use tylertoo_core::internal::archive_index::ArchiveIndex;
 use tylertoo_core::internal::merge::{merge_shards, MergeOptions};
 use tylertoo_core::internal::overview::cluster::{AccumulateOp, AccumulateSpec};
 use tylertoo_core::internal::overview::convert::{
-    convert_to_overviews, write_convert_plan, ConvertOptions, LevelPlan,
+    convert_to_overviews, write_convert_plan, ConvertOptions, GeneralizationOverrides, LevelPlan,
 };
-use tylertoo_core::internal::overview::export::{export_pmtiles, ExportOptions, MergeScope};
+use tylertoo_core::internal::overview::export::{
+    export_pmtiles, ExportOptions, SizeValve, ValveScope,
+};
 use tylertoo_core::internal::overview::simplify::{CollapseMode, SimplifyOptions};
 use tylertoo_core::internal::shard::{ShardPlan, TileRange};
 
@@ -84,12 +86,12 @@ struct Build {
     /// job saves — the data shards consume that plan unchanged, and a ceiling
     /// that leaked into it would give the whole fleet a different pyramid.
     coarse_level_ceiling: bool,
-    /// #768: a raw tile-size cap small enough that the merge valve fires at
-    /// zooms the data shards own, and the `--merge-scope` it merges with.
-    /// Under `smooth` the shards start those tiles from merge floors
+    /// #768: a raw tile-size cap small enough that the size valve fires at
+    /// zooms the data shards own, the `--valve-scope` it fits with, and the
+    /// valve. Under `smooth` the shards start those tiles from floors
     /// predicted over their own overview files. `None` keeps the default
     /// caps, which never bind.
-    tile_cap: Option<(usize, MergeScope)>,
+    tile_cap: Option<(usize, ValveScope, SizeValve)>,
 }
 
 /// The same build with #541's convert-side ceiling on the coarse job.
@@ -125,6 +127,9 @@ enum Flavor {
     /// per-level CLUSTER TABLES keyed by source row, which the re-addressing
     /// has to re-key (and drop the keys this shard does not read).
     ClusteredPoints,
+    /// #768: points, with no point thinning and no density drop, so every
+    /// level holds every point and the drop valve does the thinning.
+    UnthinnedPoints,
 }
 
 /// Pass-2 reader threads for every convert this oracle runs.
@@ -175,6 +180,17 @@ fn convert_options(build: Build) -> ConvertOptions {
                 AccumulateOp::Sum,
             )])
             .with_cluster_categories(Some("category".to_string())),
+        Flavor::UnthinnedPoints => ConvertOptions::default()
+            .with_levels(levels)
+            .with_read_workers(read_workers)
+            .with_coalesce_lines(false)
+            .with_generalization(
+                &GeneralizationOverrides::default()
+                    .with_point_thinning(Some(0.0))
+                    .with_density_drop(Some(false)),
+                false,
+            )
+            .expect("point generalization off"),
     }
 }
 
@@ -185,10 +201,11 @@ fn export_options() -> ExportOptions {
 /// [`export_options`] under `build`'s tile cap, if it sets one.
 fn capped_export_options(build: Build) -> ExportOptions {
     match build.tile_cap {
-        Some((cap, scope)) => export_options()
+        Some((cap, scope, valve)) => export_options()
             .with_tile_size_limit(Some(cap))
             .with_compressed_tile_size_limit(None)
-            .with_merge_scope(scope),
+            .with_valve_scope(scope)
+            .with_size_valve(valve),
         None => export_options(),
     }
 }
@@ -457,7 +474,7 @@ fn sharded_build_against_monolithic(input: &Path, build: Build) -> Vec<((u8, u64
     // --- Assertions ----------------------------------------------------
     let want = tiles_of(&mono);
     let got = tiles_of(&merged);
-    if let Some((_, MergeScope::Smooth)) = tile_cap {
+    if let Some((_, ValveScope::Smooth, _)) = tile_cap {
         assert_floors_change_tiles_past_the_pivot(&overview, dir, build, &want);
     }
     assert!(
@@ -588,7 +605,7 @@ fn sharded_build_against_monolithic(input: &Path, build: Build) -> Vec<((u8, u64
     differ
 }
 
-/// #768's premise for a floored build: the merge floors change tiles the
+/// #768's premise for a floored build: the valve floors change tiles the
 /// data shards own, so a shard that predicted other floors would differ.
 fn assert_floors_change_tiles_past_the_pivot(
     overview: &Path,
@@ -603,9 +620,9 @@ fn assert_floors_change_tiles_past_the_pivot(
         &alone,
         &capped_export_options(build)
             .with_min_zoom(Some(min_zoom))
-            .with_merge_scope(MergeScope::Tile),
+            .with_valve_scope(ValveScope::Tile),
     )
-    .expect("monolithic export, --merge-scope tile");
+    .expect("monolithic export, --valve-scope tile");
     let alone = tiles_of(&alone);
     let floored = want
         .iter()
@@ -615,9 +632,9 @@ fn assert_floors_change_tiles_past_the_pivot(
         .count();
     assert!(
         floored > 0,
-        "no tile at or past the pivot starts from a merge floor; the cap must bind there"
+        "no tile at or past the pivot starts from a valve floor; the cap must bind there"
     );
-    eprintln!("[oracle] {floored} tile(s) past the pivot changed by merge floors");
+    eprintln!("[oracle] {floored} tile(s) past the pivot changed by valve floors");
 }
 
 /// Assertion (4): THE ARCHIVE, not just the tiles.
@@ -928,7 +945,7 @@ fn sharded_build_matches_monolithic_with_three_shards() {
 /// around its tiles, at other band rows), yet starts its tiles from the
 /// floors the monolithic build does.
 ///
-/// Byte parity is checked against `--merge-scope tile` rather than outright:
+/// Byte parity is checked against `--valve-scope tile` rather than outright:
 /// a pruning shard's stored per-row gaps already differ at its overview's
 /// row-group starts (#854), so the same tiles differ without any floor. The
 /// floors must add no tile to that set.
@@ -945,16 +962,16 @@ fn sharded_build_matches_monolithic_with_merge_floors() {
         expect_row_group_pruning: true,
         flavor: Flavor::Defaults,
         coarse_level_ceiling: false,
-        tile_cap: Some((48 * 1024, scope)),
+        tile_cap: Some((48 * 1024, scope, SizeValve::Merge)),
     };
     let ids = |differ: &[((u8, u64), String)]| -> BTreeSet<(u8, u64)> {
         differ.iter().map(|(t, _)| *t).collect()
     };
     let without = ids(&sharded_build_against_monolithic(
         &input,
-        build(MergeScope::Tile),
+        build(ValveScope::Tile),
     ));
-    let with = sharded_build_against_monolithic(&input, build(MergeScope::Smooth));
+    let with = sharded_build_against_monolithic(&input, build(ValveScope::Smooth));
     eprintln!(
         "[oracle] #854: {} tile(s) differ without floors",
         without.len()
@@ -962,6 +979,60 @@ fn sharded_build_matches_monolithic_with_merge_floors() {
     if let Some((_, msg)) = with.iter().find(|(t, _)| !without.contains(t)) {
         panic!("a merge floor differs between a shard and the monolithic build: {msg}");
     }
+}
+
+/// #768: under `--size-valve drop` every data shard predicts the point
+/// tiles' drop floors over its own pruned overview file, and thins each
+/// over-cap point tile by gaps to the tile's own previous member, so the
+/// sharded build is byte-identical to the monolithic one outright.
+#[test]
+fn sharded_build_matches_monolithic_with_drop_floors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("points.parquet");
+    write_dense_points(&input);
+    let build = Build {
+        min_zoom: 0,
+        max_zoom: 8,
+        pivot: 7,
+        shards: 3,
+        expect_row_group_pruning: true,
+        flavor: Flavor::UnthinnedPoints,
+        coarse_level_ceiling: false,
+        tile_cap: Some((24 * 1024, ValveScope::Smooth, SizeValve::Drop)),
+    };
+    assert_sharded_build_matches_monolithic(&input, build);
+}
+
+/// #768: points in a 40 x 2.5 degree strip inside one row of z7 tiles,
+/// every other z7 tile two and a half times as dense, longitude-sorted into
+/// 20 row groups: under a small cap both kinds of z7 tile are over, so the
+/// sparser take drop floors from their denser neighbours.
+fn write_dense_points(path: &Path) {
+    let wkb = |x: f64, y: f64| -> Vec<u8> {
+        let mut out = Vec::with_capacity(21);
+        out.push(1u8); // little endian
+        out.extend_from_slice(&1u32.to_le_bytes()); // Point
+        out.extend_from_slice(&x.to_le_bytes());
+        out.extend_from_slice(&y.to_le_bytes());
+        out
+    };
+    let mut rows = Vec::new();
+    let mut x = 0.0f64;
+    let mut i = 0i64;
+    while x < 40.0 {
+        let mut y = 0.2;
+        for j in 0..50i64 {
+            let id = i * 50 + j;
+            rows.push((id, (id % 97) as f64, wkb(x, y), [x, y, x, y]));
+            // Uneven gaps, so a floor's height decides which points stay.
+            y += 0.02 + ((i * 7919 + j * 104_729) % 1000) as f64 * 0.000_04;
+        }
+        let dense = (x / (360.0 / 128.0)) as i64 % 2 == 0;
+        x += if dense { 0.02 } else { 0.05 };
+        i += 1;
+    }
+    let per_group = rows.len().div_ceil(20);
+    write_covered_grid(path, rows, "Point", per_group);
 }
 
 /// #768: small squares in a 40 x 2.5 degree strip inside one row of z7
