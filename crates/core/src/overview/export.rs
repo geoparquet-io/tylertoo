@@ -3848,16 +3848,15 @@ fn scan_with_floors(
 /// tile counts alone, as under `--valve-scope tile`.
 fn shed_over_budget(
     p: &mut valve_predict::Scan,
-    band: BandRead<'_>,
+    (budget, profile): (&MemoryBudget, MemoryProfile),
     diagnostics: &crate::diagnostics::Diagnostics,
 ) {
     if p.is_shed() {
         return;
     }
     let held = p.resident_bytes();
-    if band
-        .budget
-        .require_allowance(band.profile, MemoryPhase::Scan, held)
+    if budget
+        .require_allowance(profile, MemoryPhase::Scan, held)
         .is_err()
     {
         log::warn!(
@@ -7288,7 +7287,7 @@ fn scan_all_levels_from(
                         }
                         _ => p.batch(j, &bboxes, j..=last, zooms_ref, opts),
                     }
-                    shed_over_budget(p, band, diagnostics);
+                    shed_over_budget(p, (&band.budget, band.profile), diagnostics);
                 }
                 if j != pending_band {
                     size_pending(pending_band, &mut pending);
@@ -7308,7 +7307,7 @@ fn scan_all_levels_from(
     // ([`scan_with_floors`]).
     if let Some(p) = predict {
         p.flush(zooms_ref, opts);
-        shed_over_budget(p, band, diagnostics);
+        shed_over_budget(p, (&band.budget, band.profile), diagnostics);
     }
     #[cfg(test)]
     BAND_READ_WORKERS.with(|w| w.set(readers));
@@ -16593,6 +16592,35 @@ mod tests {
         );
         let counts = |s: &[LevelScan]| s.iter().map(|l| l.tile_counts.clone()).collect::<Vec<_>>();
         assert_eq!(counts(&scans), counts(&want));
+    }
+
+    /// #768: the tile counts are what `tile` holds too; only the dense state
+    /// the predictor adds is checked against the scan's budget, so a scan of
+    /// many sparse tiles beside one dense tile keeps its floors.
+    #[test]
+    fn many_sparse_tiles_beside_a_small_dense_state_do_not_shed() {
+        let zooms = [14u8];
+        let opts = ExportOptions::default();
+        let mut p = valve_predict::Scan::new(1);
+        p.batch(0, &valve_predict::dense_points(2_000), 0..=0, &zooms, &opts);
+        // 200,000 points, one per z14 tile.
+        let sparse: Vec<_> = (0..200_000u32)
+            .map(|i| {
+                let (x, y) = (
+                    -170.0 + f64::from(i % 1000) * 0.03,
+                    -60.0 + f64::from(i / 1000) * 0.03,
+                );
+                Some(TileBounds::new(x, y, x, y))
+            })
+            .collect();
+        p.batch(1, &sparse, 0..=0, &zooms, &opts);
+        p.flush(&zooms, &opts);
+        // Room for the dense tile's state, not for 200,000 counts.
+        let budget = MemoryBudget::with_available(Some(4 << 20));
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        shed_over_budget(&mut p, (&budget, MemoryProfile::Bounded), &diagnostics);
+        assert!(!p.is_shed(), "{} bytes", p.resident_bytes());
+        assert!(diagnostics.snapshot().is_empty());
     }
 
     /// Both sources' scans of one file, for every level: (covering, geometry).

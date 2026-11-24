@@ -339,21 +339,17 @@ impl Scan {
         }
     }
 
-    /// Bytes the per-tile state holds: charged to the export's budget.
-    /// O(maps): checked against the scan's budget after every batch.
+    /// Bytes the dense state holds, beyond the tile counts `tile` holds
+    /// too: charged to the export's budget. O(maps): checked against the
+    /// scan's budget after every batch.
     pub(crate) fn resident_bytes(&self) -> u64 {
-        let count = std::mem::size_of::<(u64, u64)>() as u64 + 1;
         let dense = std::mem::size_of::<(u64, Dense)>() as u64 + 1;
         let heap = std::mem::size_of::<[u32; BUCKETS]>() as u64
             + (PRICE_MEMBERS * std::mem::size_of::<u64>()) as u64;
         self.levels
             .iter()
             .flatten()
-            .map(|p| {
-                p.counts.capacity() as u64 * count
-                    + p.dense.capacity() as u64 * dense
-                    + p.dense.len() as u64 * heap
-            })
+            .map(|p| p.dense.capacity() as u64 * dense + p.dense.len() as u64 * heap)
             .sum()
     }
 
