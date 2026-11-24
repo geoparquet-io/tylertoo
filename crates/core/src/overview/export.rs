@@ -11091,7 +11091,10 @@ const MIN_VALVE_EXTENT: u32 = 512;
 
 /// The drop valve. Under `--size-valve drop` a point tile with a #768 floor
 /// first drops the members closer than it to the member before them
-/// ([`drop_below_floor`]); then [`drop_members_to_fit`].
+/// ([`drop_below_floor`]); then [`drop_members_to_fit`]. Under
+/// `--valve-scope smooth` the floor is a prediction: it applies only when
+/// the tile is over its cap without it, so a mispredicted tile keeps every
+/// point. Under `zoom` it is the zoom's threshold and always applies.
 fn drop_to_fit(
     gzip_cache: &Arc<TileGzipCache>,
     members: &[Member],
@@ -11104,10 +11107,27 @@ fn drop_to_fit(
     if opts.floor == 0 || opts.size_valve != SizeValve::Drop || !is_point_like(members) {
         return drop_members_to_fit(gzip_cache, members, tb, opts, fill, fill_tally, diagnostics);
     }
+    let tried = opts.valve_scope == ValveScope::Smooth;
+    if tried {
+        let mut full =
+            build_tile_layers(gzip_cache, opts.layers, members, tb, opts, &[], diagnostics);
+        if tile_fit(&mut full, opts).unwrap_or(f64::INFINITY) >= 1.0 {
+            return drop_encoded_to_fit(
+                gzip_cache,
+                (members, full),
+                tb,
+                opts,
+                fill,
+                fill_tally,
+                diagnostics,
+            );
+        }
+    }
     let above = drop_below_floor(members, opts.floor);
     let mut mvt = drop_members_to_fit(gzip_cache, &above, tb, opts, fill, fill_tally, diagnostics);
     let shed = members.len() - above.len();
     mvt.valve.dropped += shed;
+    mvt.valve.passes += u32::from(tried);
     mvt.oversized |= shed > 0;
     mvt
 }
@@ -11161,8 +11181,29 @@ fn drop_members_to_fit<M: TileFeature + std::borrow::Borrow<Member>>(
     fill_tally: &mut FillTally,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> TileMvt {
+    let full = build_tile_layers(gzip_cache, opts.layers, members, tb, opts, &[], diagnostics);
+    drop_encoded_to_fit(
+        gzip_cache,
+        (members, full),
+        tb,
+        opts,
+        fill,
+        fill_tally,
+        diagnostics,
+    )
+}
+
+/// [`drop_members_to_fit`] from `members`' encode, `full`, already made.
+fn drop_encoded_to_fit<M: TileFeature + std::borrow::Borrow<Member>>(
+    gzip_cache: &Arc<TileGzipCache>,
+    (members, mut full): (&[M], TileMvt),
+    tb: &TileBounds,
+    opts: &TileEncoding<'_>,
+    fill: &[FillFeature],
+    fill_tally: &mut FillTally,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> TileMvt {
     let layers = opts.layers;
-    let mut full = build_tile_layers(gzip_cache, layers, members, tb, opts, &[], diagnostics);
     let mut fit = tile_fit(&mut full, opts).unwrap_or(f64::INFINITY);
     if fit >= 1.0 || members.len() <= 1 {
         // One encode, as the merge valve counts a tile that fits at once.
@@ -20297,15 +20338,11 @@ mod tests {
     /// tile's predicted need, halved one ring out, drops its close pairs,
     /// more than its own need would. A tile that fits on its own beside the
     /// dense one gets no floor and keeps every point (true Africa beside the
-    /// Mediterranean on the planet).
+    /// Mediterranean on the planet). Each tile is priced at its own real
+    /// encode, and the cap binds the pairs' tile without the floor.
     #[test]
     fn an_over_cap_point_tile_beside_a_denser_one_thins_toward_it() {
         let zooms = [10u8];
-        let opts = ExportOptions {
-            size_valve: SizeValve::Drop,
-            ..Default::default()
-        };
-        assert_eq!(opts.valve_scope, ValveScope::Smooth);
         // East of the dense tile (540, 483): 12,544 points on a 0.0012 by
         // 0.001 degree grid, each with a partner 1e-5 degrees after it.
         let pairs: Vec<Option<TileBounds>> = (0..25_088u32)
@@ -20327,63 +20364,83 @@ mod tests {
             })
             .collect();
         let dense = valve_predict::dense_points(70_000);
+        let members = |rows: &[Option<TileBounds>], band: u16| -> Vec<Member> {
+            rows.iter()
+                .enumerate()
+                .map(|(i, r)| Member {
+                    band,
+                    ..point_member(r.unwrap().lng_min, r.unwrap().lat_min, i as u64)
+                })
+                .collect()
+        };
+        let (a, b, west) = ((10, 540, 483), (10, 541, 483), (10, 539, 483));
+        let encode =
+            |members: &[Member], opts: &ExportOptions, floors, (z, x, y): valve_predict::Key| {
+                encode_tile_layers(
+                    &test_gzip_cache(),
+                    members,
+                    &TileCoord::new(x, y, z).bounds(),
+                    &TileEncoding::single(opts)
+                        .with_floors(floors)
+                        .for_tile(z, x, y),
+                    &[],
+                    &mut FillTally::default(),
+                    &crate::diagnostics::Diagnostics::default(),
+                )
+            };
+        let uncapped = ExportOptions {
+            size_valve: SizeValve::Drop,
+            tile_size_limit: None,
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let on_pairs = members(&pairs, 1);
+        // The cap the pairs' tile is over by a third.
+        let cap = encode(&on_pairs, &uncapped, None, b).data.len() * 3 / 4;
+        let opts = ExportOptions {
+            tile_size_limit: Some(cap),
+            ..uncapped.clone()
+        };
+        assert_eq!(opts.valve_scope, ValveScope::Smooth);
         let mut scan = valve_predict::Scan::new(1);
         scan.batch(0, &dense, 0..=0, &zooms, &opts);
         scan.batch(1, &pairs, 0..=0, &zooms, &opts);
         scan.batch(2, &sparse, 0..=0, &zooms, &opts);
         scan.flush(&zooms, &opts);
-        // Every priced tile at 100 bytes a member raw.
-        let bytes: HashMap<(usize, u64), MemberBytes> = scan
-            .priced()
-            .iter()
-            .map(|t| ((t.level, t.key), (100.0, 20.0)))
-            .collect();
-        assert_eq!(bytes.len(), 3);
+        // Every priced tile at its own encode's raw and gzipped bytes a
+        // member, as `valve_sample_bytes` prices it.
+        let cache = test_gzip_cache();
+        let mut bytes: HashMap<(usize, u64), MemberBytes> = HashMap::new();
+        for (rows, band, (z, x, y)) in [(&dense, 0, a), (&pairs, 1, b), (&sparse, 2, west)] {
+            let m = members(rows, band);
+            let mut mvt = encode(&m, &uncapped, None, (z, x, y));
+            let n = m.len() as f64;
+            let gz = mvt.data.gzipped(&cache).unwrap().len() as f64;
+            bytes.insert((0, tile_key(x, y, z)), (mvt.data.len() as f64 / n, gz / n));
+        }
+        let priced: Vec<u64> = scan.priced().iter().map(|t| t.key).collect();
+        assert_eq!(priced.len(), 3, "{priced:?}");
         let need = scan.predict(&zooms, &bytes, &opts);
-        let (a, b) = ((10, 540, 483), (10, 541, 483));
         assert!(need.contains_key(&a) && need.contains_key(&b), "{need:?}");
         let floors = scan.floors(opts.valve_scope, &need, (&zooms, &bytes), &opts);
         assert_eq!(floors.get(b), need[&a] / 2);
         assert!(floors.get(b) > need[&b], "the denser neighbour binds");
-        assert_eq!(
-            floors.get((10, 539, 483)),
-            0,
-            "a tile that fits keeps its points"
-        );
+        assert_eq!(floors.get(west), 0, "a tile that fits keeps its points");
         assert_eq!(floors.get((10, 542, 483)), 0, "one ring only");
 
-        // The over-cap tile, encoded as the export does with its floor.
-        let members: Vec<Member> = pairs
-            .iter()
-            .enumerate()
-            .map(|(i, r)| Member {
-                band: 1,
-                ..point_member(r.unwrap().lng_min, r.unwrap().lat_min, i as u64)
-            })
-            .collect();
-        let encode = |floors: Option<&valve_predict::ValveFloors>| {
-            encode_tile_layers(
-                &test_gzip_cache(),
-                &members,
-                &TileCoord::new(541, 483, 10).bounds(),
-                &TileEncoding::single(&opts)
-                    .with_floors(floors)
-                    .for_tile(10, 541, 483),
-                &[],
-                &mut FillTally::default(),
-                &crate::diagnostics::Diagnostics::default(),
-            )
-        };
-        let thinned = encode(Some(&floors));
+        // The over-cap tile, encoded as the export does with its floor: the
+        // floor drops every partner, and what is left fits.
+        let thinned = encode(&on_pairs, &opts, Some(&floors), b);
         assert_eq!(thinned.valve.dropped, 12_544, "{:?}", thinned.valve);
         assert_eq!(thinned.valve.over_limit, 0);
-        // `tile` sets no floors: the tile is the plain drop valve's, which
-        // keeps all 25,088 points (they encode under the cap).
-        let alone = encode(None);
-        assert_eq!(alone.valve.dropped, 0, "{:?}", alone.valve);
+        assert!(thinned.data.len() <= cap);
+        assert!(thinned.oversized);
+        // `tile` sets no floors: the plain drop valve thins it by stride.
+        let alone = encode(&on_pairs, &opts, None, b);
+        assert!(alone.valve.dropped > 0, "{:?}", alone.valve);
         let plain = drop_members_to_fit(
             &test_gzip_cache(),
-            &members,
+            &on_pairs,
             &TileCoord::new(541, 483, 10).bounds(),
             &TileEncoding::single(&opts),
             &[],
@@ -20462,6 +20519,48 @@ mod tests {
             ..opts
         };
         assert_eq!(drop_at(Some(&floors), &merge).valve.dropped, 0);
+    }
+
+    /// #768: under `smooth` a drop floor is a prediction, so a point tile
+    /// that fits without it keeps every point and is not oversized; under
+    /// `zoom` it is the zoom's threshold, which thins every tile at it.
+    #[test]
+    fn a_smooth_drop_floor_spares_a_tile_that_fits() {
+        let tb = crate::tile::tile_bounds(0, 0, 0);
+        let members: Vec<Member> = (0..400u64)
+            .map(|i| point_member(-170.0 + 0.85 * i as f64, 0.37 * i as f64 - 70.0, i))
+            .collect();
+        let floors = valve_predict::ValveFloors {
+            tiles: HashMap::from([((0, 0, 0), u64::MAX)]),
+            ..Default::default()
+        };
+        let encode = |scope| {
+            let opts = ExportOptions {
+                size_valve: SizeValve::Drop,
+                valve_scope: scope,
+                ..Default::default()
+            };
+            encode_tile_layers(
+                &test_gzip_cache(),
+                &members,
+                &tb,
+                &TileEncoding::single(&opts)
+                    .with_floors(Some(&floors))
+                    .for_tile(0, 0, 0),
+                &[],
+                &mut FillTally::default(),
+                &crate::diagnostics::Diagnostics::default(),
+            )
+        };
+        let smooth = encode(ValveScope::Smooth);
+        assert_eq!(
+            (smooth.valve.dropped, smooth.oversized),
+            (0, false),
+            "{:?}",
+            smooth.valve
+        );
+        let zoom = encode(ValveScope::Zoom);
+        assert!(zoom.valve.dropped > 0 && zoom.oversized, "{:?}", zoom.valve);
     }
 
     /// #873: the margin starts on the second cut, so a tile that fits on
