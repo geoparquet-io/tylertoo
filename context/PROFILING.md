@@ -214,7 +214,7 @@ the decoder stacks. These are admission estimates, not measured peaks.
 
 ### Export: tile counts and active members
 
-[`LevelScan`](../crates/core/src/overview/export.rs) keeps a
+[`LevelScan`](../crates/core/src/overview/export/store.rs) keeps a
 `BTreeMap<u64, usize>` per level. Each occupied tile has 16 B of key/value
 payload on a 64-bit host, plus node headers, edges, unused slots, and
 allocator overhead. Counts are tile memberships, not distinct input rows.
@@ -226,10 +226,10 @@ Neither profile spills these maps.
 
 For active clipped members, the current admission model is
 `q = 2 × stored bytes/row + 224 + 120 × published properties`.
-The default merge valve adds 384 B/member to wave, group, and store sizing.
+The default merge valve adds 400 B/member to wave, group, and store sizing.
 For a 100-byte stored row with four properties, `q = 904` B and the
-merge fit price is 1288 B/member. A million active members then price at
-1.29 GB (1.20 GiB), before separately charged caches and reader buffers.
+merge fit price is 1304 B/member. A million active members then price at
+1.30 GB (1.21 GiB), before separately charged caches and reader buffers.
 These constants model geometry and property values alongside encoding and
 valve workspace. They are not fixed struct widths. The property price was
 208 B before packed rows (#874); a row's properties are now one shared byte
@@ -1004,7 +1004,7 @@ which reads, decodes, and clips every band up front. In duplicating mode
 there is no fill (`fill` is exactly 0.0) and the same work happens per wave
 inside `levels`. Use `export.mode` to tell which case you are looking at.
 
-**Stages** (`crates/core/src/overview/export.rs`). Each timer's `Instant`
+**Stages** (`crates/core/src/overview/export/`). Each timer's `Instant`
 window is taken inside the innermost per-item closure (one geometry, one
 tile), never around a whole parallel section:
 
@@ -1115,8 +1115,8 @@ sampler's closing snapshot is what gives it an entry.
 `export.partition_wave_width` is the resolved partition-wave **ceiling**
 (`resolve_and_log_partition_wave`'s return, `auto` or an explicit
 `--partition-wave`), a single scalar for the whole export.
-`memory_safe_level_wave` (#311) can narrow a level's actual wave below it
-based on that level's density. The dump does not carry that per-level detail
+`memory_safe_wave_members` and `cut_waves` (#311, #876) can narrow a level's
+waves below it, each by the members it holds. The dump does not carry that per-level detail
 yet.
 
 `crates/cli/tests/profile_json_dump.rs` covers this section:

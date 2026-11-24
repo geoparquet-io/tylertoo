@@ -19,7 +19,7 @@ use geo::{
 };
 
 use crate::{
-    box_pairs::any_box_pair,
+    box_pairs::{par_strip_box_pairs, strip_box_pairs},
     tile::TileBounds,
     vector_tile::{
         tile::{Feature, GeomType, Layer, Value},
@@ -566,10 +566,23 @@ fn ring_box(ring: &TileRing) -> (i32, i32, i32, i32) {
 /// Until #748 this tested the exteriors' edges and each exterior's first
 /// vertex only, which missed two parts that share two vertices and overlap
 /// between them (Madagascar adm4 feature 7844 at 4/10/8).
+#[cfg(test)]
 fn parts_interact(a: &[TileRing], b: &[TileRing]) -> bool {
+    clean_parts_interact(a, b, part_clean(a) && part_clean(b))
+}
+
+/// Does a part pass the owner's check on its own?
+fn part_clean(part: &[TileRing]) -> bool {
+    !tile_polygon::polygons_invalid(&[part])
+}
+
+/// [`parts_interact`], given whether both parts pass alone: a part that
+/// fails alone fails beside any other, and two that pass alone fail only
+/// on what lies between them (#908).
+fn clean_parts_interact(a: &[TileRing], b: &[TileRing], both_clean: bool) -> bool {
     #[cfg(test)]
     crate::valve_counter::note(|c| c.parts_interact += 1);
-    tile_polygon::check_polygons(&[a, b]).is_err()
+    !both_clean || tile_polygon::parts_cross(a, b)
 }
 
 /// Resolve overlaps *between* the parts of a multipolygon: each part is
@@ -591,13 +604,33 @@ fn resolve_part_overlaps(parts: Vec<Vec<TileRing>>) -> Vec<Vec<TileRing>> {
 /// previously separate components.
 type PartJoin<'a> = dyn FnMut(usize, usize, &dyn Fn() -> bool) + 'a;
 
-/// Feed `join` box-meeting pairs and their lazy exact interaction tests.
+/// Feed `join` the pairs that connect the interacting parts.
 fn interacting_pairs(parts: &[Vec<TileRing>], join: &mut PartJoin<'_>) {
+    for (i, j) in joining_pairs(parts) {
+        join(i as usize, j as usize, &|| true);
+    }
+}
+
+/// Pairs of interacting parts that join `parts` into its components, at
+/// most one per part. The box sweep runs on rayon's workers (#908); which
+/// pairs it keeps depends on their timing, the components they give do not.
+fn joining_pairs(parts: &[Vec<TileRing>]) -> Vec<(u32, u32)> {
+    #[cfg(test)]
+    crate::valve_counter::note(|c| c.part_sweeps += 1);
     let boxes: Vec<_> = parts.iter().map(|p| ring_box(&p[0])).collect();
-    any_box_pair(&boxes, |i, j| {
-        join(i, j, &|| parts_interact(&parts[i], &parts[j]));
-        false
-    });
+    // Each part checked alone once, not once per pair it is in.
+    let clean: Vec<bool> = {
+        use rayon::prelude::*;
+        parts.par_iter().map(|p| part_clean(p)).collect()
+    };
+    let components = uf_rush::UFRush::new(parts.len());
+    // Tested only while the two are apart; `unite` is true for one join.
+    par_strip_box_pairs(&boxes, |i, j| {
+        (!components.same(i, j)
+            && clean_parts_interact(&parts[i], &parts[j], clean[i] && clean[j])
+            && components.unite(i, j))
+        .then_some((i as u32, j as u32))
+    })
 }
 
 /// [`resolve_part_overlaps`] with the interacting pairs fed by `pairs`, and
@@ -703,6 +736,10 @@ pub(crate) struct QuantizedPolygons {
     /// 0 not tested yet, 1 no, 2 yes. Only pairs a pass puts in one feature
     /// are ever tested.
     interacts: Vec<std::sync::atomic::AtomicU8>,
+    /// Per part, whether it passes the owner's check alone ([`part_clean`]),
+    /// coded as in [`Self::interacts`]: a part in many candidate pairs is
+    /// checked once (#908).
+    clean: Vec<std::sync::atomic::AtomicU8>,
     /// Unioned components, keyed by their parts' indices in [`Self::parts`],
     /// kept as long as a [`PassCache`] keeps them.
     unions: std::sync::Mutex<UnionCache>,
@@ -713,6 +750,36 @@ pub(crate) struct QuantizedPolygons {
     /// By leading feature, the merged groups found valid and the lone
     /// features' repairs, so the next pass replays them.
     verdicts: std::sync::Mutex<PassCache<u32, GroupVerdict>>,
+    /// By leading feature, in dense mode, the pairs that joined a merged
+    /// group's parts, so a pass that merges the same group again replays
+    /// them instead of sweeping it (#908).
+    joins: std::sync::Mutex<PassCache<u32, GroupJoins>>,
+}
+
+/// The pairs, as local part numbers, that joined `group`'s parts: at most
+/// one per part, and the components they give are the group's.
+struct GroupJoins {
+    group: Box<[u32]>,
+    pairs: std::sync::Arc<[(u32, u32)]>,
+}
+
+/// `test()`, remembered in `state`: 0 not tested yet, 1 false, 2 true.
+/// Threads that race test it twice and store the same answer.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: a per-operation cache slot of QuantizedPolygons; no diagnostic globals"
+)]
+fn remembered(state: &std::sync::atomic::AtomicU8, test: impl FnOnce() -> bool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match state.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let answer = test();
+            state.store(if answer { 2 } else { 1 }, Relaxed);
+            answer
+        }
+    }
 }
 
 /// A merged group found valid, or a lone feature's repair.
@@ -849,6 +916,7 @@ impl QuantizedPolygons {
             }
         }
         let features_len = features.len();
+        let parts_len = parts.len();
         drop(geometries);
         drop(feature_keys);
         // The box-meeting pairs that share a key; the exact test waits until
@@ -861,7 +929,7 @@ impl QuantizedPolygons {
         // allocate millions of pairs only to discard them at the cap.
         // Per-part degrees also give exact capacities on the stored path.
         let mut degrees = vec![0usize; parts.len()];
-        let too_many = any_box_pair(&boxes, |i, j| {
+        let too_many = strip_box_pairs(&boxes, |i, j| {
             if keys[i] == keys[j] {
                 degrees[i] += 1;
                 degrees[j] += 1;
@@ -877,7 +945,7 @@ impl QuantizedPolygons {
         } else {
             let mut candidates: Vec<_> = degrees.into_iter().map(Vec::with_capacity).collect();
             slots = 0;
-            any_box_pair(&boxes, |i, j| {
+            strip_box_pairs(&boxes, |i, j| {
                 if keys[i] == keys[j] {
                     candidates[i].push((j as u32, slots));
                     candidates[j].push((i as u32, slots));
@@ -897,11 +965,15 @@ impl QuantizedPolygons {
             interacts: (0..slots)
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
+            clean: (0..parts_len)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
             unions: std::sync::Mutex::default(),
             lone: (0..features_len)
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
             verdicts: std::sync::Mutex::default(),
+            joins: std::sync::Mutex::default(),
         })
     }
 
@@ -909,17 +981,10 @@ impl QuantizedPolygons {
     /// once and remembered. Any thread may test a pair no thread has
     /// recorded yet; the answer is the same either way, so none waits.
     fn interact(&self, a: usize, b: usize, slot: u32) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        let state = &self.interacts[slot as usize];
-        match state.load(Relaxed) {
-            1 => false,
-            2 => true,
-            _ => {
-                let hit = parts_interact(&self.parts[a], &self.parts[b]);
-                state.store(if hit { 2 } else { 1 }, Relaxed);
-                hit
-            }
-        }
+        remembered(&self.interacts[slot as usize], || {
+            let clean = |i: usize| remembered(&self.clean[i], || part_clean(&self.parts[i]));
+            clean_parts_interact(&self.parts[a], &self.parts[b], clean(a) && clean(b))
+        })
     }
 
     /// Start a new pass: unions and verdicts the last pass used stay
@@ -928,6 +993,7 @@ impl QuantizedPolygons {
         let unions = self.unions.get_mut().expect("union cache");
         unions.unions.next_pass();
         self.verdicts.get_mut().expect("verdicts").next_pass();
+        self.joins.get_mut().expect("joins").next_pass();
     }
 
     /// Components served from the cache so far.
@@ -1036,7 +1102,7 @@ impl QuantizedPolygons {
                             .iter()
                             .for_each(|&(i, j)| join(i, j, &|| true));
                     } else {
-                        interacting_pairs(parts, join);
+                        self.dense_pairs(leader, group, parts, join);
                     }
                 },
                 |group, parts| self.union_cached(group, parts, &globals),
@@ -1078,6 +1144,49 @@ impl QuantizedPolygons {
                 .remove(&(leader as u32));
         }
         Some(encoded(commands))
+    }
+
+    /// Dense mode's pairs for the merged `group` led by `leader`: the pairs
+    /// that joined it when this pass or the last one merged the same
+    /// features, else a sweep, whose joining pairs are kept for the next.
+    /// Only connectivity reaches the output, so replaying the joins gives
+    /// the sweep's components.
+    fn dense_pairs(
+        &self,
+        leader: usize,
+        group: &[usize],
+        parts: &[Vec<TileRing>],
+        join: &mut PartJoin<'_>,
+    ) {
+        let same_group = |j: &GroupJoins| {
+            j.group
+                .iter()
+                .map(|&i| i as usize)
+                .eq(group.iter().copied())
+        };
+        let known = self
+            .joins
+            .lock()
+            .expect("joins")
+            .get(&(leader as u32), same_group)
+            .map(|j| std::sync::Arc::clone(&j.pairs));
+        if let Some(pairs) = known {
+            for &(i, j) in pairs.iter() {
+                join(i as usize, j as usize, &|| true);
+            }
+            return;
+        }
+        let pairs: std::sync::Arc<[(u32, u32)]> = joining_pairs(parts).into();
+        for &(i, j) in pairs.iter() {
+            join(i as usize, j as usize, &|| true);
+        }
+        self.joins.lock().expect("joins").insert(
+            leader as u32,
+            GroupJoins {
+                group: group.iter().map(|&i| i as u32).collect(),
+                pairs,
+            },
+        );
     }
 
     /// The interacting pairs among the parts `globals`, numbered by their
@@ -2111,6 +2220,109 @@ mod tests {
         assert!(
             QuantizedPolygons::new(grid.iter().map(|g| (g, 0)), &test_bounds(), 4096).is_some()
         );
+    }
+
+    /// #908: the parallel sweep's joins give the components an all-pairs
+    /// test gives, on enough parts to take the parallel path (squares that
+    /// overlap, touch at an edge or corner, nest, or stand apart).
+    #[test]
+    fn joining_pairs_give_the_all_pairs_components() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut random = |n: i32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as i32
+        };
+        let parts: Vec<Vec<TileRing>> = (0..1_000)
+            .map(|_| {
+                let (x, y, s) = (random(420), random(420), 1 + random(12));
+                vec![vec![(x, y), (x + s, y), (x + s, y + s), (x, y + s), (x, y)]]
+            })
+            .collect();
+        fn root(r: &mut [usize], mut i: usize) -> usize {
+            while r[i] != i {
+                i = r[i];
+            }
+            i
+        }
+        let mut expected: Vec<usize> = (0..parts.len()).collect();
+        for i in 0..parts.len() {
+            for j in i + 1..parts.len() {
+                if parts_interact(&parts[i], &parts[j]) {
+                    let (a, b) = (root(&mut expected, i), root(&mut expected, j));
+                    expected[a] = b;
+                }
+            }
+        }
+        let pairs = joining_pairs(&parts);
+        let mut got: Vec<usize> = (0..parts.len()).collect();
+        for &(i, j) in &pairs {
+            let (a, b) = (root(&mut got, i as usize), root(&mut got, j as usize));
+            assert_ne!(a, b, "a joining pair closes a cycle");
+            got[a] = b;
+        }
+        // Same partition: every part's component, named by its smallest part.
+        let label = |r: &mut Vec<usize>| {
+            let mut first = vec![usize::MAX; r.len()];
+            (0..r.len())
+                .map(|i| {
+                    let c = root(r, i);
+                    first[c] = first[c].min(i);
+                    c
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|c| first[c])
+                .collect::<Vec<_>>()
+        };
+        let (expected, got) = (label(&mut expected), label(&mut got));
+        assert!(
+            expected
+                .iter()
+                .enumerate()
+                .filter(|&(i, &c)| c != i)
+                .count()
+                > 100
+        );
+        assert_eq!(got, expected);
+    }
+
+    /// #908: a dense tile re-encodes the same merged groups on later
+    /// passes. Each distinct group is swept once while the pass cache keeps
+    /// it; a group with other members is swept again.
+    #[test]
+    fn quantized_polygons_sweep_a_repeated_group_once() {
+        let stacked: Vec<Geometry> = (0..300)
+            .map(|i| square(0.2 + 1e-4 * f64::from(i), 0.2, 0.3).into())
+            .collect();
+        let all: Vec<usize> = (0..300).collect();
+        let thirds: Vec<usize> = (0..300).step_by(3).collect();
+        let (all_ref, thirds_ref) = (
+            merged_reference(&stacked, &all),
+            merged_reference(&stacked, &thirds),
+        );
+        let (_, counts) = crate::valve_counter::measure(|| {
+            let mut q =
+                QuantizedPolygons::new(stacked.iter().map(|g| (g, 0)), &test_bounds(), 4096)
+                    .expect("dense tiles retain quantized parts");
+            assert!(q.candidates.is_none());
+            for (group, reference) in [
+                (&all, &all_ref),
+                (&all, &all_ref),
+                (&all, &all_ref),
+                (&thirds, &thirds_ref),
+                (&thirds, &thirds_ref),
+            ] {
+                assert_eq!(
+                    &q.encode(group, &crate::diagnostics::Diagnostics::default())
+                        .unwrap(),
+                    reference,
+                );
+                q.next_pass();
+            }
+        });
+        assert_eq!(counts.part_sweeps, 2, "{counts:#?}");
     }
 
     #[test]
@@ -3965,6 +4177,93 @@ mod tests {
         assert!(
             meet > 20 && apart > 20 && vertex_only > 5,
             "meet={meet} apart={apart} vertex_only={vertex_only}"
+        );
+    }
+
+    /// #908: in the candidate path, a part in several pairs is checked
+    /// alone once, not once per pair (at z10 of #908 this was half the
+    /// export's time).
+    #[test]
+    fn quantized_polygons_check_each_part_alone_once() {
+        // A row of squares, each overlapping the next: few candidates each.
+        let row: Vec<Geometry> = (0..40)
+            .map(|i| square(0.1 + 0.01 * f64::from(i), 0.3, 0.012).into())
+            .collect();
+        let q = QuantizedPolygons::new(row.iter().map(|g| (g, 0)), &test_bounds(), 4096)
+            .expect("polygons quantize");
+        let candidates = q
+            .candidates
+            .as_ref()
+            .expect("a sparse tile keeps candidates");
+        let pairs: Vec<(usize, usize, u32)> = candidates
+            .iter()
+            .enumerate()
+            .flat_map(|(g, c)| c.iter().map(move |&(h, slot)| (g, h as usize, slot)))
+            .filter(|&(g, h, _)| g < h)
+            .collect();
+        assert!(pairs.len() > 30, "{}", pairs.len());
+        tile_polygon::CHECKS.with(|c| c.set(0));
+        for &(g, h, slot) in &pairs {
+            assert!(q.interact(g, h, slot), "overlapping squares interact");
+        }
+        let checks = tile_polygon::CHECKS.with(|c| c.get());
+        assert!(
+            checks <= pairs.len() + q.parts.len(),
+            "{checks} checks for {} pairs of {} parts",
+            pairs.len(),
+            q.parts.len()
+        );
+    }
+
+    /// #908: the pair test splits into each part alone plus what lies
+    /// between them, and that split gives the whole check's answer, on
+    /// parts with holes, parts invalid alone, and parts far apart.
+    #[test]
+    fn pair_test_matches_the_whole_check() {
+        let mut seed = 0x9e37_79b9_u64;
+        let ring = |x: i32, y: i32, size: u32, seed: &mut u64| {
+            // Mostly rectangles, which are valid; random rings often are not.
+            if !lcg(seed).is_multiple_of(5) {
+                let (w, h) = (1 + (lcg(seed) % size) as i32, 1 + (lcg(seed) % size) as i32);
+                return closed(&[(x, y), (x + w, y), (x + w, y + h), (x, y + h)]);
+            }
+            let n = 3 + (lcg(seed) % 5) as usize;
+            let mut pts: Vec<(i32, i32)> = Vec::new();
+            while pts.len() < n {
+                let p = (x + (lcg(seed) % size) as i32, y + (lcg(seed) % size) as i32);
+                if !pts.contains(&p) {
+                    pts.push(p);
+                }
+            }
+            closed(&pts)
+        };
+        let part = |x: i32, y: i32, seed: &mut u64| {
+            let mut rings = vec![ring(x, y, 12, seed)];
+            if lcg(seed).is_multiple_of(2) {
+                rings.push(ring(x + 3, y + 3, 6, seed));
+            }
+            rings
+        };
+        let (mut clean_bad, mut clean_ok, mut unclean, mut far) = (0, 0, 0, 0);
+        for _ in 0..4000 {
+            let a = part(0, 0, &mut seed);
+            let (dx, dy) = (
+                (lcg(&mut seed) % 30) as i32 - 6,
+                (lcg(&mut seed) % 10) as i32 - 3,
+            );
+            let b = part(dx, dy, &mut seed);
+            let whole = tile_polygon::check_polygons(&[a.clone(), b.clone()]).is_err();
+            assert_eq!(parts_interact(&a, &b), whole, "{a:?} {b:?}");
+            match (part_clean(&a) && part_clean(&b), whole) {
+                (true, true) => clean_bad += 1,
+                (true, false) if dx > 12 => far += 1,
+                (true, false) => clean_ok += 1,
+                (false, _) => unclean += 1,
+            }
+        }
+        assert!(
+            clean_bad > 50 && clean_ok > 50 && unclean > 50 && far > 50,
+            "clean_bad={clean_bad} clean_ok={clean_ok} unclean={unclean} far={far}"
         );
     }
 

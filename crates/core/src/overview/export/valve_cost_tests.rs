@@ -153,8 +153,19 @@ fn valve_price_narrows_only_when_the_wave_or_group_does_not_fit() {
     let cap = |bytes, budget: &MemoryBudget| {
         level_group_member_cap(8, 100_000, Some(bytes), MemoryProfile::Auto, Some(budget))
     };
+    // The widest wave a level of eight such partitions cuts into at
+    // ceiling 8 (#876).
     let wave = |bytes, budget: &MemoryBudget| {
-        memory_safe_level_wave(8, &partitions, Some(bytes), MemoryProfile::Auto, budget)
+        let eight = (0..8)
+            .map(|k| Partition {
+                key_lo: k,
+                key_hi: k,
+                bbox: PruneRegion::of(TileBounds::new(0.0, 0.0, 0.0, 0.0)),
+                members: partitions[0].members,
+            })
+            .collect();
+        let cap = memory_safe_wave_members(Some(bytes), MemoryProfile::Auto, budget);
+        LevelPlan::cut(0, eight, 8, cap).widest_wave()
     };
     let tight = MemoryBudget::with_available(Some(1024 * 1024 * 1024));
     assert!(cap(merged, &tight) < cap(base, &tight));
@@ -198,24 +209,12 @@ fn valve_price_keeps_preflight_threshold_and_prices_the_wave() {
         )
     };
     let plans = plan(base * 100_000).expect("the pre-valve refusal price must still fit");
-    let expected = memory_safe_level_wave(
-        8,
-        &plans[0].partitions,
-        Some(merged),
-        MemoryProfile::Auto,
-        &budget,
+    let cap = |bytes| memory_safe_wave_members(Some(bytes), MemoryProfile::Auto, &budget);
+    assert_eq!(
+        plans[0].wave_starts,
+        cut_waves(&plans[0].partitions, 8, cap(merged)).0
     );
-    assert_eq!(plans[0].wave, expected);
-    assert!(
-        expected
-            < memory_safe_level_wave(
-                8,
-                &plans[0].partitions,
-                Some(base),
-                MemoryProfile::Auto,
-                &budget,
-            )
-    );
+    assert!(cap(merged) < cap(base), "the valve price narrows the wave");
     assert!(matches!(
         plan(base * 100_000 - 1),
         Err(ExportError::TileExceedsMemory { .. })
@@ -457,6 +456,12 @@ fn valve_work_overlapping_parts_is_bounded() {
             && c.parts_interact <= 4 * rows
             && c.draw_elements <= 2 * rows,
         "dense tile exceeded work budgets: {c:#?}"
+    );
+    // #908: a group a pass already swept is replayed, not swept again
+    // (3948 sweeps here when every pass re-sweeps its groups).
+    assert!(
+        c.part_sweeps <= 2_600,
+        "dense groups swept again on later passes: {c:#?}"
     );
 }
 

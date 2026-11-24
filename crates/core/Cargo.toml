@@ -81,6 +81,7 @@ mlt-core = { workspace = true, optional = true }
 tiny_http = { version = "0.12", optional = true }
 percent-encoding = { version = "2", optional = true }
 rayon = { workspace = true }
+uf_rush = "0.2.1"
 crossbeam-channel = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
