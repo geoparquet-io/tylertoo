@@ -6,10 +6,14 @@
 //!
 //! The export scan ([`super::scan_all_levels`]) already visits every row's
 //! bbox and every tile it lands in. With `smooth` it also follows each
-//! tile's own members in file order ([`Scan`]): a member count, the band
-//! holding most of them, and, from the tile's 1,024th member on, a
-//! half-octave histogram of each member's gap to the tile's previous member
-//! in its band (the merge valve's gap measure, [`gap_to_rect`]).
+//! tile's own members in file order ([`Scan`]): a member count, and once a
+//! tile holds 1,023 members the band holding most of them from there on and,
+//! from its 1,024th member on, a half-octave histogram of each member's gap
+//! to the tile's previous member in its band (the merge valve's gap measure,
+//! [`gap_to_rect`]). A tile below that holds only its count, as the scan's
+//! tile counts do; the rest is checked against the scan's memory budget
+//! after every batch, and dropped with a warning when it is over
+//! (`--valve-scope tile` from there on).
 //!
 //! After the scan each tile's need is predicted ([`Scan::predict`]):
 //!
@@ -21,8 +25,9 @@
 //!    to nothing when a column is constant, nested columns written as JSON),
 //!    and gzip ratios run 0.2 (Madagascar adm4, 53 columns) to 0.6. Every
 //!    tile with a histogram is priced by the 256 members the scan kept from
-//!    its 1,024th on; those that puts near a cap, by its first 4,096 in the
-//!    band holding most of them. Only tiles estimated well over (`f < PREDICT_BELOW_FIT`)
+//!    its 1,024th on; those that puts near a cap, by its first 4,096 from
+//!    its 1,023rd on in the band holding most of them. Only tiles estimated
+//!    well over (`f < PREDICT_BELOW_FIT`)
 //!    get a need: a false positive puts floors on its neighbours, a missed
 //!    near-cap tile only skips a small step.
 //! 2. Need: the merge valve's threshold is a gap quantile. It keeps about
@@ -91,16 +96,16 @@ type Hist = Box<[u32; BUCKETS]>;
 /// Raw and gzipped MVT bytes of one member.
 pub(crate) type MemberBytes = (f64, f64);
 
-/// One tile's scan state. Everything in it depends only on the tile's own
-/// members, in file order, so a shard that holds all of a tile's rows (any
-/// tile in its range) computes what a monolithic build does, whatever rows
-/// around them it pruned.
-#[derive(Default)]
-struct TileStat {
-    count: u64,
+/// The scan state of a tile from its member [`DENSE_FROM`] on; before that a
+/// tile holds only its member count ([`Part::counts`]), so the predictor
+/// costs a sparse tile what the scan's tile count does. Everything in it
+/// depends only on the tile's own members, in file order, so a shard that
+/// holds all of a tile's rows (any tile in its range) computes what a
+/// monolithic build does, whatever rows around them it pruned.
+struct Dense {
     /// From the member that reaches [`HIST_MIN_MEMBERS`] on: each member's
     /// gap to the tile's previous member in its band.
-    hist: Option<Hist>,
+    hist: Hist,
     /// The previous member's band and bbox centre (world units).
     prev: Option<(u16, (f64, f64))>,
     /// The band being counted: `(band, members, first and last member's
@@ -109,14 +114,49 @@ struct TileStat {
     /// The band with the most members so far, lowest on a tie, as `run`.
     best: Run,
     /// The band and band row of the first [`PRICE_MEMBERS`] members from
-    /// the one that reaches [`HIST_MIN_MEMBERS`]: the rows it is priced by.
-    price_rows: Vec<(u16, u64)>,
+    /// the one that reaches [`HIST_MIN_MEMBERS`], packed by [`pack_row`]:
+    /// the rows it is priced by.
+    price_rows: Vec<u64>,
+}
+
+/// A tile turns [`Dense`] at this member: the one before the histogram's
+/// first, whose centre the first gap is measured from.
+const DENSE_FROM: u64 = HIST_MIN_MEMBERS - 1;
+
+/// `(band, band row)` in one word: a band row is below 2^48.
+fn pack_row(band: u16, row: u64) -> u64 {
+    (u64::from(band) << 48) | (row & ((1 << 48) - 1))
+}
+
+fn unpack_row(packed: u64) -> (u16, u64) {
+    ((packed >> 48) as u16, packed & ((1 << 48) - 1))
+}
+
+impl Default for Dense {
+    fn default() -> Self {
+        Self {
+            hist: Box::new([0; BUCKETS]),
+            prev: None,
+            run: Run::default(),
+            best: Run::default(),
+            price_rows: Vec::with_capacity(PRICE_MEMBERS),
+        }
+    }
+}
+
+/// One of a level's [`PARTS`] maps: every tile's member count, and the
+/// state of those past [`DENSE_FROM`].
+#[derive(Default)]
+struct Part {
+    counts: HashMap<u64, u64>,
+    dense: HashMap<u64, Dense>,
 }
 
 type Run = (u16, u32, u64, u64);
 
-impl TileStat {
-    /// The band its members are sampled in: the one holding the most.
+impl Dense {
+    /// The band its members are sampled in: the one holding the most of
+    /// its members from [`DENSE_FROM`] on.
     fn densest_run(&self) -> Run {
         if self.run.1 > self.best.1 {
             self.run
@@ -141,7 +181,10 @@ pub(crate) struct SampleAt {
 /// The predictor's share of the scan: per level, per tile key, the keys
 /// split into [`PARTS`] maps so a level's tiles update in parallel.
 pub(crate) struct Scan {
-    levels: Vec<[HashMap<u64, TileStat>; PARTS]>,
+    levels: Vec<[Part; PARTS]>,
+    /// The dense state outgrew the scan's budget and was dropped
+    /// ([`Self::shed`]): only the counts go on, and nothing is predicted.
+    shed: bool,
     /// The band being read, and its rows already sized.
     band: Option<usize>,
     band_rows: u64,
@@ -285,8 +328,9 @@ impl Scan {
     pub(crate) fn new(levels: usize) -> Self {
         Self {
             levels: (0..levels)
-                .map(|_| std::array::from_fn(|_| HashMap::new()))
+                .map(|_| std::array::from_fn(|_| Part::default()))
                 .collect(),
+            shed: false,
             band: None,
             band_rows: 0,
             pending: Vec::new(),
@@ -296,33 +340,60 @@ impl Scan {
     }
 
     /// Bytes the per-tile state holds: charged to the export's budget.
+    /// O(maps): checked against the scan's budget after every batch.
     pub(crate) fn resident_bytes(&self) -> u64 {
-        let entry = std::mem::size_of::<(u64, TileStat)>() as u64 + 1;
-        let hist = std::mem::size_of::<[u32; BUCKETS]>() as u64
-            + (PRICE_MEMBERS * std::mem::size_of::<(u16, u64)>()) as u64;
+        let count = std::mem::size_of::<(u64, u64)>() as u64 + 1;
+        let dense = std::mem::size_of::<(u64, Dense)>() as u64 + 1;
+        let heap = std::mem::size_of::<[u32; BUCKETS]>() as u64
+            + (PRICE_MEMBERS * std::mem::size_of::<u64>()) as u64;
         self.levels
             .iter()
             .flatten()
-            .map(|l| {
-                l.capacity() as u64 * entry
-                    + l.values().filter(|t| t.hist.is_some()).count() as u64 * hist
+            .map(|p| {
+                p.counts.capacity() as u64 * count
+                    + p.dense.capacity() as u64 * dense
+                    + p.dense.len() as u64 * heap
             })
             .sum()
     }
 
-    /// Level `level`'s tiles and their member counts: the export scan's tile
-    /// counts, which it takes from here when it predicts.
-    pub(crate) fn tile_counts(&self, level: usize) -> std::collections::BTreeMap<u64, usize> {
-        self.levels[level]
-            .iter()
-            .flatten()
-            .map(|(&key, t)| (key, t.count as usize))
+    /// Drop every tile's dense state, keeping the counts the export scan
+    /// takes from here: the predictor outgrew the scan's budget, and the
+    /// export goes on as under `--valve-scope tile`.
+    pub(crate) fn shed(&mut self) {
+        self.shed = true;
+        for p in self.levels.iter_mut().flatten() {
+            p.dense = HashMap::new();
+        }
+    }
+
+    pub(crate) fn is_shed(&self) -> bool {
+        self.shed
+    }
+
+    /// Every level's tiles and their member counts: the export scan's tile
+    /// counts, which it takes from here when it predicts. Each map is freed
+    /// as it is copied, so the two are never both whole.
+    pub(crate) fn into_tile_counts(self) -> Vec<std::collections::BTreeMap<u64, usize>> {
+        self.levels
+            .into_iter()
+            .map(|parts| {
+                let mut out = std::collections::BTreeMap::new();
+                for p in parts {
+                    drop(p.dense);
+                    out.extend(p.counts.into_iter().map(|(k, c)| (k, c as usize)));
+                }
+                out
+            })
             .collect()
     }
 
     /// Forget everything: the scan restarts from the geometry.
+    /// A shed scan stays shed: the rescan reads the same rows.
     pub(crate) fn reset(&mut self) {
+        let shed = self.shed;
         *self = Self::new(self.levels.len());
+        self.shed = shed;
     }
 
     /// One batch of band `j`'s rows, row-aligned (`None`: no bbox), fanned
@@ -383,6 +454,7 @@ impl Scan {
         // Per level, per run of rows, each map's (key, row) members in file
         // order; then each map follows its members in that order.
         let range = self.pending_levels.clone();
+        let shed = self.shed;
         let fanned: Vec<Vec<Fanned>> = zooms[range.clone()]
             .par_iter()
             .map(|&zoom| {
@@ -410,12 +482,20 @@ impl Scan {
             .zip(fanned)
             .zip(&zooms[range])
             .for_each(|((level, fanned), &zoom)| {
-                level.par_iter_mut().enumerate().for_each(|(p, tiles)| {
+                level.par_iter_mut().enumerate().for_each(|(p, part)| {
                     for &(key, first, last) in fanned.iter().flat_map(|run| &run[p]) {
-                        let t = tiles.entry(key).or_default();
-                        for i in first..=last {
+                        let count = part.counts.entry(key).or_insert(0);
+                        let before = *count;
+                        *count += u64::from(last - first) + 1;
+                        if shed || *count < DENSE_FROM {
+                            continue;
+                        }
+                        // The members before the tile's `DENSE_FROM`th need
+                        // only their count.
+                        let skip = DENSE_FROM.saturating_sub(before + 1) as u32;
+                        let t = part.dense.entry(key).or_default();
+                        for (n, i) in (before + 1 + u64::from(skip)..).zip(first + skip..=last) {
                             let (_, corners, centre, valved, row) = &rows[i as usize];
-                            t.count = t.count.saturating_add(1);
                             if t.run.0 != band || t.run.1 == 0 {
                                 if t.run.1 > t.best.1 {
                                     t.best = t.run;
@@ -431,13 +511,12 @@ impl Scan {
                                 _ => GAP_NONE,
                             };
                             t.prev = Some((band, *centre));
-                            if t.count >= HIST_MIN_MEMBERS {
+                            if n >= HIST_MIN_MEMBERS {
                                 if t.price_rows.len() < PRICE_MEMBERS {
-                                    t.price_rows.push((band, *row));
+                                    t.price_rows.push(pack_row(band, *row));
                                 }
-                                let h = t.hist.get_or_insert_with(|| Box::new([0; BUCKETS]));
                                 if gap != GAP_NONE {
-                                    h[bucket(gap, zoom)] += 1;
+                                    t.hist[bucket(gap, zoom)] += 1;
                                 }
                             }
                         }
@@ -458,10 +537,12 @@ impl Scan {
 
     /// The rows `at` (one of [`Self::priced`]) is first priced by, as
     /// `(band, band row)`, in file order.
-    pub(crate) fn price_rows(&self, at: &SampleAt) -> &[(u16, u64)] {
+    pub(crate) fn price_rows(&self, at: &SampleAt) -> impl Iterator<Item = (u16, u64)> + '_ {
         self.levels[at.level][part(at.key)]
+            .dense
             .get(&at.key)
-            .map_or(&[], |t| &t.price_rows)
+            .into_iter()
+            .flat_map(|t| t.price_rows.iter().map(|&r| unpack_row(r)))
     }
 
     /// The tiles worth a larger sample: estimated under `CANDIDATE_FIT` at
@@ -472,27 +553,43 @@ impl Scan {
         opts: &ExportOptions,
     ) -> Vec<SampleAt> {
         let caps = caps(opts);
-        self.select(|s, t| {
+        self.select(|s, count| {
             bytes
                 .get(&(s.level, s.key))
-                .is_some_and(|&b| fit(t.count, b, caps) < CANDIDATE_FIT)
+                .is_some_and(|&b| fit(count, b, caps) < CANDIDATE_FIT)
         })
     }
 
-    fn select(&self, keep: impl Fn(&SampleAt, &TileStat) -> bool) -> Vec<SampleAt> {
-        let mut out: Vec<SampleAt> = self
-            .levels
+    /// Tile `key`'s members at `level`.
+    fn count(&self, level: usize, key: u64) -> u64 {
+        self.levels[level][part(key)]
+            .counts
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Each dense tile with a histogram, its level, key and member count.
+    fn dense(&self) -> impl Iterator<Item = (usize, u64, &Dense, u64)> + '_ {
+        self.levels
             .iter()
             .enumerate()
-            .flat_map(|(level, tiles)| {
-                tiles
-                    .iter()
-                    .flatten()
-                    // An empty histogram predicts nothing: not worth pricing.
-                    .filter(|(_, t)| t.hist.as_ref().is_some_and(|h| h.iter().any(|&c| c > 0)))
-                    .map(move |(&key, t)| (sample_at(level, key, t), t))
+            .flat_map(move |(level, parts)| {
+                parts.iter().flat_map(move |p| {
+                    p.dense
+                        .iter()
+                        // An empty histogram predicts nothing: not worth pricing.
+                        .filter(|(_, t)| t.hist.iter().any(|&c| c > 0))
+                        .map(move |(&key, t)| (level, key, t, p.counts[&key]))
+                })
             })
-            .filter(|(s, t)| keep(s, t))
+    }
+
+    fn select(&self, keep: impl Fn(&SampleAt, u64) -> bool) -> Vec<SampleAt> {
+        let mut out: Vec<SampleAt> = self
+            .dense()
+            .map(|(level, key, t, count)| (sample_at(level, key, t), count))
+            .filter(|(s, count)| keep(s, *count))
             .map(|(s, _)| s)
             .collect();
         out.sort_by_key(|s| (s.level, s.key));
@@ -514,16 +611,14 @@ impl Scan {
             SizeValve::Drop => predict_drop_need,
         };
         let mut out = HashMap::new();
-        for (index, (level, &zoom)) in self.levels.iter().zip(zooms).enumerate() {
-            for (&key, t) in level.iter().flatten() {
-                let Some(hist) = &t.hist else { continue };
-                let Some(&b) = bytes.get(&(index, key)) else {
-                    continue;
-                };
-                if let Some(need) = need(hist, t.count, zoom, b, caps) {
-                    let (x, y) = key_to_xy(key, zoom);
-                    out.insert((zoom, x, y), need);
-                }
+        for (level, key, t, count) in self.dense() {
+            let Some(&b) = bytes.get(&(level, key)) else {
+                continue;
+            };
+            let zoom = zooms[level];
+            if let Some(need) = need(&t.hist, count, zoom, b, caps) {
+                let (x, y) = key_to_xy(key, zoom);
+                out.insert((zoom, x, y), need);
             }
         }
         out
@@ -588,13 +683,9 @@ impl Scan {
                 return false;
             };
             let key = super::tile_key(x, y, z);
-            match (
-                self.levels[level][part(key)].get(&key),
-                bytes.get(&(level, key)),
-            ) {
-                (Some(t), Some(&b)) => fit(t.count, b, caps) < 1.0,
-                _ => false,
-            }
+            bytes
+                .get(&(level, key))
+                .is_some_and(|&b| fit(self.count(level, key), b, caps) < 1.0)
         };
         let mut out = need.clone();
         for (&(z, x, y), &m) in need {
@@ -616,7 +707,7 @@ impl Scan {
     }
 }
 
-fn sample_at(level: usize, key: u64, t: &TileStat) -> SampleAt {
+fn sample_at(level: usize, key: u64, t: &Dense) -> SampleAt {
     SampleAt {
         level,
         key,
@@ -814,10 +905,14 @@ mod tests {
                 level: 0,
                 key,
                 band: 1,
-                row: 100,
+                // Band 1's member 523, the tile's 1,023rd.
+                row: 622,
                 last: 70_099
             }]
         );
+        // The far tile, under a thousand members, holds only its count.
+        let held = |f: fn(&Part) -> usize| scan.levels[0].iter().map(f).sum::<usize>();
+        assert_eq!((held(|p| p.counts.len()), held(|p| p.dense.len())), (2, 1));
         // 70,500 members at 100 bytes raw: 3.4x the 2 MiB cap.
         let over = HashMap::from([((0, key), (100.0, 20.0))]);
         assert_eq!(scan.candidates(&over, &opts), priced);
@@ -859,26 +954,25 @@ mod tests {
         let key = key_of(inside(0));
         let at = |rows: &[(u32, Option<TileBounds>)]| {
             let scan = scan_of(&[rows.iter().map(|r| r.1).collect()]);
-            let t = &scan.levels[0][part(key)][&key];
+            let t = &scan.levels[0][part(key)].dense[&key];
             let s: Vec<_> = scan.priced().into_iter().filter(|s| s.key == key).collect();
             assert_eq!(s.len(), 1);
             let bytes = HashMap::from([((0, key), (100.0, 20.0))]);
             (
-                t.count,
+                scan.count(0, key),
                 t.hist.clone(),
                 // The sampled rows, by identity.
                 rows[s[0].row as usize].0,
                 scan.price_rows(&s[0])
-                    .iter()
-                    .map(|&(_, r)| rows[r as usize].0)
+                    .map(|(_, r)| rows[r as usize].0)
                     .collect::<Vec<_>>(),
                 scan.predict(&[10], &bytes, &opts),
             )
         };
         let (a, b) = (at(&full), at(&shard));
         assert_eq!(a.0, 30_000);
-        assert!(a.1.is_some());
-        assert_eq!(a.2, 0, "sampled from the tile's first member");
+        assert!(a.1.iter().any(|&c| c > 0));
+        assert_eq!(a.2, 1022, "sampled from the member the tile turns dense at");
         assert_eq!(
             a.3,
             (1023..1023 + PRICE_MEMBERS as u32).collect::<Vec<_>>(),

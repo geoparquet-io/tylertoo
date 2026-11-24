@@ -2854,42 +2854,20 @@ fn export_pmtiles_validated(
             variable_depth::VdScan::new(&meta, reader.geo_metadata_json(), level_zooms.clone())
         })
         .transpose()?;
-    // #768: the predictor's share of the scan, for `--valve-scope smooth`
-    // and `zoom`.
-    let mut predict = valve_predicts(options).then(|| valve_predict::Scan::new(num_levels));
-    let mut scans = scan_all_levels(
-        &reader,
-        BandRead {
-            source: reader.source(),
-            budget: *budget,
-            profile: options.profile,
-        },
-        crs,
-        options,
-        &timers,
-        vd_scan.as_mut(),
-        predict.as_mut(),
-        diagnostics,
-    )?;
     // #768: the valve floors, from the whole scan (before a shard restricts
     // it). Each tile's need comes from its own members alone, so a shard,
     // which holds every row of the tiles in its range and of their
     // neighbours (`shard::SHARD_READ_MARGIN_TILES`), predicts the floors the
     // full build does.
-    let floors = match predict {
-        Some(p) => {
-            // Its per-tile state stays resident until the floors are built.
-            budget.reserve_up_to(MemoryPhase::Scan, p.resident_bytes());
-            predict_floors(
-                &reader,
-                (&published, feature_id.as_ref()),
-                crs,
-                (options, &level_zooms),
-                &p,
-            )?
-        }
-        None => valve_predict::ValveFloors::default(),
-    };
+    let (mut scans, floors) = scan_with_floors(
+        &reader,
+        crs,
+        (&published, feature_id.as_ref()),
+        (options, &level_zooms),
+        budget,
+        (&timers, vd_scan.as_mut()),
+        diagnostics,
+    )?;
 
     // #498: a sharded build's export owns a slice of the tile space, not all
     // of it. Restricting the SCAN — the per-zoom tile-count map every
@@ -3774,6 +3752,83 @@ fn resolve_export_columns(
     })
 }
 
+/// The export scan ([`scan_all_levels`]), with the #768 valve predictor
+/// riding along under `--valve-scope smooth|zoom`, and the floors it
+/// predicts. The predictor's state is charged to `budget` while the floors
+/// are priced and returned once they are built; the scan's tile counts,
+/// which the predictor holds, are copied out after.
+fn scan_with_floors(
+    reader: &OverviewReader,
+    crs: Crs,
+    cols: (&PublishedNames, Option<&ResolvedFeatureId>),
+    (options, level_zooms): (&ExportOptions, &[u8]),
+    budget: &mut MemoryBudget,
+    (timers, vd): (&ExportTimers, Option<&mut variable_depth::VdScan>),
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<(Vec<LevelScan>, valve_predict::ValveFloors), ExportError> {
+    let mut predict =
+        valve_predicts(options).then(|| valve_predict::Scan::new(reader.num_levels()));
+    let band = BandRead {
+        source: reader.source(),
+        budget: *budget,
+        profile: options.profile,
+    };
+    let mut scans = scan_all_levels(
+        reader,
+        band,
+        crs,
+        options,
+        timers,
+        vd,
+        predict.as_mut(),
+        diagnostics,
+    )?;
+    let Some(p) = predict else {
+        return Ok((scans, valve_predict::ValveFloors::default()));
+    };
+    log::info!(
+        "[export] valve predictor state: {:.1} MiB",
+        p.resident_bytes() as f64 / f64::from(1 << 20)
+    );
+    let held = budget.reserve_up_to(MemoryPhase::Scan, p.resident_bytes());
+    let floors = if p.is_shed() {
+        Ok(valve_predict::ValveFloors::default())
+    } else {
+        predict_floors(reader, cols, crs, (options, level_zooms), &p)
+    };
+    budget.unreserve(MemoryPhase::Scan, held);
+    for (scan, counts) in scans.iter_mut().zip(p.into_tile_counts()) {
+        scan.tile_counts = counts;
+    }
+    Ok((scans, floors?))
+}
+
+/// #768: drop the predictor's dense state when it outgrows what the scan
+/// may hold under `band`'s budget, and say so: the export goes on with the
+/// tile counts alone, as under `--valve-scope tile`.
+fn shed_over_budget(
+    p: &mut valve_predict::Scan,
+    band: BandRead<'_>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
+    if p.is_shed() {
+        return;
+    }
+    let held = p.resident_bytes();
+    if band
+        .budget
+        .require_allowance(band.profile, MemoryPhase::Scan, held)
+        .is_err()
+    {
+        log::warn!(
+            "[export] the valve-scope predictor holds {held} bytes, over the scan's memory budget: \
+             dropped, fitting every tile on its own"
+        );
+        p.shed();
+        diagnostics.record(crate::diagnostics::Diagnostic::ValveFloorsShed { count: 1 });
+    }
+}
+
 /// #768 `--valve-scope smooth|zoom`: each tile's predicted need, priced by
 /// real encodes of samples of its own members, and the floors they put on
 /// the tiles ([`valve_predict::Scan::floors`]).
@@ -3847,7 +3902,7 @@ fn stored_sample_rows(
     let mut starts: HashMap<u16, Vec<(usize, u64)>> = HashMap::new();
     let mut chosen = SampleRows::new();
     for (i, t) in tiles.iter().enumerate() {
-        for &(band, row) in p.price_rows(t) {
+        for (band, row) in p.price_rows(t) {
             let groups = match starts.entry(band) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -7155,6 +7210,7 @@ fn scan_all_levels_from(
                         }
                         _ => p.batch(j, &bboxes, j..=last, zooms_ref, opts),
                     }
+                    shed_over_budget(p, band, diagnostics);
                 }
                 if j != pending_band {
                     size_pending(pending_band, &mut pending);
@@ -7170,11 +7226,11 @@ fn scan_all_levels_from(
         },
     );
     piped?;
+    // The tile counts stay in the predictor until its floors are built
+    // ([`scan_with_floors`]).
     if let Some(p) = predict {
         p.flush(zooms_ref, opts);
-        for (level, scan) in scans.iter_mut().enumerate() {
-            scan.tile_counts = p.tile_counts(level);
-        }
+        shed_over_budget(p, band, diagnostics);
     }
     #[cfg(test)]
     BAND_READ_WORKERS.with(|w| w.set(readers));
@@ -16270,6 +16326,78 @@ mod tests {
         assert_eq!(auto, bounded);
     }
 
+    /// #768: 6,000 small squares in one z2 tile under a 20 kB raw cap, and
+    /// the export scan of them with the valve predictor, under `budget`.
+    fn floored_scan(
+        budget: &mut MemoryBudget,
+    ) -> (
+        Vec<LevelScan>,
+        valve_predict::ValveFloors,
+        Vec<crate::diagnostics::Diagnostic>,
+    ) {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let squares: Vec<Geometry<f64>> = (0..6_000)
+            .map(|i| {
+                let (x, y) = (1.0 + f64::from(i % 100) * 0.8, 1.0 + f64::from(i / 100));
+                let d = 0.2 + f64::from((i * 7919) % 13) * 0.02;
+                Geometry::Polygon(geo::Rect::new((x, y), (x + d, y + d)).to_polygon())
+            })
+            .collect();
+        write_fixture(input.path(), &[((0..6_000).collect(), squares)]);
+        let reader = OverviewReader::open(input.path()).unwrap();
+        let zooms = resolve_level_zooms(reader.meta(), reader.num_levels()).unwrap();
+        let opts = ExportOptions {
+            tile_size_limit: Some(20_000),
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let cols =
+            resolve_export_columns((&reader, test_band(reader.source())), &opts, &zooms).unwrap();
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let (scans, floors) = scan_with_floors(
+            &reader,
+            Crs::Epsg4326,
+            (&cols.published, cols.feature_id.as_ref()),
+            (&opts, &zooms),
+            budget,
+            (&ExportTimers::default(), None),
+            &diagnostics,
+        )
+        .unwrap();
+        (scans, floors, diagnostics.snapshot())
+    }
+
+    /// #768: the predictor's state is charged to the export's budget while
+    /// its floors are priced, and returned once they are built.
+    #[test]
+    fn scan_with_floors_returns_the_budget_it_held() {
+        let mut budget = MemoryBudget::with_available(Some(64 << 30));
+        let before = budget.available();
+        let (scans, floors, diagnostics) = floored_scan(&mut budget);
+        assert!(!floors.is_empty(), "the cap must bind");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(budget.available(), before);
+        assert!(scans[0].tile_counts.values().sum::<usize>() >= 6_000);
+    }
+
+    /// #768: a predictor over the scan's budget drops its dense state and
+    /// says so; the export goes on as under `--valve-scope tile`, with the
+    /// same tile counts.
+    #[test]
+    fn a_predictor_over_the_scan_budget_falls_back_to_tile() {
+        let mut roomy = MemoryBudget::with_available(Some(64 << 30));
+        let (want, ..) = floored_scan(&mut roomy);
+        let mut tight = MemoryBudget::with_available(Some(1 << 10));
+        let (scans, floors, diagnostics) = floored_scan(&mut tight);
+        assert!(floors.is_empty());
+        assert_eq!(
+            diagnostics,
+            vec![crate::diagnostics::Diagnostic::ValveFloorsShed { count: 1 }]
+        );
+        let counts = |s: &[LevelScan]| s.iter().map(|l| l.tile_counts.clone()).collect::<Vec<_>>();
+        assert_eq!(counts(&scans), counts(&want));
+    }
+
     /// Both sources' scans of one file, for every level: (covering, geometry).
     fn scans_by_source(path: &Path, crs: Crs) -> (Option<Vec<LevelScan>>, Vec<LevelScan>) {
         let reader = OverviewReader::open(path).unwrap();
@@ -16315,7 +16443,13 @@ mod tests {
             Some(&mut predict),
             &crate::diagnostics::Diagnostics::default(),
         )
-        .unwrap();
+        .unwrap()
+        .map(|mut scans| {
+            for (scan, counts) in scans.iter_mut().zip(predict.into_tile_counts()) {
+                scan.tile_counts = counts;
+            }
+            scans
+        });
         assert_eq!(predicted, covering, "the predictor's tile counts differ");
         let s = timers.stage_secs();
         assert!(

@@ -743,6 +743,13 @@ impl MemoryBudget {
         *slot = slot.saturating_add(taken);
         taken
     }
+
+    /// Return what [`reserve_up_to`](Self::reserve_up_to) took for `phase`
+    /// once it is no longer resident.
+    pub(super) fn unreserve(&mut self, phase: MemoryPhase, taken: u64) {
+        let slot = &mut self.reserved[phase as usize];
+        *slot = slot.saturating_sub(taken);
+    }
 }
 
 #[cfg(test)]

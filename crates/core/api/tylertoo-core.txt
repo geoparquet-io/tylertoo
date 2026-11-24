@@ -716,6 +716,8 @@ pub tylertoo_core::Diagnostic::UnusableGeometry::total: usize
 pub tylertoo_core::Diagnostic::ValidationSkipped::count: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::ValveDropped
 pub tylertoo_core::Diagnostic::ValveDropped::count: usize
+#[non_exhaustive] pub tylertoo_core::Diagnostic::ValveFloorsShed
+pub tylertoo_core::Diagnostic::ValveFloorsShed::count: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::Wrapped
 pub tylertoo_core::Diagnostic::Wrapped::context: core::option::Option<tylertoo_core::RangeContext>
 pub tylertoo_core::Diagnostic::Wrapped::count: usize
