@@ -65,7 +65,7 @@
 //! partition target — **not** the zoom band's feature count — but a single
 //! dense tile that overshoots the target is one partition whose members are
 //! *unbounded* by it. On `auto` each wave therefore holds only the members the
-//! budget affords (`memory_safe_wave_members`, #311): [`cut_waves`] narrows the
+//! budget affords (`memory_safe_wave_members`, #311): `cut_waves` narrows the
 //! waves that hold dense partitions (down to serial if need be) and leaves the
 //! rest at the ceiling (#876), so a dense finest zoom stays within RAM instead
 //! of OOM-killing the run.
