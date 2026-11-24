@@ -969,16 +969,14 @@ impl VdPlan {
                     work: Arc::clone(&work),
                 };
                 let t = std::time::Instant::now();
+                let waves: Vec<_> = plan.wave_ranges().collect();
                 let partitions = Arc::new(plan.partitions);
-                for start in (0..partitions.len()).step_by(plan.wave) {
+                for wave in waves {
                     let partitions = Arc::clone(&partitions);
-                    let end = (start + plan.wave).min(partitions.len());
                     // Collection also joins parallel decode/clip tasks. Both
                     // it and the encode must use the caller's pool. Reads
                     // retain their dedicated helpers, as in ordinary export.
-                    state = run_on_pool(scope, move || {
-                        state.wave(&partitions[start..end], diagnostics)
-                    })?;
+                    state = run_on_pool(scope, move || state.wave(&partitions[wave], diagnostics))?;
                 }
                 level = state.level;
                 level

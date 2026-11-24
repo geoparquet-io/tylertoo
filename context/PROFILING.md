@@ -1115,8 +1115,8 @@ sampler's closing snapshot is what gives it an entry.
 `export.partition_wave_width` is the resolved partition-wave **ceiling**
 (`resolve_and_log_partition_wave`'s return, `auto` or an explicit
 `--partition-wave`), a single scalar for the whole export.
-`memory_safe_level_wave` (#311) can narrow a level's actual wave below it
-based on that level's density. The dump does not carry that per-level detail
+`memory_safe_wave_members` and `cut_waves` (#311, #876) can narrow a level's
+waves below it, each by the members it holds. The dump does not carry that per-level detail
 yet.
 
 `crates/cli/tests/profile_json_dump.rs` covers this section:
