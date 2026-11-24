@@ -7066,11 +7066,7 @@ fn scan_all_levels_from(
                         .zip(&zooms_ref[j..=last])
                         .for_each(|(scan, &zoom)| {
                             scan.feature_count += pending.len();
-                            let (bounds, counts) = if count_tiles {
-                                size_bboxes(pending, zoom, opts)
-                            } else {
-                                (bboxes_bounds(pending), HashMap::new())
-                            };
+                            let (bounds, counts) = size_bboxes(pending, zoom, opts, count_tiles);
                             if let Some(b) = bounds {
                                 match &mut scan.bounds {
                                     Some(acc) => acc.expand(&b),
@@ -7384,10 +7380,12 @@ thread_local! {
 /// accumulators, then reduce. Both reductions (bbox union, per-tile count sum)
 /// are commutative and associative, so the merged result is identical
 /// regardless of thread scheduling or how features were grouped into batches.
+/// Without `count`, only the bounds.
 fn size_bboxes(
     bboxes: &[Option<TileBounds>],
     zoom: u8,
     opts: &ExportOptions,
+    count: bool,
 ) -> (Option<TileBounds>, HashMap<u64, usize>) {
     bboxes
         .par_iter()
@@ -7408,9 +7406,12 @@ fn size_bboxes(
                     }
                     // The accumulated `bounds` above stay the true (wrapped)
                     // extent, since they become the archive's advertised bbox.
-                    for_each_member_key(bbox, zoom, opts, |key| {
-                        *counts.entry(key).or_insert(0) += 1;
-                    });
+                    // PERF (#768): the predictor counts the tiles itself.
+                    if count {
+                        for_each_member_key(bbox, zoom, opts, |key| {
+                            *counts.entry(key).or_insert(0) += 1;
+                        });
+                    }
                 }
                 (bounds, counts)
             },
@@ -7454,19 +7455,6 @@ fn wrapped_extents(bbox: &TileBounds) -> impl Iterator<Item = TileBounds> + '_ {
     })
 }
 
-/// The bounds [`size_bboxes`] gives, without the tile counts.
-fn bboxes_bounds(bboxes: &[Option<TileBounds>]) -> Option<TileBounds> {
-    bboxes
-        .par_iter()
-        .with_min_len(SIZE_BBOXES_MIN_ROWS)
-        .flatten()
-        .flat_map_iter(wrapped_extents)
-        .reduce_with(|mut a, b| {
-            a.expand(&b);
-            a
-        })
-}
-
 /// `true` when tile `tc` lies in `ranges`.
 #[inline]
 fn ranges_contain(ranges: &BboxTileRanges, tc: TileCoord) -> bool {
@@ -7503,7 +7491,7 @@ fn scan_level(
             &crate::diagnostics::Diagnostics::default(),
         )?;
         scan.feature_count += bboxes.len();
-        let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zoom, opts);
+        let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zoom, opts, true);
         if let Some(b) = batch_bounds {
             match &mut scan.bounds {
                 Some(acc) => acc.expand(&b),
@@ -15547,7 +15535,7 @@ mod tests {
             .build()
             .unwrap();
         let opts = ExportOptions::default();
-        let (_, counts) = pool.install(|| size_bboxes(&bboxes, 12, &opts));
+        let (_, counts) = pool.install(|| size_bboxes(&bboxes, 12, &opts, true));
         assert!(counts.values().sum::<usize>() >= EXPORT_BATCH_SIZE);
         let accumulators: usize = pool
             .broadcast(|_| SIZE_ACCUMULATORS.with(std::cell::Cell::take))
@@ -17567,7 +17555,7 @@ mod tests {
         for zoom in [0u8, 2, 5, 9] {
             for g in &geoms {
                 let bbox = member_bbox(g);
-                let (_, counts) = size_bboxes(&[Some(bbox)], zoom, &opts);
+                let (_, counts) = size_bboxes(&[Some(bbox)], zoom, &opts, true);
                 assert!(
                     counts.values().all(|&c| c == 1),
                     "z{zoom}: a tile counted twice for one feature {g:?}"
@@ -17596,7 +17584,7 @@ mod tests {
     #[test]
     fn scan_bounds_wrap_into_the_lng_domain() {
         let opts = ExportOptions::default();
-        let bounds = |b: TileBounds| size_bboxes(&[Some(b)], 4, &opts).0.expect("bounds");
+        let bounds = |b: TileBounds| size_bboxes(&[Some(b)], 4, &opts, true).0.expect("bounds");
 
         let b = bounds(TileBounds::new(178.0, -1.0, 181.0, 1.0));
         assert_eq!((b.lng_min, b.lng_max), (-180.0, 180.0), "{b:?}");
@@ -17681,7 +17669,7 @@ mod tests {
         let opts = ExportOptions::default();
         for zoom in [0u8, 4, 10] {
             let bbox = TileBounds::new(200.0, 10.0, 200.0, 10.0);
-            let (_, counts) = size_bboxes(&[Some(bbox)], zoom, &opts);
+            let (_, counts) = size_bboxes(&[Some(bbox)], zoom, &opts, true);
             let home = crate::tile::lng_lat_to_tile(-160.0, 10.0, zoom);
             let planned: Vec<_> = counts.keys().map(|&k| key_to_xy(k, zoom)).collect();
             assert_eq!(
@@ -17692,7 +17680,7 @@ mod tests {
         }
         // Beyond one wrap nothing reaches the grid.
         let far = TileBounds::new(600.0, 10.0, 600.0, 10.0);
-        assert!(size_bboxes(&[Some(far)], 4, &opts).1.is_empty());
+        assert!(size_bboxes(&[Some(far)], 4, &opts, true).1.is_empty());
         assert!(feature_tile_members(
             &Geometry::Point(geo::Point::new(600.0, 10.0)),
             4,
@@ -17731,7 +17719,7 @@ mod tests {
                             .map(|r| TileBounds::new(r.min().x, r.min().y, r.max().x, r.max().y))
                     })
                     .collect();
-                let (_, counts) = size_bboxes(&bboxes, zoom, &opts);
+                let (_, counts) = size_bboxes(&bboxes, zoom, &opts, true);
                 let planned: HashSet<u64> = counts.keys().copied().collect();
                 for g in &geoms {
                     for (key, _) in feature_tile_members(

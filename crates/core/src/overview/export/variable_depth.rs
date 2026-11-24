@@ -372,7 +372,7 @@ impl StopPolicy {
 /// Sizes a set of rows at a zoom, as the scan does: one member per tile each
 /// row's buffered bbox reaches.
 fn tile_keys(bboxes: &[Option<TileBounds>], zoom: u8, opts: &ExportOptions) -> HashMap<u64, usize> {
-    size_bboxes(bboxes, zoom, opts).1
+    size_bboxes(bboxes, zoom, opts, true).1
 }
 
 fn add_counts(into: &mut HashMap<u64, usize>, from: HashMap<u64, usize>) {
