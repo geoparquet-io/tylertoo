@@ -7014,7 +7014,7 @@ fn scan_all_levels_from(
     // four f64 per row, so it holds a few MiB.
     let depth = match source {
         ScanBboxSource::Covering { .. } if predict.is_some() => {
-            valve_predict::FLUSH_ROWS / tylertoo_io::DEFAULT_BATCH_ROWS
+            valve_predict::FLUSH_ROWS / EXPORT_BATCH_SIZE
         }
         _ => WAVE_READ_IN_FLIGHT,
     };
