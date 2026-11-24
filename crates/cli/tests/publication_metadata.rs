@@ -301,8 +301,9 @@ fn a_sharded_fleet_carries_the_values_through_empty_shards() {
         s(&grid()),
         "--shards",
         "4",
+        // z6: a shard reads nine pivot tiles past its range (#768).
         "--pivot",
-        "4",
+        "6",
         "-o",
         s(&plan),
     ]);
@@ -319,7 +320,7 @@ fn a_sharded_fleet_carries_the_values_through_empty_shards() {
             "--min-zoom",
             "0",
             "--max-zoom",
-            "4",
+            "6",
             // One patch away from the antimeridian (a shard reads across
             // it, #546), so most shards own nothing.
             "--bbox=-100,-70,-60,-20",
