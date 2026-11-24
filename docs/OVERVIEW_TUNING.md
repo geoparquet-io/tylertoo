@@ -1809,11 +1809,12 @@ it fits (#768):
     On NZ Parcels it cuts the p95 density step between neighbouring tiles
     at z5–z7 from 2.3–3.7 to 1.0–2.4, for 8% more wall time (19.2 s to
     20.7 s, median of 3); on FTW Moldova, 1% (2.82 s to 2.85 s).
-  - Under `drop` a point tile predicted over its cap first drops the points
-    closer to the point before them than its own threshold, or than half the
-    threshold of an over-cap neighbour, whichever is larger. A point tile
-    that fits keeps every point; only tiles over a cap are thinned toward
-    their denser neighbours. On 1.8 million French points
+  - Under `drop` a point tile predicted over its cap is encoded first as
+    is. If it is still over, it drops the points closer to the point before
+    them than its own threshold, or than half the threshold of an over-cap
+    neighbour, whichever is larger. A point tile that fits keeps every
+    point; only tiles over a cap are thinned toward their denser
+    neighbours. On 1.8 million French points
     (`--preset tippecanoe --size-valve drop --max-compressed-tile-size
     1500000`), the absolute log ratio of the kept shares on the two sides
     of the 0° tile edge at z5 falls from 1.03–1.18 to 0.13–0.37. The build takes 12.8 s
@@ -1822,6 +1823,10 @@ it fits (#768):
   - A tile still over its cap is reduced further, as under `tile`. Each
     tile's prediction reads only its own members, so a sharded build starts
     every tile from the same threshold as an unsharded one.
+  - The prediction holds a few kilobytes for each tile of more than about
+    a thousand features, and the samples it encodes are taken a few tiles
+    at a time, within the export's memory budget. If that state outgrows
+    the budget, the export warns and goes on as under `tile`.
 - `tile` thins each tile only as much as it needs on its own. It is the
   output from before #768.
 - `zoom` starts every tile at a zoom from the largest threshold predicted

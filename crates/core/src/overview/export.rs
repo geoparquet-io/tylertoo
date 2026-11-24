@@ -361,9 +361,10 @@ impl std::str::FromStr for SizeValve {
 pub enum ValveScope {
     /// The default. Under `merge`, the eight tiles around a tile predicted
     /// over its cap start from a fading floor of its merge threshold. Under
-    /// `drop`, a point tile predicted over its cap first drops the points
-    /// closer than its own predicted gap threshold, or than half an over-cap
-    /// neighbour's, whichever is larger; a point tile that fits keeps all.
+    /// `drop`, a point tile predicted over its cap that is over it as is
+    /// drops the points closer than its own predicted gap threshold, or than
+    /// half an over-cap neighbour's, whichever is larger; a point tile that
+    /// fits keeps all.
     #[default]
     Smooth,
     /// Each tile is thinned only as much as it needs on its own.
