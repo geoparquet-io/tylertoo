@@ -2274,6 +2274,10 @@ pub fn export_pmtiles(
     export_pmtiles_with_partition_target(input_path, output_path, options, DEFAULT_PARTITION_TARGET)
 }
 
+/// A tile's `(merge, drop)` valve floors ([`predicted_valve_floors`]).
+#[doc(hidden)]
+pub type FloorPair = (u64, u64);
+
 /// #768: the valve floors an export of `overview` under `options` starts
 /// its tiles from, keyed `(zoom, tile id)`, as `(merge, drop)`: for the
 /// shard parity oracle, which compares a shard's floors with the monolithic
@@ -2282,9 +2286,6 @@ pub fn export_pmtiles(
 /// # Errors
 ///
 /// As [`export_pmtiles`], for the scan and the price samples.
-#[doc(hidden)]
-pub type FloorPair = (u64, u64);
-
 #[doc(hidden)]
 pub fn predicted_valve_floors(
     overview: &Path,
@@ -4088,7 +4089,7 @@ fn valve_sample_rows(
             .resolved_schema()
             .f64_covering()
             .map(|(idx, _)| vec![idx]),
-        ScanBboxSource::Geometry => None,
+        ScanBboxSource::Geometry => reader.resolved_schema().geometry_index().map(|i| vec![i]),
     };
     let diagnostics = crate::diagnostics::Diagnostics::default();
     // One tile's first `sample_members` member rows, per row group of its

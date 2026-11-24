@@ -243,3 +243,35 @@ def test_unsorted_input_warns_once(tmp_path, caplog, command):
     assert len([w for w in raised if "not sorted" in str(w.message)]) == 1
     logged = [r for r in caplog.records if "not sorted" in r.getMessage()]
     assert logged == [], [r.getMessage() for r in logged]
+
+
+@pytest.mark.parametrize("command", ["export_pmtiles", "pyramid"])
+def test_a_shed_valve_prediction_warns_from_every_export(tmp_path, monkeypatch, command):
+    """#768: the export's shed valve floors reach Python as one ``UserWarning``."""
+    metadata = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Point"]}},
+    }
+    side = 160
+    points = [
+        struct.pack("<BIdd", 1, 1, (i % side) * 1e-4, (i // side) * 1e-4)
+        for i in range(side * side)
+    ]
+    source = tmp_path / "dense.parquet"
+    pq.write_table(
+        pa.table({"geometry": points, "id": range(len(points))}).replace_schema_metadata(
+            {b"geo": json.dumps(metadata).encode()}
+        ),
+        source,
+    )
+    overview = tmp_path / "dense-ov.parquet"
+    tylertoo.overview(str(source), str(overview), min_zoom=0, max_zoom=6)
+    monkeypatch.setenv("TYLERTOO_AUTO_MEM_LIMIT_BYTES", str(1 << 10))
+    out = str(tmp_path / "dense.pmtiles")
+    with pytest.warns(UserWarning, match="outgrew") as raised:
+        if command == "pyramid":
+            tylertoo.pyramid([f"0-6:{overview}"], out, max_compressed_tile_size=20000)
+        else:
+            tylertoo.export_pmtiles(str(overview), out, max_compressed_tile_size=20000)
+    assert len([w for w in raised if "outgrew" in str(w.message)]) == 1

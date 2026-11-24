@@ -498,6 +498,7 @@ fn export_pmtiles(
     let mut report = py
         .detach(|| export_pmtiles_core(&input_path, &output_path, &options))
         .map_err(export_error_to_py)?;
+    warn_user_diagnostics(py, &report.diagnostics)?;
 
     report.source_losses = report.source_losses
                 .for_python()
@@ -605,6 +606,7 @@ fn pyramid(
     let report = py
         .detach(|| build_pyramid(&bands, &output_path, &options))
         .map_err(pyramid_error_to_py)?;
+    warn_user_diagnostics(py, &report.diagnostics)?;
     // The same shape as the CLI's `pyramid --report` JSON.
     report_dict(py, &report)
 }
