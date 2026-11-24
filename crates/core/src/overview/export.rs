@@ -2389,8 +2389,7 @@ fn plan_level(
             slack_bytes,
         );
     }
-    let uniform = level.partitions.len().div_ceil(ceiling_wave.max(1));
-    if level.wave_count() > uniform {
+    if level.narrowed {
         let densest = level
             .partitions
             .iter()
@@ -3006,6 +3005,7 @@ fn export_pmtiles_validated(
             zoom: 0,
             partitions: Vec::new(),
             wave_starts: Vec::new(),
+            narrowed: false,
         },
     );
     let template = ExportLevelCtx {
@@ -4033,7 +4033,7 @@ fn export_level_group(
             let mut level_store = None;
             let mut grants = Vec::new();
             for w in 0..level_waves(level.plan) {
-                let wave = level.plan.waves().nth(w).unwrap_or_default();
+                let wave = level.plan.wave(w);
                 let fills = w == 0 && multi_wave && store.is_none() && level.level_read.is_some();
                 let early = fills && gate.overlap;
                 let mut fill = |floor: usize| -> Result<f64, (usize, ExportError)> {
@@ -5215,29 +5215,46 @@ struct LevelPlan {
     /// wave holds the partitions up to the next start. Empty for an empty
     /// level. Waves are uneven when a dense partition narrows its own.
     wave_starts: Vec<usize>,
+    /// The member cap, not the ceiling, closed at least one wave: the #311
+    /// density guard changed this level's waves.
+    narrowed: bool,
 }
 
 impl LevelPlan {
     /// `partitions` cut into waves of at most `ceiling` partitions and
     /// `member_cap` members ([`cut_waves`]).
     fn cut(zoom: u8, partitions: Vec<Partition>, ceiling: usize, member_cap: usize) -> Self {
-        let wave_starts = cut_waves(&partitions, ceiling, member_cap);
+        let (wave_starts, narrowed) = cut_waves(&partitions, ceiling, member_cap);
         Self {
             zoom,
             partitions,
             wave_starts,
+            narrowed,
         }
+    }
+
+    /// Wave `w`'s index range in `partitions`; empty past the last wave.
+    fn wave_range(&self, w: usize) -> std::ops::Range<usize> {
+        let Some(&start) = self.wave_starts.get(w) else {
+            return 0..0;
+        };
+        start
+            ..self
+                .wave_starts
+                .get(w + 1)
+                .copied()
+                .unwrap_or(self.partitions.len())
     }
 
     /// Each wave's index range in `partitions`, in order.
     fn wave_ranges(&self) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
-        let ends = self
-            .wave_starts
-            .iter()
-            .skip(1)
-            .copied()
-            .chain([self.partitions.len()]);
-        self.wave_starts.iter().zip(ends).map(|(&s, e)| s..e)
+        (0..self.wave_count()).map(|w| self.wave_range(w))
+    }
+
+    /// Wave `w`, in constant time; empty past the last wave (an empty
+    /// level's one synthetic wave).
+    fn wave(&self, w: usize) -> &[Partition] {
+        &self.partitions[self.wave_range(w)]
     }
 
     /// The level's waves, in partition (and so tile) order.
@@ -5265,20 +5282,24 @@ impl LevelPlan {
 /// Wave starts for `partitions` in order (#876): a new wave starts when the
 /// current one holds `ceiling` partitions or the next partition would take
 /// it past `member_cap` members. A partition over the cap alone is a wave of
-/// its own. Order is unchanged, so every cut gives the same archive.
-fn cut_waves(partitions: &[Partition], ceiling: usize, member_cap: usize) -> Vec<usize> {
+/// its own. Order is unchanged, so every cut gives the same archive. Also
+/// returns whether the cap, not the ceiling, closed any wave.
+fn cut_waves(partitions: &[Partition], ceiling: usize, member_cap: usize) -> (Vec<usize>, bool) {
     let ceiling = ceiling.max(1);
     let mut starts = Vec::new();
+    let mut narrowed = false;
     let (mut len, mut members) = (0usize, 0usize);
     for (i, p) in partitions.iter().enumerate() {
-        if starts.is_empty() || len == ceiling || members.saturating_add(p.members) > member_cap {
+        let full = len == ceiling;
+        if starts.is_empty() || full || members.saturating_add(p.members) > member_cap {
+            narrowed |= !starts.is_empty() && !full;
             starts.push(i);
             (len, members) = (0, 0);
         }
         len += 1;
         members = members.saturating_add(p.members);
     }
-    starts
+    (starts, narrowed)
 }
 
 // ============================================================================
@@ -10015,10 +10036,14 @@ impl<'a> JoinedTileFitter<'a> {
         // restriction also prunes disjoint bboxes and prevents clipping holes
         // between requested ids, as in variable-depth and shard exports.
         let tile_counts = tiles.iter().map(|&id| (id, 1)).collect();
-        let partitions = plan_partitions(&tile_counts, zoom, 1);
-        let width = self.tile_wave(tiles, opts);
+        let plan = LevelPlan::cut(
+            zoom,
+            plan_partitions(&tile_counts, zoom, 1),
+            self.tile_wave(tiles, opts),
+            usize::MAX,
+        );
         let mut replacements = BTreeMap::new();
-        for wave in partitions.chunks(width) {
+        for wave in plan.waves() {
             let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
             let mut layers = Vec::new();
             let mut seq_base = 0;
@@ -13263,7 +13288,7 @@ mod tests {
     #[test]
     fn cut_waves_narrows_only_the_dense_partitions_wave() {
         let starts = |counts: &[usize], ceiling, cap| {
-            cut_waves(&partitions_with_members(counts), ceiling, cap)
+            cut_waves(&partitions_with_members(counts), ceiling, cap).0
         };
         // No member cap: uniform waves of the ceiling, as before.
         assert_eq!(starts(&[1; 10], 4, usize::MAX), vec![0, 4, 8]);
@@ -13281,6 +13306,40 @@ mod tests {
         assert_eq!(starts(&[3, 3, 3], 16, 1), vec![0, 1, 2]);
         // An empty level has no waves.
         assert_eq!(starts(&[], 16, 100), Vec::<usize>::new());
+    }
+
+    /// #876 review: the plan records that the member cap moved a boundary
+    /// even when the wave count is the same as an uncapped cut, so the
+    /// density-guard log line still fires.
+    #[test]
+    fn level_plan_flags_a_member_cap_cut_even_when_the_count_holds() {
+        let capped = LevelPlan::cut(3, partitions_with_members(&[90, 5, 5, 5, 5]), 4, 100);
+        assert_eq!(capped.wave_starts, vec![0, 3]);
+        assert!(capped.narrowed);
+        let free = LevelPlan::cut(3, partitions_with_members(&[90, 5, 5, 5, 5]), 4, usize::MAX);
+        assert_eq!(free.wave_starts, vec![0, 4]);
+        assert!(!free.narrowed);
+        assert!(!LevelPlan::cut(3, Vec::new(), 4, 1).narrowed);
+    }
+
+    /// #876 review: `wave(w)` is the `w`-th of `waves()` in constant time, and
+    /// empty past the last wave (an empty level's one synthetic wave).
+    #[test]
+    fn level_plan_wave_indexes_like_waves() {
+        let same = |a: &[Partition], b: &[Partition]| {
+            a.len() == b.len() && std::ptr::eq(a.as_ptr(), b.as_ptr())
+        };
+        let plan = LevelPlan::cut(
+            3,
+            partitions_with_members(&[90, 5, 5, 5, 5, 5, 5, 5, 5]),
+            4,
+            100,
+        );
+        for (w, wave) in plan.waves().enumerate() {
+            assert!(same(plan.wave(w), wave), "wave {w}");
+        }
+        assert!(plan.wave(plan.wave_count()).is_empty());
+        assert!(LevelPlan::cut(3, Vec::new(), 4, 100).wave(0).is_empty());
     }
 
     /// #876: a level's routing and its wave slices agree for uneven waves.
