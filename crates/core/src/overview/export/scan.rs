@@ -289,8 +289,19 @@ pub(super) fn scan_all_levels_from(
                     };
                     let aligned = || -> Result<Vec<Option<TileBounds>>, ExportError> {
                         match source {
+                            // Row-aligned, `None` for a null row. Every row passed
+                            // `covering_batch_bboxes`' checks, so one that does not
+                            // is an error.
                             ScanBboxSource::Covering { column, names } => {
-                                covering_row_bboxes(&batch, column, names, crs)
+                                covering_rows(&batch, column, names, crs)?
+                                    .collect::<Option<_>>()
+                                    .ok_or_else(|| {
+                                        crate::GeoParquetReadError::decode(
+                                            "bbox covering",
+                                            format!("{column:?} has a malformed row"),
+                                        )
+                                        .into()
+                                    })
                             }
                             ScanBboxSource::Geometry => Ok(geometries()?
                                 .iter()
@@ -366,26 +377,6 @@ pub(super) fn covering_batch_bboxes(
     Ok(covering_rows(batch, column, names, crs)?
         .filter(|row| !matches!(row, Some(None)))
         .collect())
-}
-
-/// [`covering_batch_bboxes`] row-aligned: `None` for a null row. Only called
-/// on a batch whose covering rows all passed that function's checks; a row
-/// that does not is an error.
-pub(super) fn covering_row_bboxes(
-    batch: &RecordBatch,
-    column: &str,
-    names: &[String; 4],
-    crs: Crs,
-) -> Result<Vec<Option<TileBounds>>, ExportError> {
-    covering_rows(batch, column, names, crs)?
-        .collect::<Option<_>>()
-        .ok_or_else(|| {
-            crate::GeoParquetReadError::decode(
-                "bbox covering",
-                format!("{column:?} has a malformed row"),
-            )
-            .into()
-        })
 }
 
 /// Each row of a bbox covering: `Some(None)` for a null row, `Some(bbox)`
