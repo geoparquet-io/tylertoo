@@ -4235,6 +4235,11 @@ fn valve_sample_bytes(
             }
             let (x, y) = key_to_xy(t.key, zooms[t.level]);
             let tb = TileCoord::new(x, y, zooms[t.level]).bounds();
+            // `--feature-order` ties go by the tile's own file order: a
+            // row's place in its row group moves with a shard's row groups.
+            for (k, m) in sample.iter_mut().enumerate() {
+                m.seq = k as u64;
+            }
             sort_tile_for_encode(&mut sample, &opts.feature_order);
             let mut mvt = build_tile_layers(&cache, &[], &sample, &tb, opts, &[], &diagnostics);
             let n = sample.len() as f64;

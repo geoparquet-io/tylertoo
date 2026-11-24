@@ -92,6 +92,9 @@ struct Build {
     /// predicted over their own overview files. `None` keeps the default
     /// caps, which never bind.
     tile_cap: Option<(usize, ValveScope, SizeValve)>,
+    /// #768: a `--feature-order` column, whose ties a tile breaks by row
+    /// order.
+    feature_order: Option<&'static str>,
 }
 
 /// The same build with #541's convert-side ceiling on the coarse job.
@@ -200,14 +203,18 @@ fn export_options() -> ExportOptions {
 
 /// [`export_options`] under `build`'s tile cap, if it sets one.
 fn capped_export_options(build: Build) -> ExportOptions {
-    match build.tile_cap {
+    let mut opts = match build.tile_cap {
         Some((cap, scope, valve)) => export_options()
             .with_tile_size_limit(Some(cap))
             .with_compressed_tile_size_limit(None)
             .with_valve_scope(scope)
             .with_size_valve(valve),
         None => export_options(),
+    };
+    if let Some(column) = build.feature_order {
+        opts.feature_order = column.parse().expect("a feature order");
     }
+    opts
 }
 
 /// Every tile in an archive: `zoom -> tile id -> body bytes`.
@@ -368,6 +375,7 @@ fn sharded_build_against_monolithic(input: &Path, build: Build) -> Vec<((u8, u64
         flavor,
         coarse_level_ceiling,
         tile_cap,
+        feature_order: _,
     } = build;
     let dir = tempfile::tempdir().expect("tempdir");
     let dir = dir.path();
@@ -930,6 +938,7 @@ fn madagascar(shards: usize) -> Option<(PathBuf, Build)> {
             flavor: Flavor::NoCoalesce,
             coarse_level_ceiling: false,
             tile_cap: None,
+            feature_order: None,
         },
     ))
 }
@@ -957,6 +966,7 @@ fn grid_build(shards: usize, flavor: Flavor) -> Build {
         flavor,
         coarse_level_ceiling: false,
         tile_cap: None,
+        feature_order: None,
     }
 }
 
@@ -1002,6 +1012,7 @@ fn sharded_build_matches_monolithic_with_merge_floors() {
         flavor: Flavor::Defaults,
         coarse_level_ceiling: false,
         tile_cap: Some((48 * 1024, scope, SizeValve::Merge)),
+        feature_order: None,
     };
     let ids = |differ: &[((u8, u64), String)]| -> BTreeSet<(u8, u64)> {
         differ.iter().map(|(t, _)| *t).collect()
@@ -1018,6 +1029,31 @@ fn sharded_build_matches_monolithic_with_merge_floors() {
     if let Some((_, msg)) = with.iter().find(|(t, _)| !without.contains(t)) {
         panic!("a merge floor differs between a shard and the monolithic build: {msg}");
     }
+}
+
+/// #768: under `--feature-order` a tile's members are sorted by a column,
+/// ties broken by row order, and its price samples are encoded in that
+/// order. A shard's overview starts its row groups elsewhere, so ties
+/// broken by a row's place in its row group would encode another order and
+/// price the tile, and its floor, differently.
+#[test]
+fn sharded_build_matches_monolithic_with_merge_floors_and_a_feature_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("squares.parquet");
+    write_dense_squares(&input);
+    let build = Build {
+        min_zoom: 0,
+        max_zoom: 8,
+        pivot: 7,
+        shards: 3,
+        expect_row_group_pruning: true,
+        flavor: Flavor::Defaults,
+        coarse_level_ceiling: false,
+        tile_cap: Some((48 * 1024, ValveScope::Smooth, SizeValve::Merge)),
+        feature_order: Some("weight"),
+    };
+    // The floors must match outright; tile bodies may still differ by #854.
+    let _ = sharded_build_against_monolithic(&input, build);
 }
 
 /// #768: under `--size-valve drop` every data shard predicts the point
@@ -1038,6 +1074,7 @@ fn sharded_build_matches_monolithic_with_drop_floors() {
         flavor: Flavor::UnthinnedPoints,
         coarse_level_ceiling: false,
         tile_cap: Some((24 * 1024, ValveScope::Smooth, SizeValve::Drop)),
+        feature_order: None,
     };
     assert_sharded_build_matches_monolithic(&input, build);
 }
@@ -1314,6 +1351,7 @@ fn sharded_build_matches_monolithic_with_coalesced_line_chains() {
         flavor: Flavor::Defaults,
         coarse_level_ceiling: false,
         tile_cap: None,
+        feature_order: None,
     };
 
     // The premise: chains merge in the levels the shards build, or this
@@ -1430,6 +1468,7 @@ fn level_capped_coarse_job_matches_monolithic_on_coalesced_line_chains() {
         flavor: Flavor::Defaults,
         coarse_level_ceiling: true,
         tile_cap: None,
+        feature_order: None,
     };
     let opts = convert_options(build);
     assert!(opts.coalesce_lines, "the point is coalescing ON");
