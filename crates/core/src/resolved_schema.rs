@@ -685,9 +685,7 @@ fn property_indices(
                 && (!schema
                     .metadata()
                     .contains_key(crate::overview::level::OVERVIEWS_KEY)
-                    || !f
-                        .name()
-                        .eq_ignore_ascii_case(crate::overview::writer::LEVEL_COLUMN))
+                    || !crate::overview::writer::is_unpublished_column(f.name()))
                 && !crate::overview::writer::is_covering_column(
                     f,
                     geometry,
@@ -1144,15 +1142,14 @@ pub(crate) fn publication_names(
     suppressed: &HashSet<String>,
 ) -> HashMap<String, String> {
     // Names already spoken for by a column that will publish under its own
-    // schema name. `level` is excluded because the export drops it, which
-    // is precisely what frees the name for restoration; a suppressed
-    // counter is excluded for the same reason.
+    // schema name. `level` and `input_row` are excluded because the export
+    // drops them, which is precisely what frees the name for restoration; a
+    // suppressed counter is excluded for the same reason.
     let occupied: HashSet<String> = schema
         .fields()
         .iter()
         .filter(|f| {
-            !f.name()
-                .eq_ignore_ascii_case(crate::overview::writer::LEVEL_COLUMN)
+            !crate::overview::writer::is_unpublished_column(f.name())
                 && !suppressed.contains(f.name())
         })
         .map(|f| f.name().to_ascii_lowercase())

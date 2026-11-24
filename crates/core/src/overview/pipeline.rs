@@ -1970,9 +1970,8 @@ pub(super) fn run_pass2_buffered(
         // (#494); either way the reader lives off the rayon pool, so reads are
         // never head-of-line blocked behind compute work.
         |tx: &Sender<ReadMsg>| -> Result<(), ConvertError> {
-            source.read(
+            source.read_with_input_rows(
                 selected_row_groups,
-                None,
                 read_tuning,
                 &mut |batch, row_offset, read_dur| {
                     peak_batch_ref.fetch_max(batch.get_array_memory_size() as u64, Relaxed);

@@ -2217,7 +2217,8 @@ fn create_level_writer(
 
     let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
-    let non_geom_cols: Vec<usize> = (0..input_schema.fields().len())
+    // Over pass 2's batches: the input's columns and its `input_row`.
+    let non_geom_cols: Vec<usize> = (0..source_schema.fields().len())
         .filter(|&c| c != geom_idx)
         .collect();
 
@@ -7092,9 +7093,8 @@ fn write_level_streaming(
                         // several merged back into the identical batch sequence
                         // (#494) — `read_tuning` decides, and the decision never
                         // reaches the output.
-                        source.read(
+                        source.read_with_input_rows(
                             row_groups,
-                            None,
                             read_tuning,
                             &mut |batch, offset, read_dur| {
                                 if last_progress.elapsed().as_secs() >= 10 {
@@ -10429,7 +10429,6 @@ mod tests {
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
-        let input_schema = source.schema().unwrap();
         let geom_idx = source
             .resolved_schema()
             .unwrap()
@@ -10459,7 +10458,7 @@ mod tests {
 
         // Every row is a member of the single (verbatim, canonical) level.
         let min_levels = vec![0u8; ROWS];
-        let non_geom_cols: Vec<usize> = (0..input_schema.fields().len())
+        let non_geom_cols: Vec<usize> = (0..source_schema.fields().len())
             .filter(|&c| c != geom_idx)
             .collect();
         let diagnostics = crate::diagnostics::Diagnostics::default();

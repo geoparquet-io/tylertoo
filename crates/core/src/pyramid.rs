@@ -3340,20 +3340,19 @@ fn drop_joined_tile(
         let world = i64::from(l.extent.unwrap_or(4096)) << zoom;
         l.features.iter().all(|f| draws_one_mvt_point(f, world))
     });
-    // Rank once; every keep count below selects from this ranking.
-    let ranked =
-        crate::overview::export::select_kept_by_size(&features, total, point_like, |(_, f)| {
-            f.geometry.len()
-        });
-    // The search needs nested selections, and point strides do not nest:
-    // order points by bit-reversed index, so each prefix spreads evenly.
-    let points = point_like.then(|| {
+    // Rank once; every keep count below keeps a prefix of this ranking, so
+    // the search's selections nest. Points rank by their bit-reversed
+    // position in the tile, the in-tile form of the export's `point_rank`
+    // (#768): a joined tile is decoded from finished band archives, whose
+    // features no longer carry the input row the export ranks by.
+    let ranked: Vec<&(usize, &crate::vector_tile::tile::Feature)> = if point_like {
         let bits = usize::BITS - (total - 1).leading_zeros();
-        let mut order = ranked.clone();
+        let mut order: Vec<_> = features.iter().collect();
         order.sort_by_key(|(index, _)| index.reverse_bits() >> (usize::BITS - bits));
         order
-    });
-    let nested = points.as_deref().unwrap_or(&ranked);
+    } else {
+        crate::overview::export::select_kept_by_size(&features, total, |(_, f)| f.geometry.len())
+    };
     let encode = |kept: &[&(usize, &crate::vector_tile::tile::Feature)],
                   raw: &mut Vec<u8>|
      -> Result<Vec<u8>, std::io::Error> {
@@ -3390,16 +3389,7 @@ fn drop_joined_tile(
     // nothing has fit yet.
     let passes = crate::overview::export::MAX_DROP_PASSES as usize;
     let first = joined_budget_keep(&tile, &ranked, original.len(), fit);
-    let stride;
-    *gzip = encode(
-        if point_like {
-            stride = crate::overview::export::select_kept_by_size(&features, first, true, |_| 0);
-            &stride
-        } else {
-            &ranked[..first]
-        },
-        raw,
-    )?;
+    *gzip = encode(&ranked[..first], raw)?;
     let mut kept = first;
     if joined_over_limit(raw.len(), gzip.len(), opts) {
         // low fits (0: no fit yet, one feature is the floor); high misses.
@@ -3418,7 +3408,7 @@ fn drop_joined_tile(
                 low + (high - low) / 2
             };
             scaled = 0;
-            *gzip = encode(&nested[..keep], raw)?;
+            *gzip = encode(&ranked[..keep], raw)?;
             kept = keep;
             if joined_over_limit(raw.len(), gzip.len(), opts) {
                 high = keep;

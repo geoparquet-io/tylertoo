@@ -6101,7 +6101,8 @@ pub(super) fn mixed_geometry_field(
 }
 
 /// Build the writer source schema: original fields, geometry field replaced by
-/// the geoarrow-typed field, no file-level metadata (the encoder regenerates it).
+/// the geoarrow-typed field, then the `input_row` field pass 2 appends (#768);
+/// no file-level metadata (the encoder regenerates it).
 pub(super) fn build_source_schema(
     descriptor: &crate::resolved_schema::ResolvedSchema,
     geom_out_field: Arc<Field>,
@@ -6121,6 +6122,7 @@ pub(super) fn build_source_schema(
                 f.clone()
             }
         })
+        .chain(std::iter::once(super::source::input_row_field()))
         .collect();
     Schema::new(fields)
 }
@@ -6734,7 +6736,7 @@ pub(super) fn validate_coalesce_schema(
 /// only in those modes — mirroring [`validate_cluster_schema`] /
 /// [`validate_coalesce_schema`].
 fn reserved_output_columns(options: &ConvertOptions) -> Vec<&'static str> {
-    let mut names = vec![LEVEL_COLUMN];
+    let mut names = vec![LEVEL_COLUMN, super::writer::INPUT_ROW_COLUMN];
     if options.cluster {
         names.push(POINT_COUNT_COLUMN);
     }

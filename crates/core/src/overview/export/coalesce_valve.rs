@@ -506,6 +506,7 @@ mod tests {
         Member {
             key: 0,
             seq,
+            rank: super::super::point_rank(seq),
             geom: geom.into(),
             props: SharedProps::new(vec![(Arc::from("n"), crate::mvt::PropertyValue::UInt(seq))]),
             id: Some(seq * 10),

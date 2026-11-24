@@ -85,6 +85,20 @@ use crate::wkb_column::check_wkb_column;
 /// Name of the mandatory level column (§4.1).
 pub const LEVEL_COLUMN: &str = "level";
 
+/// The overview's optional `input_row` column (#768): each row's position
+/// in the convert's input, counted over every part and row group in file
+/// order (pruned ones too), so a shard numbers a row as the whole build
+/// does. Export ranks points by it (`export::point_rank`); it is never
+/// published as a property.
+pub(crate) const INPUT_ROW_COLUMN: &str = "input_row";
+
+/// Whether `name` is one of the columns an overview reserves for itself and
+/// never publishes: `level` or `input_row` (case-insensitively, as the
+/// collision renames match them).
+pub(crate) fn is_unpublished_column(name: &str) -> bool {
+    name.eq_ignore_ascii_case(LEVEL_COLUMN) || name.eq_ignore_ascii_case(INPUT_ROW_COLUMN)
+}
+
 /// Default ZSTD compression level (spec §4.5 recommends ZSTD).
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 

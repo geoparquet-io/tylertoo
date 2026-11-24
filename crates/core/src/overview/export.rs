@@ -99,13 +99,19 @@ use std::{
 };
 
 #[cfg(test)]
+use super::writer::LEVEL_COLUMN;
+#[cfg(test)]
 use crate::mvt::PropertyValue;
 #[cfg(test)]
 use arrow_array::types::{
     Decimal128Type, Float32Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
+    UInt8Type,
 };
-use arrow_array::{cast::AsArray, types::Float64Type, Array, RecordBatch};
+use arrow_array::{
+    cast::AsArray,
+    types::{Float64Type, UInt64Type},
+    Array, RecordBatch,
+};
 #[cfg(test)]
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{DataType, Schema};
@@ -142,7 +148,7 @@ use super::{
         write_export_profile_json, ExportPhaseWalls, ExportProfileJsonInputs, ExportTimers,
         ExportZoomProfile, RssSampler, RssSamplerReport,
     },
-    writer::LEVEL_COLUMN,
+    writer::INPUT_ROW_COLUMN,
 };
 #[cfg(test)]
 use crate::compression;
@@ -302,7 +308,7 @@ pub enum SizeValve {
     #[default]
     Merge,
     /// Drop features until the tile fits: the largest sized geometries
-    /// survive, or a uniform stride of points. Every feature that remains
+    /// survive, or the best-ranked points, spread evenly. Every feature that remains
     /// keeps exactly its own geometry and attributes; dropped ones leave
     /// holes. The valve before #745 (which dropped once, without
     /// re-measuring).
@@ -4207,6 +4213,7 @@ fn valve_sample_bytes(
                                 members[w].extend(pieces.into_iter().map(|(key, g)| Member {
                                     key,
                                     seq: u64::from(*r),
+                                    rank: attrs.rank(k, u64::from(*r)),
                                     geom: g.into(),
                                     props: props.clone(),
                                     id,
@@ -5609,6 +5616,10 @@ impl From<Geometry<f64>> for MemberGeom {
 struct Member {
     key: u64,
     seq: u64,
+    /// The feature's point-thinning rank (#768, [`point_rank`]): the same in
+    /// every tile and zoom that holds the feature, so a drop that keeps the
+    /// best-ranked points nests across zooms and agrees across tile edges.
+    rank: u64,
     geom: MemberGeom,
     props: SharedProps,
     /// `Some` on every member when [`ExportOptions::feature_id`] is set
@@ -6097,6 +6108,7 @@ fn encode_geometry(buf: &mut Vec<u8>, g: &Geometry<f64>) {
 fn encode_member(buf: &mut Vec<u8>, m: &Member, names: &SpillNames) {
     put_u64(buf, m.key);
     put_u64(buf, m.seq);
+    put_u64(buf, m.rank);
     put_u64(buf, m.gap);
     put_u32(buf, u32::from(m.band));
     match m.id {
@@ -6303,6 +6315,7 @@ fn decode_segment(buf: &[u8], names: &SpillNames) -> Result<Vec<Member>, ExportE
 fn decode_member(cur: &mut SpillCursor<'_>, names: &SpillNames) -> Result<Member, ExportError> {
     let key = cur.u64()?;
     let seq = cur.u64()?;
+    let rank = cur.u64()?;
     let gap = cur.u64()?;
     let band = u16::try_from(cur.u32()?).map_err(|_| spill_corrupt())?;
     let id = match cur.u8()? {
@@ -6318,6 +6331,7 @@ fn decode_member(cur: &mut SpillCursor<'_>, names: &SpillNames) -> Result<Member
     Ok(Member {
         key,
         seq,
+        rank,
         geom: geom.into(),
         props,
         id,
@@ -6831,6 +6845,7 @@ fn fanout_batch_members(
                     Member {
                         key,
                         seq: *seq + row as u64,
+                        rank: attrs.rank(row, *seq + row as u64),
                         geom,
                         props: props.clone(),
                         id,
@@ -8766,6 +8781,7 @@ fn collect_member_chunk(
             out.buckets[route_partition(input.wave, key)].push(Member {
                 key,
                 seq: source_row,
+                rank: attrs.rank(i, source_row),
                 geom,
                 props: props.clone(),
                 id,
@@ -10327,6 +10343,8 @@ trait TileFeature: Sync {
     fn properties(&self) -> &SharedProps;
     fn feature_id(&self) -> Option<u64>;
     fn source_row(&self) -> u64;
+    /// The point-thinning rank ([`point_rank`]).
+    fn rank(&self) -> u64;
     fn band(&self) -> u16;
 }
 
@@ -10347,6 +10365,9 @@ impl TileFeature for Member {
     }
     fn source_row(&self) -> u64 {
         self.seq
+    }
+    fn rank(&self) -> u64 {
+        self.rank
     }
 }
 
@@ -10374,6 +10395,9 @@ impl TileFeature for coalesce_valve::Merged<'_> {
     fn source_row(&self) -> u64 {
         self.target.seq
     }
+    fn rank(&self) -> u64 {
+        self.target.rank
+    }
 }
 
 impl<T: TileFeature + ?Sized> TileFeature for &T {
@@ -10394,6 +10418,9 @@ impl<T: TileFeature + ?Sized> TileFeature for &T {
     }
     fn source_row(&self) -> u64 {
         (**self).source_row()
+    }
+    fn rank(&self) -> u64 {
+        (**self).rank()
     }
 }
 
@@ -11134,31 +11161,35 @@ fn drop_to_fit(
     mvt
 }
 
-/// #768: the members a point tile keeps at drop floor `floor`: a share
-/// `KEEP_ALL / floor` of them (all at or under [`valve_predict::KEEP_ALL`],
-/// at least one), by the stride [`select_kept_members`] thins with. The
-/// floor is the tile's own predicted need, or an over-cap neighbour's
-/// halved ([`valve_predict::Scan::drop_floors`]): a tile beside a denser
-/// one keeps no more than twice its share, so neighbours keep shares that
-/// agree, and a stride keeps a dense cluster as much denser than its
-/// surroundings as it was. The stride ladder after it still holds the cap
+/// #768: the members a point tile keeps at drop floor `floor`: those whose
+/// [`point_rank`] is below the share `KEEP_ALL / floor` of `2^64` (all at or
+/// under [`valve_predict::KEEP_ALL`]; at least the best-ranked one). The
+/// share is a threshold on the point's own rank, not a count of the tile's
+/// members, so a point kept at one share is kept at every larger share, in
+/// any tile and zoom that holds it, and tiles at one share keep the same
+/// points along their edges. The size ladder after it still holds the cap
 /// when the floor kept too many.
 ///
 /// DIVERGENCE FROM TIPPECANOE: `--drop-densest-as-needed` drops below one
-/// gap threshold per zoom and raises it until every tile fits, which
-/// thins clusters first. Here the floor is a share per tile, predicted
-/// before any encode and smoothed over over-cap neighbours, so a tile that
-/// fits keeps all its points; a tile still over after it is thinned by
-/// stride. `--valve-scope zoom` keeps every point tile at its zoom's
-/// smallest predicted share, as `--drop-fraction-as-needed` keeps one
-/// fraction a zoom.
+/// gap threshold per zoom and raises it until every tile fits, which thins
+/// clusters first. Here the floor is a share per tile, predicted before any
+/// encode and faded over the tiles around it ([`valve_predict::floors`]);
+/// a tile still over after it is thinned by rank. `--valve-scope zoom`
+/// keeps every point tile at its zoom's smallest predicted share, as
+/// `--drop-fraction-as-needed` keeps one fraction a zoom.
 fn kept_at_floor(members: &[Member], floor: u64) -> Vec<&Member> {
-    let n = members.len() as u64;
-    let keep = n.saturating_mul(valve_predict::KEEP_ALL) / floor.max(1);
-    if keep >= n {
+    if floor <= valve_predict::KEEP_ALL {
         return members.iter().collect();
     }
-    select_kept_members(members, keep as usize)
+    let below = (u128::from(valve_predict::KEEP_ALL) << 64) / u128::from(floor);
+    let kept: Vec<&Member> = members
+        .iter()
+        .filter(|m| u128::from(m.rank) < below)
+        .collect();
+    if kept.is_empty() {
+        return select_kept_by_rank(members, 1, |m| m.rank);
+    }
+    kept
 }
 
 /// The drop valve: while the tile is over its limit, keep a proportional
@@ -11655,50 +11686,77 @@ fn shed_to_fit<'a, M: TileFeature + std::borrow::Borrow<Member>>(
 
 /// Choose which `keep` of `members` survive the oversized-tile drop pass.
 ///
-/// The single-pass valve has exactly one per-feature ranking signal — geometry
-/// vertex count — and that signal is degenerate for point tiles, so there are
-/// two regimes:
-///
 /// * **Sized geometries** (lines / polygons): keep the `keep` largest by
-///   coordinate count. The biggest features carry the tile's visual signal;
-///   this is the pre-#280 behaviour and is byte-identical to it.
+///   coordinate count ([`select_kept_by_size`]). The biggest features carry
+///   the tile's visual signal; this is the pre-#280 behaviour and is
+///   byte-identical to it.
 /// * **Point-dominated tiles** (every member ≤ 1 coordinate — the #259 dot-fill
 ///   recipe collapses dense polygons to centroid points): vertex count carries
-///   no signal, so a size-ranked prefix would just keep whichever points happen
-///   to sort first and clump them in one corner. Instead keep a uniform stride
-///   across member order. Overview rows are in the source file's order, which
-///   for gpio-optimized input is Hilbert order, so a tile's members arrive in
-///   space-filling-curve order; an even stride then spreads the survivors
-///   across the tile — the same spatially uniform thinning tippecanoe
-///   achieves by dropping every Nth feature in sequence.
+///   no signal, so keep the `keep` best-ranked points ([`select_kept_by_rank`],
+///   [`point_rank`]). The rank belongs to the point, not the tile, so a point
+///   a tile keeps is kept by its child tiles too when they keep as large a
+///   share, and neighbouring tiles agree across their edge (#768). A stride
+///   counted from each tile's own first member replaced ~95% of the visible
+///   points from z3 to z4 on France points; tippecanoe replaces none.
 ///
 /// `keep` is clamped to `1..=members.len()`.
 fn select_kept_members<M: TileFeature>(members: &[M], keep: usize) -> Vec<&M> {
-    select_kept_by_size(members, keep, is_point_like(members), |m| {
-        m.geometry().coords_count()
-    })
+    if is_point_like(members) {
+        select_kept_by_rank(members, keep, TileFeature::rank)
+    } else {
+        select_kept_by_size(members, keep, |m| m.geometry().coords_count())
+    }
 }
 
-/// Shared drop ranking for overview members and decoded joined-tile features.
-/// The latter have geometry commands rather than source coordinates.
+/// A point's fixed thinning rank (#768): its input row, bit-reversed. Keeping
+/// the points ranked below a share of `2^64` keeps a van der Corput
+/// subsequence of the input: every 2nd row, then every 4th, and so on, with
+/// one phase for the whole dataset. Hilbert-sorted input (the input
+/// contract, `gpio sort hilbert`) puts each tile's points in long runs of
+/// rows, so the survivors spread evenly over the tile, a larger share keeps
+/// a superset of a smaller one, and two tiles at one share keep the same
+/// points along their shared edge. The input row, unlike the overview row,
+/// is the same in every shard.
+pub(crate) fn point_rank(input_row: u64) -> u64 {
+    input_row.reverse_bits()
+}
+
+/// The `keep` members of lowest `rank`, in member order (ties by position).
+/// `keep` is clamped to `1..=members.len()`.
+pub(crate) fn select_kept_by_rank<M>(
+    members: &[M],
+    keep: usize,
+    rank: impl Fn(&M) -> u64,
+) -> Vec<&M> {
+    let keep = keep.clamp(1, members.len().max(1));
+    let mut order: Vec<(u64, usize)> = members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (rank(m), i))
+        .collect();
+    if keep < order.len() {
+        order.select_nth_unstable(keep - 1);
+        order.truncate(keep);
+    }
+    let mut kept: Vec<usize> = order.into_iter().map(|(_, i)| i).collect();
+    kept.sort_unstable();
+    kept.into_iter().map(|i| &members[i]).collect()
+}
+
+/// The `keep` largest members by `size`, largest first (a stable sort, so
+/// equal sizes keep member order). `keep` is clamped to `1..=members.len()`.
+/// Shared by overview members and decoded joined-tile features, which have
+/// geometry commands rather than source coordinates.
 pub(crate) fn select_kept_by_size<M>(
     members: &[M],
     keep: usize,
-    point_like: bool,
     size: impl Fn(&M) -> usize,
 ) -> Vec<&M> {
-    let n = members.len();
-    let keep = keep.clamp(1, n);
-    if point_like {
-        // Evenly spaced indices 0, n/keep, 2n/keep, … — strictly increasing and
-        // in-bounds because keep ≤ n.
-        (0..keep).map(|i| &members[i * n / keep]).collect()
-    } else {
-        let mut ranked: Vec<&M> = members.iter().collect();
-        ranked.sort_by_key(|m| std::cmp::Reverse(size(m)));
-        ranked.truncate(keep);
-        ranked
-    }
+    let keep = keep.clamp(1, members.len());
+    let mut ranked: Vec<&M> = members.iter().collect();
+    ranked.sort_by_key(|m| std::cmp::Reverse(size(m)));
+    ranked.truncate(keep);
+    ranked
 }
 
 /// Vertices at which [`build_mvt`] encodes a tile's geometries in parallel
@@ -11997,6 +12055,7 @@ fn encode_level_tiles(
             members.push(Member {
                 key,
                 seq,
+                rank: point_rank(seq),
                 geom: geom.into(),
                 props: props.clone(),
                 id,
@@ -12543,8 +12602,14 @@ fn skipped_property_columns(
         .collect()
 }
 
+/// The overview's `input_row` column (#768): convert's own, by name and type.
+fn input_row_column(schema: &Schema) -> Option<usize> {
+    let i = schema.index_of(INPUT_ROW_COLUMN).ok()?;
+    (schema.field(i).data_type() == &DataType::UInt64).then_some(i)
+}
+
 /// Every schema column that is a property candidate: not the geometry, not
-/// the `level` column, not a bbox covering struct ([`super::writer::is_covering_column`]:
+/// the `level` or `input_row` column, not a bbox covering struct ([`super::writer::is_covering_column`]:
 /// index metadata, not user data -- so it is neither exported nor warned
 /// about), and not withheld by the selection.
 fn candidate_columns<'a>(
@@ -12560,7 +12625,7 @@ fn candidate_columns<'a>(
         .filter(move |&(i, f)| {
             published.properties.as_ref().map_or(
                 i != geom_idx
-                    && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
+                    && !super::writer::is_unpublished_column(f.name())
                     && !super::writer::is_covering_column(f, geom, published.covering.as_deref()),
                 |indices| indices.contains(&i),
             ) && !published.is_suppressed(f.name())
@@ -12575,6 +12640,9 @@ struct AttrColumns<'a> {
     /// `(column index, published name)` in schema order.
     props: Vec<(usize, Arc<str>)>,
     feature_id: Option<&'a ResolvedFeatureId>,
+    /// The overview's `input_row` column (#768), absent from overviews
+    /// written before it.
+    input_row: Option<usize>,
 }
 
 impl<'a> AttrColumns<'a> {
@@ -12597,6 +12665,7 @@ impl<'a> AttrColumns<'a> {
             props,
             names,
             feature_id,
+            input_row: input_row_column(schema),
         }
     }
 
@@ -12622,6 +12691,9 @@ impl<'a> AttrColumns<'a> {
                     .unwrap_or_default();
                 (fid, ids)
             }),
+            input_rows: self
+                .input_row
+                .and_then(|i| batch.column(i).as_primitive_opt::<UInt64Type>().cloned()),
             #[cfg(debug_assertions)]
             read: vec![false; batch.num_rows()],
         })
@@ -12634,12 +12706,21 @@ struct BatchAttributes<'a> {
     rows: Vec<packed_props::arrow::Row>,
     /// The `--feature-id` column and its per-row ids (`None` = invalid).
     ids: Option<(&'a ResolvedFeatureId, Vec<Option<u64>>)>,
+    /// The batch's `input_row` column, when the overview has one.
+    input_rows: Option<arrow_array::UInt64Array>,
     /// Rows [`Self::row`] has already moved out (debug builds only).
     #[cfg(debug_assertions)]
     read: Vec<bool>,
 }
 
 impl BatchAttributes<'_> {
+    /// Row `row`'s [`point_rank`]: its input row's, or, in an overview
+    /// written before the `input_row` column, its overview row `seq`'s
+    /// (the same, unsharded, for points no convert thinned).
+    fn rank(&self, row: usize, seq: u64) -> u64 {
+        point_rank(self.input_rows.as_ref().map_or(seq, |r| r.value(row)))
+    }
+
     /// Row `row`'s `--feature-id`, if one is set.
     fn id(&self, row: usize) -> Result<Option<u64>, ExportError> {
         Ok(match &self.ids {
@@ -16005,6 +16086,7 @@ mod tests {
         let member = |geom: Geometry| Member {
             key: 0,
             seq: 0,
+            rank: point_rank(0),
             geom: geom.into(),
             props: SharedProps::new(Vec::new()),
             id: None,
@@ -16075,6 +16157,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: i as u64,
+                    rank: point_rank(i as u64),
                     geom: geom.into(),
                     props: SharedProps::new(props),
                     id: None,
@@ -16901,6 +16984,7 @@ mod tests {
         let m = Member {
             key,
             seq: 0,
+            rank: point_rank(0),
             geom: geom.clone().into(),
             props: SharedProps::new(Vec::new()),
             id: None,
@@ -16999,6 +17083,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: i,
+                    rank: point_rank(i),
                     geom: Geometry::Polygon(
                         geo::Rect::new(
                             geo::coord! { x: x, y: y },
@@ -17232,6 +17317,7 @@ mod tests {
         let half = |lng0: f64, lng1: f64, name: &str, id: u64| Member {
             key: 0,
             seq: 0,
+            rank: point_rank(0),
             geom: Geometry::Polygon(
                 geo::Rect::new(
                     geo::coord! { x: lng0, y: tb.lat_min },
@@ -18797,6 +18883,7 @@ mod tests {
         let member = Member {
             key: 9,
             seq: 3,
+            rank: point_rank(3),
             geom: Geometry::Point(Point::new(1.5, -2.5)).into(),
             props: SharedProps::new(vec![
                 ("empty".into(), PropertyValue::String(String::new())),
@@ -19899,6 +19986,7 @@ mod tests {
         let member = Member {
             key: tile_key(tiles[0].x, tiles[0].y, 4),
             seq: 0,
+            rank: point_rank(0),
             geom: poly.clone().into(),
             props: SharedProps::new(vec![]),
             id: None,
@@ -20227,6 +20315,7 @@ mod tests {
             .map(|(i, f)| Member {
                 key: tile_key(512, 511, 10),
                 seq: i as u64,
+                rank: point_rank(i as u64),
                 geom: f.geom.into(),
                 props: SharedProps::new(if i < 2 {
                     vec![]
@@ -20314,6 +20403,7 @@ mod tests {
             .map(|(i, f)| Member {
                 key: tile_key(512, 511, 10),
                 seq: i as u64,
+                rank: point_rank(i as u64),
                 geom: f.geom.into(),
                 props: SharedProps::new(vec![]),
                 id: None,
@@ -20370,6 +20460,7 @@ mod tests {
             .map(|(i, f)| Member {
                 key: tile_key(512, 511, 10),
                 seq: i as u64,
+                rank: point_rank(i as u64),
                 geom: f.geom.into(),
                 props: SharedProps::new(vec![]),
                 id: None,
@@ -20514,14 +20605,13 @@ mod tests {
         // keeps the share the dense neighbour's halved floor implies, which
         // fits, so nothing more drops.
         let thinned = encode(&on_pairs, &opts, Some(&floors), b);
-        let keep = 25_088 * valve_predict::KEEP_ALL / floors.get(b);
-        assert!(keep < 25_088 && keep > 0, "{keep}");
-        assert_eq!(
-            thinned.valve.dropped as u64,
-            25_088 - keep,
-            "{:?}",
-            thinned.valve
+        let keep = kept_at_floor(&on_pairs, floors.get(b)).len();
+        let share = 25_088 * valve_predict::KEEP_ALL / floors.get(b);
+        assert!(
+            keep.abs_diff(share as usize) < 25_088 / 100,
+            "{keep} {share}"
         );
+        assert_eq!(thinned.valve.dropped, 25_088 - keep, "{:?}", thinned.valve);
         assert_eq!(thinned.valve.over_limit, 0);
         assert!(thinned.data.len() <= cap);
         assert!(thinned.oversized);
@@ -20583,6 +20673,109 @@ mod tests {
         assert!(kept_at_floor(&[], u64::MAX).is_empty());
     }
 
+    /// Points on rows `rows`, one a row along a line, in input order.
+    fn run_of_points(rows: std::ops::Range<u64>) -> Vec<Member> {
+        rows.map(|r| point_member(r as f64 * 1e-4, 1.0, r))
+            .collect()
+    }
+
+    fn kept_rows(kept: &[&Member]) -> Vec<u64> {
+        kept.iter().map(|m| m.seq).collect()
+    }
+
+    /// The drop floor of a kept `share` (1 / that floor's multiple of
+    /// `KEEP_ALL`).
+    fn share_floor(share: f64) -> u64 {
+        (valve_predict::KEEP_ALL as f64 / share) as u64
+    }
+
+    /// #768: point thinning keeps points by a rank of their own, not a
+    /// stride counted from each tile's first member: a point a tile keeps
+    /// is kept by a child tile that keeps at least the same share, and two
+    /// tiles at one share keep, between them, what their union would.
+    #[test]
+    fn point_thinning_nests_across_zooms_and_agrees_at_tile_edges() {
+        let parent = run_of_points(0..4_096);
+        let kept = kept_at_floor(&parent, share_floor(1.0 / 8.0));
+        // A child tile holds a run of the parent's rows.
+        let child = run_of_points(1_000..2_100);
+        let in_child: Vec<u64> = kept_rows(&kept)
+            .into_iter()
+            .filter(|r| (1_000..2_100).contains(r))
+            .collect();
+        assert_eq!(
+            kept_rows(&kept_at_floor(&child, share_floor(1.0 / 8.0))),
+            in_child,
+            "the child at the parent's share keeps the parent's points"
+        );
+        let deeper = kept_rows(&kept_at_floor(&child, share_floor(0.3)));
+        assert!(in_child.iter().all(|r| deeper.contains(r)));
+        // Two neighbours at one share keep what the whole run does.
+        let mut halves = kept_rows(&kept_at_floor(&run_of_points(0..1_500), share_floor(0.125)));
+        halves.extend(kept_rows(&kept_at_floor(
+            &run_of_points(1_500..4_096),
+            share_floor(0.125),
+        )));
+        assert_eq!(halves, kept_rows(&kept));
+        // The ladder after the floor keeps nested counts too.
+        let few = kept_rows(&select_kept_members(&child, 50));
+        let more = kept_rows(&select_kept_members(&child, 200));
+        assert_eq!((few.len(), more.len()), (50, 200));
+        assert!(few.iter().all(|r| more.contains(r)));
+    }
+
+    /// #768: a rank keeps its points evenly along the input order (the
+    /// Hilbert curve), from any first row: at a power-of-two share exactly
+    /// every n-th row, at any other within twice the spacing.
+    #[test]
+    fn point_rank_spreads_the_kept_points_evenly() {
+        for start in [0u64, 1, 777, 1 << 40] {
+            let rows = kept_rows(&kept_at_floor(
+                &run_of_points(start..start + 3_000),
+                share_floor(0.125),
+            ));
+            assert!(rows.windows(2).all(|w| w[1] - w[0] == 8), "{start}");
+            let rows = kept_rows(&kept_at_floor(
+                &run_of_points(start..start + 3_000),
+                share_floor(0.3),
+            ));
+            assert!(rows.windows(2).all(|w| w[1] - w[0] <= 4), "{start}");
+            assert!(
+                (rows.len() as f64 / 900.0 - 1.0).abs() < 0.02,
+                "{}",
+                rows.len()
+            );
+        }
+    }
+
+    proptest::proptest! {
+        /// #768: for any run of input rows, a split of it into two tiles and
+        /// two shares, the larger share keeps a superset, and the split
+        /// halves keep exactly what the run keeps.
+        #[test]
+        fn point_floors_nest_and_split_cleanly(
+            start in 0u64..1 << 50,
+            len in 1u64..3_000,
+            cut in 0.0f64..1.0,
+            low in 0.001f64..1.0,
+            more in 0.0f64..1.0,
+        ) {
+            let high = low + (1.0 - low) * more;
+            let run = run_of_points(start..start + len);
+            let at = start + (len as f64 * cut) as u64;
+            let (left, right) = (run_of_points(start..at), run_of_points(at..start + len));
+            let whole = kept_rows(&kept_at_floor(&run, share_floor(low)));
+            let wider = kept_rows(&kept_at_floor(&run, share_floor(high)));
+            proptest::prop_assert!(whole.iter().all(|r| wider.contains(r)));
+            let mut halves = kept_rows(&kept_at_floor(&left, share_floor(low)));
+            halves.extend(kept_rows(&kept_at_floor(&right, share_floor(low))));
+            // Beyond the run's points, only a half whose share kept none
+            // keeps one more: its best-ranked point.
+            proptest::prop_assert!(halves.len() <= whole.len() + 2);
+            proptest::prop_assert!(whole.iter().all(|r| halves.contains(r)));
+        }
+    }
+
     /// #768: a point floor that keeps too many still ends under the cap.
     /// The stride ladder finishes the tile from what the floor kept.
     #[test]
@@ -20594,9 +20787,10 @@ mod tests {
                 point_member(x, 0.37 * i as f64 - 70.0, i)
             })
             .collect();
-        // Keeps four fifths of the points.
+        // Keeps about four fifths of the points.
         let floor = valve_predict::KEEP_ALL * 5 / 4;
-        let below = 400 - 400 * 4 / 5;
+        let below = members.len() - kept_at_floor(&members, floor).len();
+        assert!((75..=85).contains(&below), "{below}");
         let opts = ExportOptions {
             size_valve: SizeValve::Drop,
             tile_size_limit: None,
@@ -20630,7 +20824,7 @@ mod tests {
         assert!(mvt.data.len() <= cap);
         assert!(mvt.valve.dropped > below, "{:?}", mvt.valve);
         // Under a looser cap the floor alone fits the tile: it drops exactly
-        // the share it does not keep, where the stride alone would drop fewer.
+        // the share it does not keep, where the ladder alone would drop fewer.
         let loose = ExportOptions {
             tile_size_limit: Some(cap * 3 / 2),
             ..opts.clone()
@@ -20730,6 +20924,7 @@ mod tests {
             .map(|(i, f)| Member {
                 key: tile_key(512, 511, 10),
                 seq: i as u64,
+                rank: point_rank(i as u64),
                 geom: f.geom.into(),
                 props: SharedProps::new(vec![]),
                 id: Some(i as u64),
@@ -21326,6 +21521,7 @@ mod tests {
                 members.push(Member {
                     key,
                     seq: i as u64,
+                    rank: point_rank(i as u64),
                     geom: geom.into(),
                     props: props.clone(),
                     id: None,
@@ -21790,6 +21986,7 @@ mod tests {
         Member {
             key: 0,
             seq,
+            rank: point_rank(seq),
             geom: Geometry::Point(Point::new(x, y)).into(),
             props: SharedProps::new(Vec::new()),
             id: None,
@@ -22063,6 +22260,7 @@ mod tests {
         Member {
             key: 0,
             seq,
+            rank: point_rank(seq),
             geom: Geometry::Point(Point::new(seq as f64 * 0.001, 0.0)).into(),
             props: SharedProps::new(vec![("level".into(), PropertyValue::Double(level))]),
             id: None,
@@ -22221,6 +22419,7 @@ mod tests {
         let mk = |key: u64, seq: u64, level: f64| Member {
             key,
             seq,
+            rank: point_rank(seq),
             geom: Geometry::Point(Point::new(0.0, 0.0)).into(),
             props: SharedProps::new(vec![("level".into(), PropertyValue::Double(level))]),
             id: None,
@@ -22253,6 +22452,7 @@ mod tests {
         let mk = |seq: u64, v: PropertyValue| Member {
             key: 0,
             seq,
+            rank: point_rank(seq),
             geom: Geometry::Point(Point::new(0.0, 0.0)).into(),
             props: SharedProps::new(vec![("n".into(), v)]),
             id: None,
@@ -22333,6 +22533,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: n as u64,
+                    rank: point_rank(n as u64),
                     geom: Geometry::LineString(LineString::from(coords)).into(),
                     props: SharedProps::new(Vec::new()),
                     id: None,
@@ -22348,11 +22549,11 @@ mod tests {
 
     /// At z0 a point within the buffer of the date line reaches the tile
     /// twice, and the two copies join into one 2-point MultiPoint (#342). A
-    /// tile holding such members is still a tile of points: it thins by the
-    /// even stride across the whole tile, not by size (which kept every
+    /// tile holding such members is still a tile of points: it thins by
+    /// rank across the whole tile, not by size (which kept every
     /// wrapped pair and then a prefix of the rest: no Europe at z0).
     #[test]
-    fn drop_valve_point_tile_with_date_line_pairs_keeps_uniform_stride() {
+    fn drop_valve_point_tile_with_date_line_pairs_keeps_its_best_ranked_points() {
         let mut members: Vec<Member> = (0..90)
             .map(|i| point_member(-170.0 + 3.7 * i as f64, 10.0, i))
             .collect();
@@ -22370,7 +22571,9 @@ mod tests {
             .iter()
             .map(|m| m.seq)
             .collect();
-        assert_eq!(kept, (0..10).map(|i| i * 10).collect::<Vec<_>>());
+        // The ten lowest bit-reversed rows of 0..100: the date-line pairs
+        // (90..100) rank as the points they draw.
+        assert_eq!(kept, [0, 8, 16, 32, 40, 48, 64, 72, 80, 96]);
     }
 
     /// #768: only a pair one world apart at one latitude is a date-line
@@ -22494,6 +22697,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: i,
+                    rank: point_rank(i),
                     geom: Geometry::LineString(coords.into_iter().collect()).into(),
                     props: SharedProps::new(vec![(
                         "level".into(),
@@ -22649,6 +22853,7 @@ mod tests {
             let m = Member {
                 key: tile_key(7, 11, 5) + i as u64,
                 seq: u64::MAX - i as u64,
+                rank: point_rank(u64::MAX - i as u64),
                 geom: g.into(),
                 props: SharedProps::new(props.clone()),
                 id,
@@ -22686,6 +22891,7 @@ mod tests {
         let member = Member {
             key: 0,
             seq: 0,
+            rank: point_rank(0),
             geom: Geometry::Point(Point::new(0.0, 0.0)).into(),
             props: SharedProps::new(vec![(
                 "text".into(),
@@ -23027,6 +23233,7 @@ mod tests {
                         Member {
                             key: 0,
                             seq,
+                            rank: point_rank(seq),
                             geom: Geometry::Point(Point::new(seq as f64, -1.0)).into(),
                             props: SharedProps::new(vec![]),
                             id: None,
@@ -23063,6 +23270,7 @@ mod tests {
         let mk = |key: u64, seq: u64| Member {
             key,
             seq,
+            rank: point_rank(seq),
             geom: Geometry::Point(Point::new(seq as f64, -1.0)).into(),
             props: SharedProps::new(vec![("id".into(), PropertyValue::Int(seq as i64))]),
             id: None,
@@ -23101,6 +23309,7 @@ mod tests {
         let m = |props: Vec<(Arc<str>, PropertyValue)>| Member {
             key: 0,
             seq: 0,
+            rank: point_rank(0),
             geom: Geometry::LineString(LineString::from(vec![(0.0, 0.0), (1.0, 1.0)])).into(),
             props: SharedProps::new(props),
             id: None,
@@ -23135,6 +23344,7 @@ mod tests {
         let mk = |seq: u64, props: Vec<(Arc<str>, PropertyValue)>| Member {
             key: 0,
             seq,
+            rank: point_rank(seq),
             geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
             props: SharedProps::new(props),
             id: None,
@@ -23207,6 +23417,7 @@ mod tests {
         let member = |seq: u64| Member {
             key: 0,
             seq,
+            rank: point_rank(seq),
             geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
             props: SharedProps::new(Vec::new()),
             id: None,
@@ -23256,6 +23467,7 @@ mod tests {
                     Member {
                         key: 0,
                         seq,
+                        rank: point_rank(seq),
                         geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
                         props: SharedProps::new(vec![(name, PropertyValue::UInt(seq))]),
                         id: None,
@@ -25613,6 +25825,7 @@ mod tests {
                     .map(|seq| Member {
                         key: 0,
                         seq,
+                        rank: point_rank(seq),
                         geom: Geometry::Point(Point::new(seq as f64, 0.0)).into(),
                         props: SharedProps::new(Vec::new()),
                         id: None,
@@ -25642,6 +25855,7 @@ mod tests {
             .map(|i| Member {
                 key: 0,
                 seq: i as u64,
+                rank: point_rank(i as u64),
                 geom: Geometry::Point(Point::new(
                     -170.0 + (i % 300) as f64 * 0.5,
                     10.0 + (i / 300) as f64 * 0.5,
@@ -25692,6 +25906,7 @@ mod diagnostic_row_alignment {
         .map(|(row, geom)| Member {
             key: 0,
             seq: row as u64,
+            rank: point_rank(row as u64),
             geom: geom.into(),
             props: SharedProps::new(vec![]),
             id: Some(100 + row as u64),
@@ -25822,6 +26037,7 @@ mod diagnostic_row_alignment {
                 .map(|(row, geom)| Member {
                     key: 0,
                     seq: row as u64,
+                    rank: point_rank(row as u64),
                     geom: geom.into(),
                     props: SharedProps::new(vec![]),
                     id: Some(100 + row as u64),
@@ -25911,6 +26127,7 @@ mod diagnostic_row_alignment {
                 Member {
                     key: 0,
                     seq: row as u64,
+                    rank: point_rank(row as u64),
                     geom: geom.into(),
                     id: Some(7),
                     props: SharedProps::new(vec![]),
@@ -25968,6 +26185,7 @@ mod diagnostic_row_alignment {
         let members = vec![Member {
             key: 0,
             seq: 0,
+            rank: point_rank(0),
             geom: triangle.into(),
             props: SharedProps::new(vec![]),
             id: Some(7),
