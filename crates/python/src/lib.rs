@@ -119,6 +119,15 @@ impl log::Log for Bridge {
     }
 }
 
+/// Empty [`USER_WARNINGS`], returning what it held.
+fn take_user_warnings() -> Vec<String> {
+    std::mem::take(
+        &mut *USER_WARNINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
 /// Run `f` with the GIL released, then raise the user warnings it logged
 /// ([`USER_WARNINGS`]), once each, from the caller's own frame; a warning
 /// escalated to an error (`-W error`) is the exception the call raises.
@@ -126,12 +135,10 @@ fn detached<T: pyo3::marker::Ungil>(
     py: Python<'_>,
     f: impl pyo3::marker::Ungil + FnOnce() -> T,
 ) -> PyResult<T> {
+    // A run that panicked, or a `_run_cli`, may have left another call's.
+    take_user_warnings();
     let out = py.detach(f);
-    let messages = std::mem::take(
-        &mut *USER_WARNINGS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
+    let messages = take_user_warnings();
     let mut seen = std::collections::HashSet::new();
     for message in messages {
         if seen.insert(message.clone()) {
@@ -714,7 +721,13 @@ fn _defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// logger, `--quiet`, and exit codes, a panic included (101).
 #[pyfunction]
 fn _run_cli(py: Python<'_>, argv: Vec<std::ffi::OsString>) -> u8 {
-    py.detach(|| tylertoo_cli::run(argv))
+    let code = py.detach(|| tylertoo_cli::run(argv));
+    // After a binding installed the bridge, the CLI's user warnings land in
+    // the buffer; print them as the CLI's own logger would.
+    for message in take_user_warnings() {
+        eprintln!("{message}");
+    }
+    code
 }
 
 /// The compiled extension, imported as `tylertoo._tylertoo`.
