@@ -42,7 +42,7 @@ Use these settings to balance coverage, build time, and file size:
 
 | Goal | Settings | Cost and effect |
 |---|---|---|
-| No holes where small polygons are dense (parcels, small admin units) | `export-pmtiles --coverage-fill` | Each tile also draws, under its own features, the area its child tiles cover, so placeholder squares no longer leave gaps between them: Auckland parcels at z8 go from 28.5% of the area missing to none. 1.10–1.17× the build time and 4% larger archives on Madagascar admin-4 and NZ parcels. On scattered polygons smaller than a pixel (FTW fields) it also draws area between them. See [coverage fill](#coverage-fill-coverage-fill). |
+| No holes where small polygons are dense (parcels, small admin units) | `export-pmtiles --coverage-fill` | Each tile also draws, under its own features, the area its child tiles cover, so placeholder squares no longer leave gaps between them: Auckland parcels at z8 go from 28.5% of the area missing to none. 2.4–2.8× the build time and 1–3% larger archives on NZ parcels and Madagascar admin-4 (2 MB gzip cap, median of 3). On scattered polygons smaller than a pixel (FTW fields) it also draws area between them. See [coverage fill](#coverage-fill-coverage-fill). |
 | Neighbors share their simplified borders | `--no-simplification-of-shared-nodes` | Keeps simplification on. Pins make the overview file a little larger, but avoid storing full-resolution geometry at every level. See [coverage and simplification](#coverage-and-simplification) for costs. |
 | Fewer slivers by lowering the tolerance | `--simplify-factor 0.25` | About tippecanoe's coverage on dense parcels. See [coverage and simplification](#coverage-and-simplification). |
 | No simplification slivers | `--simplify-factor 0`, plus `--profile bounded` when memory is tight | Neighbors meet without gaps. The overview file grows about 2.7×, and dense small polygons build up to 10× slower. |
@@ -251,8 +251,9 @@ that area under its own features.
   (`--tile-range`) own the zooms from the pivot down, where the fill matters
   least, and skip it (#771).
 
-On the benchmark inputs, the fill adds 17% to end-to-end time on NZ parcels
-and 10% on Madagascar admin-4, and 4% to the archive. On FTW Moldova, where
+On the benchmark inputs at a 2 MB gzip cap (median of 3), the fill takes
+NZ parcels from 20.9 s to 50.3 s end to end (2.4×) and Madagascar admin-4
+from 1.08 s to 3.00 s (2.8×), and adds 1% and 2.5% to the archive. On FTW Moldova, where
 fields are smaller than a pixel at coarse zooms, it halves the missing area
 but draws more area between fields, and the build takes about 1.5× as long
 (#762).
@@ -1766,8 +1767,9 @@ full-resolution polygons can compress 4:1. A tile must fit both caps, and
 twice as strict as tippecanoe's: on dense fields it merged nearly twice as
 many features (FTW Moldova: 901k against 490k) for no coverage gain.
 
-A tile over a cap is reduced for that tile only, and measured again until it
-fits. `--size-valve` chooses how:
+A tile over a cap is reduced and measured again until it fits.
+`--size-valve` chooses how, and `--valve-scope` how far the reduction
+reaches past the tile:
 
 - `merge` (the default) merges the densest lines and polygons into the
   feature kept just before them, raising the merge threshold until the tile
@@ -1795,21 +1797,38 @@ fits. `--size-valve` chooses how:
   the chosen extent and takes at most eight encodes. Both valves keep their
   first drop cut unchanged. Later cuts use a 20% margin to finish sooner.
 
-`--merge-scope` sets how far `merge` reaches (#768):
+`--valve-scope` sets how far either valve's threshold reaches past the tile
+it fits (#768):
 
-- `smooth` (the default) predicts, from the export's scan, which tiles must
-  merge and how far: each dense tile's gap threshold, priced by a real
-  encode of a sample of its own members. A tile then starts its merge at
-  that threshold, in one encode, and its eight neighbours start at half of
-  it. Merge density then steps down at a tile edge instead of
-  jumping from merged to unmerged. A tile still over its cap merges further,
-  as under `tile`. Each tile's prediction reads only its own members, so a
-  sharded build starts every tile from the same threshold as an unsharded
-  one. On NZ Parcels it cuts the p95 density step between
-  neighbouring tiles at z5–z7 from 2.3–3.7 to 1.0–2.4, for 14% more
-  wall time (19.1 s to 21.9 s); on FTW Moldova, 9% (2.8 s to 3.0 s).
-- `tile` merges each tile only as much as it needs on its own, as tippecanoe
-  does.
+- `smooth` (the default) predicts, from the export's scan, which tiles go
+  over a cap and how far: each dense tile's gap threshold, priced by a real
+  encode of a sample of its own members.
+  - Under `merge` a tile then starts its merge at that threshold, in one
+    encode, and its eight neighbours start at half of it. Merge density
+    steps down at a tile edge instead of jumping from merged to unmerged.
+    On NZ Parcels it cuts the p95 density step between neighbouring tiles
+    at z5–z7 from 2.3–3.7 to 1.0–2.4, for 8% more wall time (19.2 s to
+    20.7 s, median of 3); on FTW Moldova, 1% (2.82 s to 2.85 s).
+  - Under `drop` a point tile predicted over its cap first drops the points
+    closer to the point before them than its own threshold, or than half the
+    threshold of an over-cap neighbour, whichever is larger. A point tile
+    that fits keeps every point; only tiles over a cap are thinned toward
+    their denser neighbours. On 1.8 million French points
+    (`--preset tippecanoe --size-valve drop --max-compressed-tile-size
+    1500000`), the absolute log ratio of the kept shares on the two sides
+    of the 0° tile edge at z5 falls from 1.03–1.18 to 0.13–0.37. The build takes 12.8 s
+    instead of 33.2 s, because the floor drops most of a dense tile's
+    points before its first encode.
+  - A tile still over its cap is reduced further, as under `tile`. Each
+    tile's prediction reads only its own members, so a sharded build starts
+    every tile from the same threshold as an unsharded one.
+- `tile` thins each tile only as much as it needs on its own. It is the
+  output from before #768.
+- `zoom` starts every tile at a zoom from the largest threshold predicted
+  there, under either valve. Tippecanoe works this way: a tile too big
+  raises the zoom's threshold and the zoom is rebuilt with it, so sparse
+  tiles next to dense ones are thinned too. A sharded build
+  (`--tile-range`) cannot see the whole zoom and refuses it.
 
 Under either valve, the warning about tiles still over the cap, and the
 `tiles_over_limit` diagnostic in `--report`, list the ten largest of them as

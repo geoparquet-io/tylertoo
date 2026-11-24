@@ -64,6 +64,9 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Pass 1 warns when the input rows are not sorted by location (#768) and
+  names the `gpio sort hilbert` command for the input: on unsorted input,
+  merged features join unrelated geometry and tile edges show more seams.
 - `--preset tippecanoe` (Python `preset="tippecanoe"`) on `tiles`, `overview`
   and `export-pmtiles` starts from tippecanoe's drop rate, gamma,
   simplification, tile buffer, size caps and size valve (#822). Options you
@@ -194,6 +197,17 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Tile output: the size valve's threshold reaches past the tile it fits
+  (#768).** `--valve-scope` (Python `valve_scope=`) defaults to `smooth`.
+  The export scan predicts each dense tile's threshold. Under
+  `--size-valve merge` the tiles around a merging tile start from half of
+  it, so merge density steps down over a tile instead of at its edge; under
+  `--size-valve drop` a point tile over its cap first drops its closest
+  points, down to its own threshold or half an over-cap neighbour's.
+  Archives change. `--valve-scope tile` restores the previous output, and
+  `--valve-scope zoom` starts every tile from its zoom's largest threshold
+  (not with `--tile-range`). The default costs at most 1.09× the build time
+  of `tile` on the benchmark inputs (median of 3).
 - The Python wheel uses mimalloc as its global allocator on every platform,
   as the CLI does (#739, #792). On the 792 buildings input (median of 3),
   export takes 10.0 s against 10.9 s and peak RSS is 3.36 GB against 2.84 GB
