@@ -64,9 +64,10 @@
 //! encoded tiles. That per-partition transient is usually bounded by the
 //! partition target — **not** the zoom band's feature count — but a single
 //! dense tile that overshoots the target is one partition whose members are
-//! *unbounded* by it. On `auto` the wave width is therefore sized per level from
-//! the densest planned partition (`memory_safe_level_wave`, #311), narrowing
-//! (down to serial if need be) so a dense finest zoom stays within RAM instead
+//! *unbounded* by it. On `auto` each wave therefore holds only the members the
+//! budget affords (`memory_safe_wave_members`, #311): `cut_waves` narrows the
+//! waves that hold dense partitions (down to serial if need be) and leaves the
+//! rest at the ceiling (#876), so a dense finest zoom stays within RAM instead
 //! of OOM-killing the run.
 //! The scan pass keeps only per-tile member counts (`O(#tiles)`), and the
 //! PMTiles writer streams tile bytes to a temp file, keeping only directory
@@ -1596,7 +1597,7 @@ fn export_collect_bytes(profile: MemoryProfile, budget: &MemoryBudget) -> u64 {
 
 /// Flat fallback estimate of one wave slot's transient memory cost, used **only
 /// by the upfront ceiling** [`memory_safe_wave`] and when the data-aware
-/// per-level estimate ([`memory_safe_level_wave`], #311) cannot be computed
+/// per-level estimate ([`memory_safe_wave_members`], #311) cannot be computed
 /// (finest-level row size unknown).
 ///
 /// Measured (2026-07, #293 benchmark, germany-segments 19.2M-feature z14
@@ -1605,8 +1606,8 @@ fn export_collect_bytes(profile: MemoryProfile, budget: &MemoryBudget) -> u64 {
 /// dense finest-zoom polygon data a single dense tile is one partition holding
 /// millions of members, so the true per-slot transient runs ~120× this (#311,
 /// Brazil field boundaries: ~7.5 GiB/slot). That is why the binding memory
-/// guard is now the per-level [`memory_safe_level_wave`], which sizes from the
-/// densest planned partition's actual member count; this constant survives only
+/// guard is now the per-level [`memory_safe_wave_members`], which caps the
+/// members a wave actually holds ([`cut_waves`], #876); this constant survives only
 /// as the coarse upfront ceiling and the last-resort fallback.
 const PARTITION_SLOT_TRANSIENT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -1726,53 +1727,39 @@ fn auto_partition_wave(cores: usize, profile: MemoryProfile, budget: &MemoryBudg
         .max(PARTITION_WAVE_MIN)
 }
 
-/// The memory-safe wave width for a **single level** (#311), the fix for the
-/// flat [`PARTITION_SLOT_TRANSIENT_BYTES`] under-count that OOM-killed dense
-/// exports on `auto`.
+/// The most members one wave of a level may hold (#311, #876), the fix for
+/// the flat [`PARTITION_SLOT_TRANSIENT_BYTES`] under-count that OOM-killed
+/// dense exports on `auto`.
 ///
-/// Where the upfront [`memory_safe_wave`] sizes from a flat per-slot constant,
-/// this uses the level's *actual* densest planned partition:
-/// `max(partition.members) × member_bytes` (see [`export_member_resident_bytes`])
-/// directly estimates the largest partition's resident volume. This
-/// captures the real driver — a single dense tile that overshoots
-/// [`DEFAULT_PARTITION_TARGET`] is one partition, wholly unbounded by the target
-/// — which the flat constant ignores entirely.
+/// [`cut_waves`] sums the members a wave actually holds against this cap, so
+/// one dense partition (a tile that overshoots [`DEFAULT_PARTITION_TARGET`]
+/// is one partition, unbounded by the target) narrows only its own wave.
+/// Pricing every slot at the densest partition narrowed whole levels: on the
+/// #908 input z10 ran at wave 15 of 64, 46% slower, for no memory it needed.
+/// A wave may still fall to one partition, below [`PARTITION_WAVE_MIN`]:
+/// a serial wave that finishes beats an OOM that never does.
 ///
-/// The result is clamped to `ceiling` (the auto/core-sized upper bound, so this
-/// never *widens* a wave) but is deliberately allowed to fall **below**
-/// [`PARTITION_WAVE_MIN`], down to 1: on pathologically dense data, memory
-/// safety outranks the historical throughput floor (a serial wave that finishes
-/// beats an OOM that never does).
-///
-/// Falls back to `ceiling` (prior behaviour) when the per-member size is
-/// unknown (empty finest level), where the flat preflight already governed.
-/// With RAM unknown the budget's fallback allowance prices it; under
-/// `speed` there is no cap (#788).
-fn memory_safe_level_wave(
-    ceiling: usize,
-    partitions: &[Partition],
+/// No cap (`usize::MAX`) when the per-member size is unknown (empty finest
+/// level), where the flat preflight already governed. With RAM unknown the
+/// budget's fallback allowance prices it; under `speed` there is no cap
+/// (#788).
+fn memory_safe_wave_members(
     member_bytes: Option<u64>,
     profile: MemoryProfile,
     budget: &MemoryBudget,
 ) -> usize {
-    let Some(per_member) = member_bytes.filter(|&b| b > 0) else {
-        return ceiling;
-    };
-    let max_members = partitions.iter().map(|p| p.members).max().unwrap_or(0);
-    if max_members == 0 {
-        return ceiling;
-    }
-    // Saturating throughout: an absurd member count or byte size clamps the
-    // per-slot estimate to "definitely serial" (wave 1) rather than overflowing.
-    // A footer price: `per_member` is the finest level's mean stored row
-    // bytes from the footer, inflated with the optional valve workspace by
+    // A footer price: the finest level's mean stored row bytes from the
+    // footer, inflated with the optional valve workspace by
     // [`export_member_resident_bytes`].
-    let per_slot = (max_members as u64).saturating_mul(per_member).max(1);
-    ceiling.min(budget.affordable(
-        profile,
-        MemoryPhase::ExportCollect,
-        Price::new(per_slot, PriceBasis::Footer),
-    ))
+    member_bytes
+        .filter(|&b| b > 0)
+        .map_or(usize::MAX, |per_member| {
+            budget.affordable(
+                profile,
+                MemoryPhase::ExportCollect,
+                Price::new(per_member, PriceBasis::Footer),
+            )
+        })
 }
 
 /// The most members one concurrent level group (#647) may hold at once.
@@ -1784,7 +1771,7 @@ fn memory_safe_level_wave(
 /// size is known, the cap also narrows to the members
 /// [`MemoryPhase::ExportCollect`] can afford under `profile` at
 /// `member_bytes` each (see [`export_member_resident_bytes`]), the same estimate
-/// [`memory_safe_level_wave`] uses; under `speed` it does not narrow.
+/// [`memory_safe_wave_members`] uses; under `speed` it does not narrow.
 ///
 /// The cap counts members only. A group can also hold the encoded tiles of
 /// a level that finished before a coarser one, until [`GroupCommit`] writes
@@ -1813,7 +1800,7 @@ fn level_group_member_cap(
 /// The error for a level whose densest tile cannot fit in `limit` even when
 /// it is the only one in flight (#665), or `None` when it fits.
 ///
-/// [`memory_safe_level_wave`] can narrow a wave down to one partition, but no
+/// [`cut_waves`] can narrow a wave down to one partition, but no
 /// further, and [`plan_partitions`] never splits a tile. With thinning off
 /// (`--verbatim`), the z0 tile holds every feature. Exporting a tile means
 /// holding all its members and then their full MVT, so a tile estimated past
@@ -1941,7 +1928,7 @@ fn plan_level_groups(
     let mut open: Option<(std::ops::Range<usize>, usize)> = None;
     for (i, plan) in plans.iter().enumerate() {
         let members: usize = plan.partitions.iter().map(|p| p.members).sum();
-        let single_wave = plan.partitions.len() <= plan.wave.max(1);
+        let single_wave = plan.wave_count() <= 1;
         if waves && !single_wave {
             // #817: its waves are bounded in flight and in write order, not
             // by the group's sum, so it joins the open group.
@@ -2007,8 +1994,7 @@ fn group_schedule(
     let largest_wave = plans
         .iter()
         .flat_map(|plan| {
-            plan.partitions
-                .chunks(plan.wave.max(1))
+            plan.waves()
                 .map(|wave| wave.iter().map(|p| p.members).sum::<usize>())
         })
         .max()
@@ -2382,41 +2368,47 @@ fn plan_level(
     } = *inputs;
     let plan = |target: usize, member_bytes: Option<u64>| {
         let partitions = plan_partitions(tile_counts, zoom, target);
-        let wave = if auto_wave {
-            memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, profile, budget)
+        let cap = if auto_wave {
+            memory_safe_wave_members(member_bytes, profile, budget)
         } else {
-            ceiling_wave
+            usize::MAX
         };
-        (partitions, wave)
+        LevelPlan::cut(zoom, partitions, ceiling_wave, cap)
     };
-    // Per-level memory guard (#311): on `auto`, the wave is narrowed from
-    // THIS level's densest planned partition so a dense finest zoom does not
-    // OOM the whole run. Explicit waves are honoured verbatim.
-    let (mut partitions, mut wave) = plan(partition_target, member_bytes);
-    if profile == MemoryProfile::Bounded && partitions.len() > wave {
+    // Per-level memory guard (#311): on `auto`, each wave holds only the
+    // members the budget affords, so a dense finest zoom does not OOM the
+    // whole run (#876: it narrows only the waves that hold dense
+    // partitions). Explicit waves are honoured verbatim.
+    let mut level = plan(partition_target, member_bytes);
+    if profile == MemoryProfile::Bounded && level.wave_count() > 1 {
         // The waves overlap by the slack ([`group_schedule`]): priced in,
         // a wave and its slack fit the grant one wave did.
         let slack_bytes = member_bytes.map(|b| with_wave_slack(b as usize) as u64);
-        (partitions, wave) = plan(
+        level = plan(
             partition_target * BOUNDED_MULTI_WAVE_TARGET_PERCENT / 100,
             slack_bytes,
         );
     }
-    if wave < ceiling_wave {
-        let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
+    if level.narrowed {
+        let densest = level
+            .partitions
+            .iter()
+            .map(|p| p.members)
+            .max()
+            .unwrap_or(0);
+        let narrowest = level.waves().map(<[Partition]>::len).min().unwrap_or(0);
         log::info!(
-            "[export] {}: wave {ceiling_wave} → {wave} (densest partition {densest} \
-             members × ~{} B/member resident, {} MiB budget) — #311 density guard",
+            "[export] {}: {} waves of {narrowest}–{} partitions, ceiling {ceiling_wave} \
+             (densest partition {densest} members × ~{} B/member resident, {} MiB budget) \
+             — #311 density guard",
             label(),
+            level.wave_count(),
+            level.widest_wave(),
             member_bytes.unwrap_or(0),
             export_collect_bytes(profile, budget) / (1024 * 1024),
         );
     }
-    LevelPlan {
-        zoom,
-        partitions,
-        wave,
-    }
+    level
 }
 
 /// #541 review: a partial overview (written under a convert-side zoom
@@ -2549,6 +2541,9 @@ struct Pass2Run {
     /// The resolved partition-wave ceiling.
     #[cfg(test)]
     ceiling_wave: usize,
+    /// Each planned level's wave starts (#876).
+    #[cfg(test)]
+    wave_starts: Vec<Vec<usize>>,
     /// The export's work counts (#788).
     #[cfg(test)]
     work: ExportWorkTally,
@@ -2682,9 +2677,9 @@ fn export_pmtiles_validated(
 
     // Resolve the partition-wave *ceiling* once (auto-sizes from available cores
     // when the caller left it at PARTITION_WAVE_AUTO) and surface it (#293). On
-    // `auto` this is only an upper bound: each level narrows it further from its
-    // own densest partition (#311) — see the per-level `memory_safe_level_wave`
-    // below. An explicit `--partition-wave N` is honoured verbatim and never
+    // `auto` this is only an upper bound: each level narrows the waves that
+    // hold dense partitions (#311, #876) — see `memory_safe_wave_members` and
+    // `cut_waves` below. An explicit `--partition-wave N` is honoured verbatim and never
     // narrowed (the caller opted into the memory cost).
     let ceiling_wave =
         resolve_and_log_partition_wave(options.partition_wave, options.profile, budget);
@@ -2857,6 +2852,8 @@ fn export_pmtiles_validated(
         &level_zooms[..planned],
         &partition_budget,
     )?;
+    #[cfg(test)]
+    let wave_starts: Vec<Vec<usize>> = plans.iter().map(|p| p.wave_starts.clone()).collect();
     progress.end_scan(t_scan);
 
     // Pass 2 read strategy (#235): in partitioning mode a level's render set
@@ -3007,7 +3004,8 @@ fn export_pmtiles_validated(
         LevelPlan {
             zoom: 0,
             partitions: Vec::new(),
-            wave: 1,
+            wave_starts: Vec::new(),
+            narrowed: false,
         },
     );
     let template = ExportLevelCtx {
@@ -3181,6 +3179,8 @@ fn export_pmtiles_validated(
         store_backing,
         #[cfg(test)]
         ceiling_wave,
+        #[cfg(test)]
+        wave_starts,
         #[cfg(test)]
         work,
         #[cfg(test)]
@@ -3759,14 +3759,12 @@ fn export_level(
         ..
     } = *level;
     let zoom = plan.zoom;
-    let partitions = &plan.partitions;
-    let partition_wave = plan.wave;
     let timers = &progress.profile.timers;
 
     let t_tiles = Instant::now();
     let ctx = level.level_ctx(timers);
     let mut tally = LevelTally::default();
-    let total_waves = partitions.len().div_ceil(partition_wave);
+    let total_waves = plan.wave_count();
     // Within-level progress (#229): a long finest level is where runs get
     // stuck, so emit a throttled wave counter. If it advances the level is
     // slow; if it freezes the level is stuck — diagnosable in minutes.
@@ -3786,7 +3784,7 @@ fn export_level(
         (None, Some(s)) => s.level_spilled_bytes(level_idx),
         (None, None) => 0,
     };
-    for (wave_idx, wave) in partitions.chunks(partition_wave).enumerate() {
+    for (wave_idx, wave) in plan.waves().enumerate() {
         let results: Vec<Vec<EncodedTile>> = match (level_store.as_mut(), store.as_deref_mut()) {
             (Some(s), _) => encode_wave_from_store(s, 0, &ctx, wave_idx, wave, diagnostics)?,
             (None, Some(s)) => {
@@ -4031,15 +4029,11 @@ fn export_level_group(
                 break;
             }
             injected_fault(level, fail_level).map_err(|e| (i, e))?;
-            let partitions = &level.plan.partitions;
             let multi_wave = level_waves(level.plan) > 1;
             let mut level_store = None;
             let mut grants = Vec::new();
             for w in 0..level_waves(level.plan) {
-                let wave = partitions
-                    .chunks(level.plan.wave.max(1))
-                    .nth(w)
-                    .unwrap_or_default();
+                let wave = level.plan.wave(w);
                 let fills = w == 0 && multi_wave && store.is_none() && level.level_read.is_some();
                 let early = fills && gate.overlap;
                 let mut fill = |floor: usize| -> Result<f64, (usize, ExportError)> {
@@ -4267,7 +4261,7 @@ struct GroupGate {
 /// The waves `plan` exports in, at least one: an empty level writes its
 /// stopped tiles and reports as one empty wave.
 fn level_waves(plan: &LevelPlan) -> usize {
-    plan.partitions.len().div_ceil(plan.wave.max(1)).max(1)
+    plan.wave_count().max(1)
 }
 
 /// The members a level group has admitted to collect and not yet encoded
@@ -4653,7 +4647,7 @@ impl GroupCommit<'_> {
         let report = finish_level(
             level,
             &open.tally,
-            level.plan.partitions.len().div_ceil(level.plan.wave.max(1)),
+            level.plan.wave_count(),
             LevelWalls::grouped(
                 open.start.map_or(0.0, |s| s.elapsed().as_secs_f64()),
                 open.collect_secs,
@@ -4896,7 +4890,7 @@ fn finish_level(
         tiles: tile_count,
         features: tally.tile_feature_count,
         bytes: tally.bytes_written,
-        wave_width: plan.wave,
+        wave_width: plan.widest_wave().max(1),
         spill_bytes: tally.spill_bytes,
     });
     profile.waves_total += total_waves;
@@ -5217,7 +5211,95 @@ struct FanoutCtx<'a> {
 struct LevelPlan {
     zoom: u8,
     partitions: Vec<Partition>,
-    wave: usize,
+    /// Where each wave starts in `partitions`, ascending from 0 (#876): a
+    /// wave holds the partitions up to the next start. Empty for an empty
+    /// level. Waves are uneven when a dense partition narrows its own.
+    wave_starts: Vec<usize>,
+    /// The member cap, not the ceiling, closed at least one wave: the #311
+    /// density guard changed this level's waves.
+    narrowed: bool,
+}
+
+impl LevelPlan {
+    /// `partitions` cut into waves of at most `ceiling` partitions and
+    /// `member_cap` members ([`cut_waves`]).
+    fn cut(zoom: u8, partitions: Vec<Partition>, ceiling: usize, member_cap: usize) -> Self {
+        let (wave_starts, narrowed) = cut_waves(&partitions, ceiling, member_cap);
+        Self {
+            zoom,
+            partitions,
+            wave_starts,
+            narrowed,
+        }
+    }
+
+    /// Wave `w`'s index range in `partitions`; empty past the last wave.
+    fn wave_range(&self, w: usize) -> std::ops::Range<usize> {
+        let Some(&start) = self.wave_starts.get(w) else {
+            return 0..0;
+        };
+        start
+            ..self
+                .wave_starts
+                .get(w + 1)
+                .copied()
+                .unwrap_or(self.partitions.len())
+    }
+
+    /// Each wave's index range in `partitions`, in order.
+    fn wave_ranges(&self) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+        (0..self.wave_count()).map(|w| self.wave_range(w))
+    }
+
+    /// Wave `w`, in constant time; empty past the last wave (an empty
+    /// level's one synthetic wave).
+    fn wave(&self, w: usize) -> &[Partition] {
+        &self.partitions[self.wave_range(w)]
+    }
+
+    /// The level's waves, in partition (and so tile) order.
+    fn waves(&self) -> impl Iterator<Item = &[Partition]> + '_ {
+        self.wave_ranges().map(|r| &self.partitions[r])
+    }
+
+    fn wave_count(&self) -> usize {
+        self.wave_starts.len()
+    }
+
+    /// The wave that holds partition `pidx`.
+    fn wave_of(&self, pidx: usize) -> usize {
+        self.wave_starts
+            .partition_point(|&s| s <= pidx)
+            .saturating_sub(1)
+    }
+
+    /// The most partitions any one wave holds; 0 for an empty level.
+    fn widest_wave(&self) -> usize {
+        self.waves().map(<[Partition]>::len).max().unwrap_or(0)
+    }
+}
+
+/// Wave starts for `partitions` in order (#876): a new wave starts when the
+/// current one holds `ceiling` partitions or the next partition would take
+/// it past `member_cap` members. A partition over the cap alone is a wave of
+/// its own. Order is unchanged, so every cut gives the same archive. Also
+/// returns whether the cap, not the ceiling, closed any wave.
+fn cut_waves(partitions: &[Partition], ceiling: usize, member_cap: usize) -> (Vec<usize>, bool) {
+    let ceiling = ceiling.max(1);
+    let mut starts = Vec::new();
+    let mut narrowed = false;
+    let (mut len, mut members) = (0usize, 0usize);
+    for (i, p) in partitions.iter().enumerate() {
+        let full = len == ceiling;
+        if starts.is_empty() || full || members.saturating_add(p.members) > member_cap {
+            narrowed |= !starts.is_empty() && !full;
+            starts.push(i);
+            (len, members) = (0, 0);
+        }
+        len += 1;
+        members = members.saturating_add(p.members);
+    }
+    (starts, narrowed)
 }
 
 // ============================================================================
@@ -5320,13 +5402,7 @@ fn level_read_backing(
     let price = Price::new(per_member, PriceBasis::Footer);
     let members = |ps: &[Partition]| ps.iter().map(|p| p.members).sum::<usize>();
     let level_members = members(&plan.partitions);
-    let wave_members = plan
-        .partitions
-        .chunks(plan.wave.max(1))
-        .map(members)
-        .max()
-        .unwrap_or(0)
-        .max(wave_floor);
+    let wave_members = plan.waves().map(members).max().unwrap_or(0).max(wave_floor);
     // The wave the drain holds while it encodes, which the wave width was
     // sized to fit; the level's members share what is left.
     let wave = budget.fit(
@@ -5385,7 +5461,7 @@ const SINGLE_READ_IN_FLIGHT: usize = 4;
 /// Deliberately shallower than [`SINGLE_READ_IN_FLIGHT`]. The wave path also
 /// holds a whole wave's members in RAM, and the scan runs before any wave
 /// preflight, so in-flight batches on either land outside what the wave-width
-/// preflight ([`memory_safe_level_wave`]) budgets. Two is all the overlap
+/// preflight ([`memory_safe_wave_members`]) budgets. Two is all the overlap
 /// needs — one batch being consumed while the next is read.
 ///
 /// The live Arrow batches per pipe are bounded by **depth + 2**, not depth:
@@ -5813,10 +5889,7 @@ impl MemberStore {
         ram_budget: usize,
         spill_dir: Option<&Path>,
     ) -> Result<Self, ExportError> {
-        let shape: Vec<usize> = plans
-            .iter()
-            .map(|p| p.partitions.len().div_ceil(p.wave.max(1)))
-            .collect();
+        let shape: Vec<usize> = plans.iter().map(LevelPlan::wave_count).collect();
         let buckets = shape
             .iter()
             .map(|&w| (0..w).map(|_| Vec::new()).collect())
@@ -6230,7 +6303,7 @@ fn fanout_batch_members(
                 let pidx = route_partition(&plan.partitions, key);
                 store.push(
                     k,
-                    pidx / plan.wave.max(1),
+                    plan.wave_of(pidx),
                     Member {
                         key,
                         seq: *seq + row as u64,
@@ -7159,7 +7232,7 @@ fn fill_level_store(
         &plan.partitions,
         &mut LevelStoreSink {
             store: &mut store,
-            wave: plan.wave,
+            plan,
         },
         diagnostics,
     )?;
@@ -7175,7 +7248,7 @@ fn fill_level_store(
          collect={:.2}s ({:?}, buffer {} MiB, resident {} MiB, spilled {} MiB)",
         ctx.zoom,
         plan.partitions.len(),
-        plan.partitions.len().div_ceil(plan.wave.max(1)),
+        plan.wave_count(),
         t_collect.elapsed().as_secs_f64(),
         backing.backing,
         store.buffer >> 20,
@@ -8032,13 +8105,13 @@ impl MemberSink for Vec<Vec<Member>> {
 /// partitions: a partition's members go to its wave's bucket.
 struct LevelStoreSink<'a> {
     store: &'a mut MemberStore,
-    /// The level's wave width, in partitions.
-    wave: usize,
+    /// The level whose waves the store's buckets are.
+    plan: &'a LevelPlan,
 }
 
 impl MemberSink for LevelStoreSink<'_> {
     fn append(&mut self, partition: usize, members: Vec<Member>) -> Result<(), ExportError> {
-        let wave = partition / self.wave.max(1);
+        let wave = self.plan.wave_of(partition);
         members
             .into_iter()
             .try_for_each(|m| self.store.push(0, wave, m))
@@ -9963,10 +10036,14 @@ impl<'a> JoinedTileFitter<'a> {
         // restriction also prunes disjoint bboxes and prevents clipping holes
         // between requested ids, as in variable-depth and shard exports.
         let tile_counts = tiles.iter().map(|&id| (id, 1)).collect();
-        let partitions = plan_partitions(&tile_counts, zoom, 1);
-        let width = self.tile_wave(tiles, opts);
+        let plan = LevelPlan::cut(
+            zoom,
+            plan_partitions(&tile_counts, zoom, 1),
+            self.tile_wave(tiles, opts),
+            usize::MAX,
+        );
         let mut replacements = BTreeMap::new();
-        for wave in partitions.chunks(width) {
+        for wave in plan.waves() {
             let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
             let mut layers = Vec::new();
             let mut seq_base = 0;
@@ -13155,153 +13232,135 @@ mod tests {
             .collect()
     }
 
-    /// The data-aware per-level guard (#311): sizes from the *densest* planned
-    /// partition, not a flat constant, and may drop below the throughput floor
-    /// when memory demands it.
+    /// The data-aware per-level guard (#311): a wave may hold the members the
+    /// budget affords, and may drop below the throughput floor when memory
+    /// demands it.
     #[test]
-    fn memory_safe_level_wave_uses_densest_partition() {
+    fn memory_safe_wave_members_prices_one_member() {
         const MIB: u64 = 1024 * 1024;
         const GIB: u64 = 1024 * MIB;
-
-        // Sparse level: small partitions × modest members → the estimate is far
-        // under budget, so the ceiling is preserved untouched.
-        let sparse = partitions_with_members(&[32_768, 30_000, 31_000]);
-        let sparse_bytes = Some(member_resident_bytes(512, 0));
         let dense_bytes = Some(member_resident_bytes(600, 0));
-        assert_eq!(
-            memory_safe_level_wave(
-                16,
-                &sparse,
-                sparse_bytes,
-                MemoryProfile::Auto,
-                &MemoryBudget::with_available(Some(54 * GIB))
-            ),
-            16,
-            "a sparse level must not narrow below the ceiling"
-        );
+        let budget = MemoryBudget::with_available(Some(54 * GIB));
+        let cap = memory_safe_wave_members(dense_bytes, MemoryProfile::Auto, &budget);
+        // 0.5 × 54 GiB at ~1424 B/member ≈ 20M members: the Brazil level
+        // that OOM'd at wave 16 (one 6.5M-member partition) fits 3 of them.
+        assert_eq!(cap / 6_500_000, 3, "cap {cap}");
 
-        // Dense level: one tile overshoots the target into a 6.5M-member
-        // partition of ~600 B/member stored. per-slot ≈ 6.5M × (600 × 2 + 224)
-        // ≈ 8.6 GiB; budget = 0.5 × 54 GiB = 27 GiB → 3 slots. This is the
-        // Brazil case that OOM'd at wave 16, now capped to a safe 3.
-        let dense = partitions_with_members(&[6_500_000, 100, 200]);
+        // Fallbacks keep prior behaviour: unknown or zero member size, and
+        // speed, put no member cap on a wave.
+        for bytes in [None, Some(0)] {
+            assert_eq!(
+                memory_safe_wave_members(bytes, MemoryProfile::Auto, &budget),
+                usize::MAX
+            );
+        }
         assert_eq!(
-            memory_safe_level_wave(
-                16,
-                &dense,
+            memory_safe_wave_members(
                 dense_bytes,
-                MemoryProfile::Auto,
-                &MemoryBudget::with_available(Some(54 * GIB))
-            ),
-            3,
-        );
-
-        // Extreme density can fall *below* PARTITION_WAVE_MIN, all the way to a
-        // serial wave — memory safety outranks the historical floor.
-        // Result 1 is deliberately below PARTITION_WAVE_MIN (6): the memory
-        // guard bypasses the throughput floor rather than OOM.
-        let extreme = partitions_with_members(&[60_000_000, 100]);
-        assert_eq!(
-            memory_safe_level_wave(
-                16,
-                &extreme,
-                dense_bytes,
-                MemoryProfile::Auto,
-                &MemoryBudget::with_available(Some(54 * GIB))
-            ),
-            1,
-        );
-
-        // The clamp is one-directional: a roomy budget never widens past the
-        // ceiling the caller already chose.
-        assert_eq!(
-            memory_safe_level_wave(
-                4,
-                &sparse,
-                sparse_bytes,
-                MemoryProfile::Auto,
-                &MemoryBudget::with_available(Some(256 * GIB))
-            ),
-            4,
-        );
-
-        // Fallbacks preserve prior behaviour: unknown member size (empty finest
-        // level), unmeasurable RAM, or an empty partition list all return the
-        // ceiling verbatim.
-        assert_eq!(
-            memory_safe_level_wave(
-                16,
-                &dense,
-                None,
-                MemoryProfile::Auto,
-                &MemoryBudget::with_available(Some(54 * GIB))
-            ),
-            16,
-            "unknown member size falls back to the ceiling"
-        );
-        assert_eq!(
-            memory_safe_level_wave(
-                16,
-                &dense,
-                Some(0),
-                MemoryProfile::Auto,
-                &MemoryBudget::with_available(Some(54 * GIB))
-            ),
-            16,
-            "a degenerate zero member size falls back to the ceiling"
-        );
-        // Even when RAM is tiny: zero is unknown, not one byte per member.
-        assert_eq!(
-            memory_safe_level_wave(
-                16,
-                &dense,
-                Some(0),
                 MemoryProfile::Auto,
                 &MemoryBudget::with_available(Some(8))
             ),
-            16
+            1,
+            "a tiny machine affords one member: every partition is its own wave"
         );
         assert_eq!(
-            memory_safe_level_wave(
-                16,
-                &dense,
-                dense_bytes,
-                MemoryProfile::Auto,
-                &MemoryBudget::with_available(None)
-            ),
-            memory_safe_level_wave(
-                16,
-                &dense,
-                dense_bytes,
-                MemoryProfile::Auto,
-                &MemoryBudget::with_available(Some(1 << 20))
-            )
-            .max(1),
-            "unprobeable RAM is priced by the budget's fallback allowance, \
-             which this dense level overflows as it does a tiny machine"
-        );
-        assert_eq!(
-            memory_safe_level_wave(
-                16,
-                &dense,
+            memory_safe_wave_members(
                 dense_bytes,
                 MemoryProfile::Speed,
                 &MemoryBudget::with_available(Some(1 << 20))
             ),
-            16,
+            usize::MAX,
             "speed keeps the ceiling: no memory cap (#788)"
         );
-        assert_eq!(
-            memory_safe_level_wave(
-                16,
-                &[],
-                dense_bytes,
-                MemoryProfile::Auto,
-                &MemoryBudget::with_available(Some(54 * GIB))
-            ),
-            16,
-            "an empty level falls back to the ceiling"
+        let unprobed = memory_safe_wave_members(
+            dense_bytes,
+            MemoryProfile::Auto,
+            &MemoryBudget::with_available(None),
         );
+        assert!(
+            unprobed < cap,
+            "unprobeable RAM is priced by the budget's 4 GiB fallback allowance, not uncapped: {unprobed}"
+        );
+    }
+
+    /// #876: a wave is cut by the members actually in it, so one dense
+    /// partition narrows only its own wave, not the whole level.
+    #[test]
+    fn cut_waves_narrows_only_the_dense_partitions_wave() {
+        let starts = |counts: &[usize], ceiling, cap| {
+            cut_waves(&partitions_with_members(counts), ceiling, cap).0
+        };
+        // No member cap: uniform waves of the ceiling, as before.
+        assert_eq!(starts(&[1; 10], 4, usize::MAX), vec![0, 4, 8]);
+        // A dense partition shares its wave while the sum fits, then the
+        // small ones after it run at the full ceiling.
+        assert_eq!(starts(&[90, 5, 5, 5, 5, 5, 5, 5, 5], 4, 100), vec![0, 3, 7]);
+        // The old rule priced every slot at the densest (90): one partition
+        // a wave, nine waves.
+        // A partition over the cap on its own is its own wave (refused or
+        // not, that is `densest_tile_over_limit`'s call, not the cut's).
+        assert_eq!(starts(&[5, 500, 5, 5], 4, 100), vec![0, 1, 2]);
+        // The Brazil shape: 6.5M + two tiny partitions fit one wave.
+        assert_eq!(starts(&[6_500_000, 100, 200], 16, 20_000_000), vec![0]);
+        // A cap of one member makes every partition its own wave.
+        assert_eq!(starts(&[3, 3, 3], 16, 1), vec![0, 1, 2]);
+        // An empty level has no waves.
+        assert_eq!(starts(&[], 16, 100), Vec::<usize>::new());
+    }
+
+    /// #876 review: the plan records that the member cap moved a boundary
+    /// even when the wave count is the same as an uncapped cut, so the
+    /// density-guard log line still fires.
+    #[test]
+    fn level_plan_flags_a_member_cap_cut_even_when_the_count_holds() {
+        let capped = LevelPlan::cut(3, partitions_with_members(&[90, 5, 5, 5, 5]), 4, 100);
+        assert_eq!(capped.wave_starts, vec![0, 3]);
+        assert!(capped.narrowed);
+        let free = LevelPlan::cut(3, partitions_with_members(&[90, 5, 5, 5, 5]), 4, usize::MAX);
+        assert_eq!(free.wave_starts, vec![0, 4]);
+        assert!(!free.narrowed);
+        assert!(!LevelPlan::cut(3, Vec::new(), 4, 1).narrowed);
+    }
+
+    /// #876 review: `wave(w)` is the `w`-th of `waves()` in constant time, and
+    /// empty past the last wave (an empty level's one synthetic wave).
+    #[test]
+    fn level_plan_wave_indexes_like_waves() {
+        let same = |a: &[Partition], b: &[Partition]| {
+            a.len() == b.len() && std::ptr::eq(a.as_ptr(), b.as_ptr())
+        };
+        let plan = LevelPlan::cut(
+            3,
+            partitions_with_members(&[90, 5, 5, 5, 5, 5, 5, 5, 5]),
+            4,
+            100,
+        );
+        for (w, wave) in plan.waves().enumerate() {
+            assert!(same(plan.wave(w), wave), "wave {w}");
+        }
+        assert!(plan.wave(plan.wave_count()).is_empty());
+        assert!(LevelPlan::cut(3, Vec::new(), 4, 100).wave(0).is_empty());
+    }
+
+    /// #876: a level's routing and its wave slices agree for uneven waves.
+    #[test]
+    fn level_plan_routes_each_partition_to_the_wave_that_holds_it() {
+        let plan = LevelPlan::cut(
+            3,
+            partitions_with_members(&[90, 5, 5, 5, 5, 5, 5, 5, 5]),
+            4,
+            100,
+        );
+        assert_eq!(plan.wave_count(), 3);
+        assert_eq!(plan.widest_wave(), 4);
+        let mut seen = 0;
+        for (w, wave) in plan.waves().enumerate() {
+            for _ in wave {
+                assert_eq!(plan.wave_of(seen), w, "partition {seen}");
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 9);
     }
 
     /// #665: the resident model covers every shape it was calibrated on,
@@ -13461,11 +13520,7 @@ mod tests {
             (0..32).map(|x| (tile_key(x, 0, zoom), 1_024)).collect();
         let partitions = plan_partitions(&tile_counts, zoom, DEFAULT_PARTITION_TARGET);
         assert_eq!(partitions.len(), 1);
-        let plans = [LevelPlan {
-            zoom,
-            partitions,
-            wave: 1,
-        }];
+        let plans = [LevelPlan::cut(zoom, partitions, 1, usize::MAX)];
         let scans = [LevelScan {
             feature_count: 32 * 1_024,
             bounds: None,
@@ -13484,16 +13539,13 @@ mod tests {
         let zoom = 0;
         let tile_counts = BTreeMap::from([(tile_key(0, 0, zoom), 1_000)]);
         let plans = [
-            LevelPlan {
+            LevelPlan::cut(
                 zoom,
-                partitions: plan_partitions(&BTreeMap::new(), zoom, 1),
-                wave: 1,
-            },
-            LevelPlan {
-                zoom,
-                partitions: plan_partitions(&tile_counts, zoom, 1),
-                wave: 1,
-            },
+                plan_partitions(&BTreeMap::new(), zoom, 1),
+                1,
+                usize::MAX,
+            ),
+            LevelPlan::cut(zoom, plan_partitions(&tile_counts, zoom, 1), 1, usize::MAX),
         ];
         let scans = [
             LevelScan {
@@ -13650,12 +13702,53 @@ mod tests {
         );
     }
 
-    fn plan_with_members(zoom: u8, counts: &[usize], wave: usize) -> LevelPlan {
-        LevelPlan {
-            zoom,
-            partitions: partitions_with_members(counts),
-            wave,
+    /// #876: the auto guard cuts waves by the members in them, so a tight
+    /// budget gives a level waves of different widths. The archive must
+    /// still be the bytes of an explicit one-partition wave, in both the
+    /// duplicating (per-wave reads) and partitioning (#235 store) modes, RAM
+    /// or spill.
+    #[test]
+    fn uneven_auto_waves_are_byte_invariant() {
+        let mut uneven = 0;
+        let fixtures: [fn(&Path); 2] = [equivalence_fixture, partitioning_equivalence_fixture];
+        for fixture in fixtures {
+            let input = tempfile::NamedTempFile::new().unwrap();
+            fixture(input.path());
+            let run = |partition_wave: usize, available: Option<u64>| {
+                let opts = ExportOptions {
+                    layer_name: "ref".to_string(),
+                    partition_wave,
+                    ..Default::default()
+                };
+                let out = tempfile::NamedTempFile::new().unwrap();
+                let run = export_pmtiles_run(
+                    input.path(),
+                    out.path(),
+                    &opts,
+                    1,
+                    &Pass2Knobs {
+                        budget_available: available,
+                        ..knobs(false, None, true)
+                    },
+                )
+                .unwrap();
+                (std::fs::read(out.path()).unwrap(), run.wave_starts)
+            };
+            let (reference, _) = run(1, Some(100 << 30));
+            for shift in 10..=34 {
+                let (bytes, starts) = run(PARTITION_WAVE_AUTO, Some(1 << shift));
+                assert_eq!(bytes, reference, "budget 2^{shift}");
+                uneven += starts
+                    .iter()
+                    .filter(|s| s.windows(3).any(|w| w[1] - w[0] != w[2] - w[1]))
+                    .count();
+            }
         }
+        assert!(uneven > 0, "no budget cut a level into uneven waves");
+    }
+
+    fn plan_with_members(zoom: u8, counts: &[usize], wave: usize) -> LevelPlan {
+        LevelPlan::cut(zoom, partitions_with_members(counts), wave, usize::MAX)
     }
 
     proptest::proptest! {
@@ -13759,7 +13852,7 @@ mod tests {
                 .map(|(z, (counts, wave))| plan_with_members(z as u8, counts, *wave))
                 .collect();
             let members = |p: &LevelPlan| p.partitions.iter().map(|q| q.members).sum::<usize>();
-            let single = |p: &LevelPlan| p.partitions.len() <= p.wave.max(1);
+            let single = |p: &LevelPlan| p.wave_count() <= 1;
             for profile in [MemoryProfile::Auto, MemoryProfile::Speed, MemoryProfile::Bounded] {
                 let (groups, gate) = group_schedule(member_cap, &plans, target, profile);
                 let flat: Vec<usize> = groups.iter().flat_map(Clone::clone).collect();
@@ -13779,7 +13872,7 @@ mod tests {
                 if !overlap {
                     let largest_wave = plans
                         .iter()
-                        .flat_map(|p| p.partitions.chunks(p.wave.max(1)).map(|w| w.iter().map(|q| q.members).sum::<usize>()))
+                        .flat_map(|p| p.waves().map(|w| w.iter().map(|q| q.members).sum::<usize>()).collect::<Vec<_>>())
                         .max()
                         .unwrap_or(0);
                     proptest::prop_assert_eq!(gate.cap, member_cap.min(with_wave_slack(largest_wave)));
@@ -21272,11 +21365,12 @@ mod tests {
     #[test]
     fn member_store_spill_lives_under_spill_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let plans = vec![LevelPlan {
-            zoom: 4,
-            partitions: partitions_with_members(&[10]),
-            wave: 1,
-        }];
+        let plans = vec![LevelPlan::cut(
+            4,
+            partitions_with_members(&[10]),
+            1,
+            usize::MAX,
+        )];
         let store = MemberStore::new(
             &plans,
             SinkBacking::Spill,
@@ -21323,8 +21417,7 @@ mod tests {
             )
         };
         let wave_members = |p: &LevelPlan| {
-            p.partitions
-                .chunks(p.wave)
+            p.waves()
                 .map(|w| w.iter().map(|p| p.members).sum::<usize>())
                 .max()
                 .unwrap()
@@ -21371,11 +21464,7 @@ mod tests {
                 let zoom = zoom_for_level(&meta, k).unwrap();
                 let partitions = plan_partitions(&scan.tile_counts, zoom, DEFAULT_PARTITION_TARGET);
                 let wave = partitions.len().max(1);
-                LevelPlan {
-                    zoom,
-                    partitions,
-                    wave,
-                }
+                LevelPlan::cut(zoom, partitions, wave, usize::MAX)
             })
             .collect();
         fill_member_store(
@@ -21506,11 +21595,12 @@ mod tests {
 
     #[test]
     fn member_store_ram_wave_reuses_its_allocation() {
-        let plans = vec![LevelPlan {
-            zoom: 4,
-            partitions: partitions_with_members(&[10]),
-            wave: 1,
-        }];
+        let plans = vec![LevelPlan::cut(
+            4,
+            partitions_with_members(&[10]),
+            1,
+            usize::MAX,
+        )];
         for backing in [SinkBacking::Ram, SinkBacking::Spill] {
             let mut store =
                 MemberStore::new(&plans, backing, MEMBER_STORE_RAM_BUDGET, None).unwrap();
@@ -21548,11 +21638,12 @@ mod tests {
     #[test]
     fn member_store_spill_segments_roundtrip() {
         // One level, two single-partition waves (wave width 1).
-        let plans = vec![LevelPlan {
-            zoom: 4,
-            partitions: partitions_with_members(&[10, 10]),
-            wave: 1,
-        }];
+        let plans = vec![LevelPlan::cut(
+            4,
+            partitions_with_members(&[10, 10]),
+            1,
+            usize::MAX,
+        )];
         let mut store =
             MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None).unwrap();
         let mk = |key: u64, seq: u64| Member {
@@ -21620,11 +21711,12 @@ mod tests {
     /// segments do not share one refcount (#803).
     #[test]
     fn member_store_spill_reload_shares_schema_tables() {
-        let plans = vec![LevelPlan {
-            zoom: 4,
-            partitions: partitions_with_members(&[10]),
-            wave: 1,
-        }];
+        let plans = vec![LevelPlan::cut(
+            4,
+            partitions_with_members(&[10]),
+            1,
+            usize::MAX,
+        )];
         let mut store =
             MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None).unwrap();
         let mk = |seq: u64, props: Vec<(Arc<str>, PropertyValue)>| Member {
@@ -21692,11 +21784,12 @@ mod tests {
     /// the store keeps spilling in whole segments and reading back in order.
     #[test]
     fn member_store_buffer_is_priced_from_measured_members() {
-        let plans = vec![LevelPlan {
-            zoom: 4,
-            partitions: partitions_with_members(&[10, 10, 10]),
-            wave: 1,
-        }];
+        let plans = vec![LevelPlan::cut(
+            4,
+            partitions_with_members(&[10, 10, 10]),
+            1,
+            usize::MAX,
+        )];
         let mut store =
             MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None).unwrap();
         let member = |seq: u64| Member {
@@ -21734,11 +21827,12 @@ mod tests {
 
     #[test]
     fn member_store_parallel_segments_roundtrip_in_order() {
-        let plans = vec![LevelPlan {
-            zoom: 4,
-            partitions: partitions_with_members(&[10]),
-            wave: 1,
-        }];
+        let plans = vec![LevelPlan::cut(
+            4,
+            partitions_with_members(&[10]),
+            1,
+            usize::MAX,
+        )];
         let mut store =
             MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None).unwrap();
         let n = 2 * SPILL_SEGMENT_MEMBERS + 5;
@@ -23955,11 +24049,7 @@ mod tests {
     /// budget grants it nothing.
     #[test]
     fn a_forced_level_store_backing_is_used_as_is() {
-        let plan = LevelPlan {
-            zoom: 4,
-            partitions: partitions_with_members(&[10, 10]),
-            wave: 1,
-        };
+        let plan = LevelPlan::cut(4, partitions_with_members(&[10, 10]), 1, usize::MAX);
         let mut budget = MemoryBudget::with_available(Some(1 << 30));
         let read = LevelRead {
             forced: Some(SinkBacking::Ram),
@@ -23983,11 +24073,7 @@ mod tests {
     /// bytes resident.
     #[test]
     fn a_partly_granted_level_store_keeps_its_grant_resident() {
-        let plan = LevelPlan {
-            zoom: 4,
-            partitions: partitions_with_members(&[1000, 1000]),
-            wave: 1,
-        };
+        let plan = LevelPlan::cut(4, partitions_with_members(&[1000, 1000]), 1, usize::MAX);
         let read = LevelRead {
             forced: None,
             ram_budget: 7,
@@ -24013,11 +24099,7 @@ mod tests {
     /// size to grant from: it spills whole and holds no grant.
     #[test]
     fn a_level_with_zero_byte_members_spills_whole() {
-        let plan = LevelPlan {
-            zoom: 4,
-            partitions: partitions_with_members(&[1000, 1000]),
-            wave: 1,
-        };
+        let plan = LevelPlan::cut(4, partitions_with_members(&[1000, 1000]), 1, usize::MAX);
         let read = LevelRead {
             forced: None,
             ram_budget: 7,
@@ -24096,11 +24178,12 @@ mod tests {
                 .build()
                 .unwrap();
             let segments = pool.install(|| {
-                let plans = vec![LevelPlan {
-                    zoom: 4,
-                    partitions: partitions_with_members(&[10]),
-                    wave: 1,
-                }];
+                let plans = vec![LevelPlan::cut(
+                    4,
+                    partitions_with_members(&[10]),
+                    1,
+                    usize::MAX,
+                )];
                 let mut store =
                     MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None)
                         .unwrap();
