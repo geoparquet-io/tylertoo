@@ -3794,7 +3794,7 @@ fn scan_with_floors(
     let floors = if p.is_shed() {
         Ok(valve_predict::ValveFloors::default())
     } else {
-        predict_floors(reader, cols, crs, (options, level_zooms), &p)
+        predict_floors(reader, cols, crs, (options, level_zooms), &p, budget)
     };
     budget.unreserve(MemoryPhase::Scan, held);
     for (scan, counts) in scans.iter_mut().zip(p.into_tile_counts()) {
@@ -3838,48 +3838,79 @@ fn predict_floors(
     crs: Crs,
     (options, level_zooms): (&ExportOptions, &[u8]),
     p: &valve_predict::Scan,
+    budget: &MemoryBudget,
 ) -> Result<valve_predict::ValveFloors, ExportError> {
     let t = Instant::now();
+    // A sampled member's resident bytes, as pass 2 prices one.
+    let member = export_member_bytes(reader, cols.0, reader.finest_level_mean_row_bytes())
+        .unwrap_or_else(|| budget.estimate(MemoryPhase::ExportCollect, 1, None));
     // Every tile that can be over is priced by a small sample of its own
-    // members; those it puts near a cap, by a larger one.
-    let sample = |tiles: &[valve_predict::SampleAt], rows: SampleRows| {
-        valve_sample_bytes(reader, cols, crs, (options, level_zooms), tiles, rows).map(|b| {
-            tiles
-                .iter()
-                .zip(b)
-                .filter_map(|(t, b)| Some(((t.level, t.key), b?)))
-                .collect::<HashMap<(usize, u64), MemberBytes>>()
-        })
-    };
+    // members; those it puts near a cap, by a larger one. Tiles are sampled
+    // a chunk at a time, in `(level, key)` order, each chunk's members freed
+    // once encoded: as many tiles as the export's share of the budget holds.
+    let sample =
+        |tiles: &[valve_predict::SampleAt],
+         members: usize,
+         rows: &dyn Fn(&[valve_predict::SampleAt]) -> Result<SampleRows, ExportError>| {
+            let price = Price::model(member.saturating_mul(members as u64));
+            let chunk = budget.affordable(options.profile, MemoryPhase::ExportCollect, price);
+            let mut bytes = HashMap::new();
+            for tiles in tiles.chunks(chunk) {
+                #[cfg(test)]
+                SAMPLE_CHUNKS.with(|n| n.set(n.get() + 1));
+                let b = valve_sample_bytes(
+                    reader,
+                    cols,
+                    crs,
+                    (options, level_zooms),
+                    tiles,
+                    rows(tiles)?,
+                )?;
+                bytes.extend(
+                    tiles
+                        .iter()
+                        .zip(b)
+                        .filter_map(|(t, b)| Some(((t.level, t.key), b?))),
+                );
+            }
+            Ok::<_, ExportError>(bytes)
+        };
     let priced = p.priced();
-    let first = sample(&priced, stored_sample_rows(reader, p, &priced)?)?;
+    let mut bytes = sample(&priced, valve_predict::PRICE_MEMBERS, &|tiles| {
+        stored_sample_rows(reader, p, tiles)
+    })?;
     let t_first = t.elapsed();
-    let candidates = p.candidates(&first, options);
-    let mut bytes = first;
-    let rows = valve_sample_rows(
-        reader,
-        cols.0,
-        crs,
-        (options, level_zooms),
-        &candidates,
-        SAMPLE_MEMBERS,
-    )?;
-    let t_rows = t.elapsed();
-    bytes.extend(sample(&candidates, rows)?);
+    let candidates = p.candidates(&bytes, options);
+    bytes.extend(sample(&candidates, SAMPLE_MEMBERS, &|tiles| {
+        valve_sample_rows(
+            reader,
+            cols.0,
+            crs,
+            (options, level_zooms),
+            tiles,
+            SAMPLE_MEMBERS,
+        )
+    })?);
     let need = p.predict(level_zooms, &bytes, options);
     let floors = p.floors(options.valve_scope, &need, (level_zooms, &bytes), options);
     log::info!(
-        "[export] valve floors: {} tiles priced ({} by a larger sample), {} predicted over a cap, {} floors, {:.2}s (first sample {:.2}s, larger sample rows {:.2}s; scan share {:.2}s)",
+        "[export] valve floors: {} tiles priced ({} by a larger sample), {} predicted over a cap, {} floors, {:.2}s (first sample {:.2}s; scan share {:.2}s)",
         bytes.len(),
         candidates.len(),
         need.len(),
         floors.len(),
         t.elapsed().as_secs_f64(),
         t_first.as_secs_f64(),
-        (t_rows - t_first).as_secs_f64(),
         p.spent.as_secs_f64(),
     );
     Ok(floors)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Chunks this thread's [`predict_floors`] sampled tiles in (test
+    /// counter, #768).
+    static SAMPLE_CHUNKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// #768 predict: members in the larger price sample of a tile its first
@@ -16326,8 +16357,9 @@ mod tests {
         assert_eq!(auto, bounded);
     }
 
-    /// #768: 6,000 small squares in one z2 tile under a 20 kB raw cap, and
-    /// the export scan of them with the valve predictor, under `budget`.
+    /// #768: 6,000 small squares in each of two z2 tiles under a 20 kB raw
+    /// cap, and the export scan of them with the valve predictor, under
+    /// `budget`.
     fn floored_scan(
         budget: &mut MemoryBudget,
     ) -> (
@@ -16336,14 +16368,20 @@ mod tests {
         Vec<crate::diagnostics::Diagnostic>,
     ) {
         let input = tempfile::NamedTempFile::new().unwrap();
-        let squares: Vec<Geometry<f64>> = (0..6_000)
+        // The same grid in two z2 tiles, side by side.
+        let squares: Vec<Geometry<f64>> = (0..12_000)
             .map(|i| {
-                let (x, y) = (1.0 + f64::from(i % 100) * 0.8, 1.0 + f64::from(i / 100));
+                let east = if i < 6_000 { 0.0 } else { 90.0 };
+                let i = i % 6_000;
+                let (x, y) = (
+                    east + 1.0 + f64::from(i % 100) * 0.8,
+                    1.0 + f64::from(i / 100),
+                );
                 let d = 0.2 + f64::from((i * 7919) % 13) * 0.02;
                 Geometry::Polygon(geo::Rect::new((x, y), (x + d, y + d)).to_polygon())
             })
             .collect();
-        write_fixture(input.path(), &[((0..6_000).collect(), squares)]);
+        write_fixture(input.path(), &[((0..12_000).collect(), squares)]);
         let reader = OverviewReader::open(input.path()).unwrap();
         let zooms = resolve_level_zooms(reader.meta(), reader.num_levels()).unwrap();
         let opts = ExportOptions {
@@ -16377,7 +16415,28 @@ mod tests {
         assert!(!floors.is_empty(), "the cap must bind");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_eq!(budget.available(), before);
-        assert!(scans[0].tile_counts.values().sum::<usize>() >= 6_000);
+        assert!(scans[0].tile_counts.values().sum::<usize>() >= 12_000);
+    }
+
+    /// #768: the price samples are taken a chunk of tiles at a time, as
+    /// many as the export's share of the budget holds, to the same floors.
+    #[test]
+    fn price_samples_are_chunked_by_the_budget_to_the_same_floors() {
+        let chunks = |available| {
+            let before = SAMPLE_CHUNKS.with(std::cell::Cell::get);
+            let (_, floors, diagnostics) =
+                floored_scan(&mut MemoryBudget::with_available(Some(available)));
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            (floors, SAMPLE_CHUNKS.with(std::cell::Cell::get) - before)
+        };
+        let (roomy, whole) = chunks(64 << 30);
+        assert!(roomy.tiles.len() >= 2, "{roomy:?}");
+        // Two priced tiles, both candidates: one chunk a sample.
+        assert_eq!(whole, 2);
+        // 64 KiB holds one tile's first sample, not two.
+        let (tight, chunked) = chunks(64 << 10);
+        assert_eq!(chunked, 4);
+        assert_eq!(tight, roomy);
     }
 
     /// #768: a predictor over the scan's budget drops its dense state and
