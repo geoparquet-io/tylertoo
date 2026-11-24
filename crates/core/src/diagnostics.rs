@@ -178,10 +178,6 @@ pub enum Diagnostic {
     /// Pass 1 found the input rows in no spatial order (#768). `ratio` is
     /// the mean distance between consecutive rows over the spacing of
     /// evenly spread rows; `input` is the input's root path.
-    /// The `--valve-scope smooth|zoom` predictor outgrew the export scan's
-    /// memory budget, and the export fell back to `tile` (#768).
-    #[non_exhaustive]
-    ValveFloorsShed { count: usize },
     #[non_exhaustive]
     UnsortedInput {
         count: usize,
@@ -189,6 +185,10 @@ pub enum Diagnostic {
         parts: usize,
         ratio: f64,
     },
+    /// The `--valve-scope smooth|zoom` predictor outgrew the export scan's
+    /// memory budget, and the export fell back to `tile` (#768).
+    #[non_exhaustive]
+    ValveFloorsShed { count: usize },
     #[non_exhaustive]
     PyramidSharedTiles { count: usize },
     #[non_exhaustive]
