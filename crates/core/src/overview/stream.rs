@@ -1152,8 +1152,8 @@ fn build_writer_options_with_ceiling(
 
 /// A shard's read window as a query in the input's CRS: its tile range plus
 /// the read margin, with the wrapped copies.
-fn shard_read_query(range: &crate::shard::TileRange, crs: Crs) -> BboxQuery {
-    let b = range.read_bounds();
+fn shard_read_query(read: &crate::shard::ShardRead, crs: Crs) -> BboxQuery {
+    let b = read.range.read_bounds_within(read.margin_tiles);
     BboxQuery::new(&[b.lng_min, b.lat_min, b.lng_max, b.lat_max], crs)
 }
 
@@ -1170,9 +1170,10 @@ fn shard_read_query(range: &crate::shard::TileRange, crs: Crs) -> BboxQuery {
 /// gaps depend on.
 fn shard_chain_reps(
     plan: &mut super::plan_state::ConvertPlan,
-    range: &crate::shard::TileRange,
+    read: &crate::shard::ShardRead,
     crs: Crs,
 ) -> Result<std::collections::BTreeSet<usize>, ConvertError> {
+    let range = &read.range;
     let Some(chains) = &mut plan.chains else {
         return Ok(std::collections::BTreeSet::new());
     };
@@ -1183,7 +1184,7 @@ fn shard_chain_reps(
             .and_then(|&(_, zoom)| zoom)
             .is_none_or(|z| z >= range.pivot_zoom())
     });
-    let window = shard_read_query(range, crs);
+    let window = shard_read_query(read, crs);
     let chains = &*chains;
     chains
         .entries
@@ -1214,7 +1215,7 @@ pub(super) fn select_row_groups_streaming(
     bbox_query: Option<&BboxQuery>,
     mask_query: Option<&BboxQuery>,
     filter: Option<&super::filter::BoundFilter>,
-    shard: Option<&crate::shard::TileRange>,
+    shard: Option<crate::shard::ShardRead>,
     crs: Crs,
 ) -> Result<Option<RowGroupSelection>, ConvertError> {
     let bbox_selection: Option<RowGroupSelection> = match bbox_query {
@@ -1232,7 +1233,7 @@ pub(super) fn select_row_groups_streaming(
     // at lng 200 belongs to the shard covering -160: test the wrapped copies
     // too, as `--bbox` does (#643).
     let shard_selection: Option<RowGroupSelection> = match shard {
-        Some(range) => Some(source.select_row_groups_any(shard_read_query(range, crs).boxes())?),
+        Some(read) => Some(source.select_row_groups_any(shard_read_query(&read, crs).boxes())?),
         None => None,
     };
     let spatial = [bbox_selection, mask_selection, shard_selection]
@@ -2927,7 +2928,7 @@ fn preflight_with_memory_limit(
         bbox_query.as_ref(),
         mask_query.as_ref(),
         bound_filter.as_ref(),
-        options.shard.as_ref(),
+        options.shard_read(),
         crs,
     )?;
     if let Some(selection) = &selected_row_groups {
@@ -3549,8 +3550,9 @@ fn load_plan_state(
     // the equality below is what proves the re-addressing landed — the
     // compacted table must be exactly as long as what the shard will read.
     let mut read_selection = None;
-    if let Some(range) = &options.shard {
-        let reps = shard_chain_reps(&mut plan, range, crs)?;
+    if let Some(read) = options.shard_read() {
+        let range = read.range;
+        let reps = shard_chain_reps(&mut plan, &read, crs)?;
         read_selection = super::plan_state::rebase_plan_for_shard(
             &mut plan,
             source,
@@ -10831,10 +10833,16 @@ mod tests {
         // (#768) reaches -192.7 in the west and -166 in the east.
         let id = crate::pmtiles_writer::tile_id(8, 0, 120);
         let range = crate::shard::TileRange::new(8, id, id).unwrap();
-        let sel =
-            select_row_groups_streaming(&source, None, None, None, Some(&range), Crs::Epsg4326)
-                .unwrap()
-                .expect("a shard always yields a selection");
+        let sel = select_row_groups_streaming(
+            &source,
+            None,
+            None,
+            None,
+            Some(crate::shard::ShardRead::wide(range)),
+            Crs::Epsg4326,
+        )
+        .unwrap()
+        .expect("a shard always yields a selection");
         assert_eq!(sel.parts(), &[vec![1usize]]);
     }
 
@@ -10860,9 +10868,16 @@ mod tests {
         let read = range.read_bounds();
         assert!(read.lng_min <= -160.0 && read.lng_max < -10.0, "{read:?}");
 
-        let sel = select_row_groups_streaming(&source, None, None, None, Some(&range), crs)
-            .unwrap()
-            .expect("a shard always yields a selection");
+        let sel = select_row_groups_streaming(
+            &source,
+            None,
+            None,
+            None,
+            Some(crate::shard::ShardRead::wide(range)),
+            crs,
+        )
+        .unwrap()
+        .expect("a shard always yields a selection");
         assert_eq!(
             sel.parts(),
             &[vec![1usize]],

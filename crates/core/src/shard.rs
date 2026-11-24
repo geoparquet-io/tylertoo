@@ -111,22 +111,50 @@ pub(crate) const MAX_SHARD_PIVOT_ZOOM: u8 = 10;
 /// comes from the needs of the tiles up to
 /// [`MAX_RINGS`](crate::overview::export::valve_predict::MAX_RINGS) rings
 /// away, each predicted from every one of its rows, so a shard reads those
-/// rings plus a one-tile buffer: nine pivot tiles. That covers every
-/// `--tile-buffer` up to 2,304 tile pixels. Since #433 every export, sharded or not, is capped at
+/// rings plus a one-tile buffer: nine pivot tiles.
+///
+/// The cost: a shard reads the row groups up to nine pivot tiles past its
+/// range, on an input whose row groups are Hilbert-compact. The wider
+/// margin's cost is measured in `docs/OVERVIEW_TUNING.md`. A `tiles` data
+/// shard whose export predicts no floors (`--valve-scope tile`, or no size
+/// cap) reads only [`SHARD_BUFFER_MARGIN_TILES`]; a standalone `overview`
+/// shard cannot see the export options that follow it, so it reads this.
+pub(crate) const SHARD_READ_MARGIN_TILES: f64 =
+    (crate::overview::export::valve_predict::MAX_RINGS + 1) as f64;
+
+/// The margin a data shard reads when no valve floor reaches past the tile
+/// buffer: two pivot tiles, every `--tile-buffer` up to **512** tile pixels,
+/// two full tile widths, against a default of 8 and a tippecanoe default of
+/// 5. Since #433 every export, sharded or not, is capped at
 /// [`MAX_TILE_BUFFER_PX`](crate::overview::export::MAX_TILE_BUFFER_PX) (one
 /// tile width) by
 /// [`ExportError::TileBufferTooWide`](crate::overview::export::ExportError::TileBufferTooWide),
 /// and the compile-time check below keeps that cap within this margin, so
 /// the bound is enforced, not merely assumed.
-///
-/// The cost: a shard reads the row groups up to nine pivot tiles past its
-/// range, on an input whose row groups are Hilbert-compact (two before #768).
-/// The wider margin's cost is measured in `docs/OVERVIEW_TUNING.md`.
-pub(crate) const SHARD_READ_MARGIN_TILES: f64 =
-    (crate::overview::export::valve_predict::MAX_RINGS + 1) as f64;
+pub(crate) const SHARD_BUFFER_MARGIN_TILES: f64 = 2.0;
 
-/// The largest `--tile-buffer` (in tile pixels) the read-pruning margin
-/// [`SHARD_READ_MARGIN_TILES`] covers. See that constant for the derivation.
+/// A data shard's read window: its range and the margin past it, in pivot
+/// tiles ([`SHARD_READ_MARGIN_TILES`] or [`SHARD_BUFFER_MARGIN_TILES`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ShardRead {
+    pub(crate) range: TileRange,
+    pub(crate) margin_tiles: f64,
+}
+
+impl ShardRead {
+    /// `range` with the valve floors' margin, [`SHARD_READ_MARGIN_TILES`].
+    #[cfg(test)]
+    pub(crate) fn wide(range: TileRange) -> Self {
+        Self {
+            range,
+            margin_tiles: SHARD_READ_MARGIN_TILES,
+        }
+    }
+}
+
+/// The largest `--tile-buffer` (in tile pixels) the narrower read-pruning
+/// margin [`SHARD_BUFFER_MARGIN_TILES`] covers. See that constant for the
+/// derivation.
 ///
 /// Not a user-facing cap of its own any more (#433): the universal
 /// [`MAX_TILE_BUFFER_PX`](crate::overview::export::MAX_TILE_BUFFER_PX) is
@@ -134,7 +162,7 @@ pub(crate) const SHARD_READ_MARGIN_TILES: f64 =
 /// raise the universal cap past the margin and the build fails here rather
 /// than a shard silently missing geometry.
 pub(crate) const MAX_SHARD_TILE_BUFFER_PX: u32 =
-    (SHARD_READ_MARGIN_TILES * crate::overview::export::NOMINAL_TILE_PIXELS) as u32;
+    (SHARD_BUFFER_MARGIN_TILES * crate::overview::export::NOMINAL_TILE_PIXELS) as u32;
 const _: () = assert!(
     crate::overview::export::MAX_TILE_BUFFER_PX <= MAX_SHARD_TILE_BUFFER_PX,
     "the universal --tile-buffer cap must stay within the shard read-pruning margin"
@@ -630,8 +658,13 @@ impl TileRange {
     /// extent. [`TileRange::tile_bounds`] is the exact extent, and is what an
     /// archive advertises.
     pub fn read_bounds(&self) -> TileBounds {
+        self.read_bounds_within(SHARD_READ_MARGIN_TILES)
+    }
+
+    /// [`Self::read_bounds`] widened by `margin_tiles` pivot tiles instead.
+    pub(crate) fn read_bounds_within(&self, margin_tiles: f64) -> TileBounds {
         let b = self.tile_bounds();
-        let margin = SHARD_READ_MARGIN_TILES * 360.0 / 2f64.powi(i32::from(self.pivot_zoom));
+        let margin = margin_tiles * 360.0 / 2f64.powi(i32::from(self.pivot_zoom));
         // Longitude is not clamped: past ±180 the margin covers the far
         // side's features, which export draws wrapped into the edge tiles
         // (#342); the readers test the wrapped query boxes (#643).

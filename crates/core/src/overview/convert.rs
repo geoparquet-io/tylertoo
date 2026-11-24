@@ -919,6 +919,15 @@ pub struct ConvertOptions {
     #[serde(skip)]
     #[cfg_attr(feature = "cli", arg(skip = crate::OverviewCodec::Zstd))]
     pub(crate) overview_codec: crate::OverviewCodec,
+    /// #768: a data shard reads the tile buffer's margin past its range
+    /// ([`crate::shard::SHARD_BUFFER_MARGIN_TILES`]), not the valve floors'
+    /// reach ([`crate::shard::SHARD_READ_MARGIN_TILES`]). The `tiles` facade
+    /// sets it when its export predicts no floors (`--valve-scope tile`, or
+    /// no size cap); a convert run on its own cannot see the export that
+    /// follows, so it keeps the wide margin. Default `false`.
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = false))]
+    pub(crate) shard_buffer_margin_only: bool,
     /// Materialize only the levels at or coarser than this zoom (#541): the
     /// **coarse job**'s half of a sharded build, on the convert side.
     ///
@@ -1008,6 +1017,7 @@ with_setters!(ConvertOptions {
     with_zoom_ceiling => zoom_ceiling: Option<u8>,
 } internal {
     overview_codec,
+    shard_buffer_margin_only,
 });
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -1223,6 +1233,19 @@ impl ConvertOptions {
     /// The first rule broken; every error this returns is
     /// [`ErrorKind::Usage`](crate::error::ErrorKind::Usage).
     /// Validate these options and return the immutable engine configuration.
+    /// A data shard's read window: its range, and the margin past it in
+    /// pivot tiles ([`Self::shard_buffer_margin_only`]).
+    pub(crate) fn shard_read(&self) -> Option<crate::shard::ShardRead> {
+        self.shard.map(|range| crate::shard::ShardRead {
+            range,
+            margin_tiles: if self.shard_buffer_margin_only {
+                crate::shard::SHARD_BUFFER_MARGIN_TILES
+            } else {
+                crate::shard::SHARD_READ_MARGIN_TILES
+            },
+        })
+    }
+
     #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConvertError> {
         super::config::validate_convert(self)
@@ -1666,6 +1689,7 @@ impl Default for ConvertOptions {
             shard_plan_digest: None,
             cell_bands: None,
             overview_codec: crate::OverviewCodec::Zstd,
+            shard_buffer_margin_only: false,
             zoom_ceiling: None,
         }
     }

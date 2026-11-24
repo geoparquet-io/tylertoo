@@ -232,21 +232,24 @@ impl TilesShard {
     /// and the level assignment stay full-range, so any saved plan is
     /// byte-identical to a full run's).
     ///
-    /// `keep_finest_level` skips that ceiling: the coverage fill (#771)
+    /// `export.coverage_fill` skips that ceiling: the coverage fill (#771)
     /// draws each coarse tile from the finest level, so a coarse job that
-    /// builds the fill needs every level in its intermediate.
+    /// builds the fill needs every level in its intermediate. A data shard
+    /// whose `export` predicts no valve floors (#768: `--valve-scope tile`,
+    /// or no size cap) reads only the tile buffer's margin past its range.
     ///
     /// The facade's own (#709): it applies this to its copy of
     /// [`TilesOptions::convert`], so no caller hand-syncs the two.
     /// Idempotent.
-    pub(crate) fn apply_to_convert(&self, convert: &mut ConvertOptions, keep_finest_level: bool) {
+    pub(crate) fn apply_to_convert(&self, convert: &mut ConvertOptions, export: &ExportOptions) {
         self.apply_selection(convert);
         if self.range.is_none()
-            && !keep_finest_level
+            && !export.coverage_fill
             && matches!(convert.levels, LevelPlan::ZoomRange { .. })
         {
             convert.zoom_ceiling = Some(self.pivot_zoom.saturating_sub(1));
         }
+        convert.shard_buffer_margin_only = !super::export::valve_predicts(export);
     }
 }
 
@@ -1185,7 +1188,7 @@ pub(super) fn convert_to_pmtiles_retaining_overview(
     let convert_options = match &options.shard {
         Some(job) => {
             let mut convert = options.convert.clone();
-            job.apply_to_convert(&mut convert, options.export.coverage_fill);
+            job.apply_to_convert(&mut convert, &options.export);
             Cow::Owned(convert)
         }
         None => Cow::Borrowed(&options.convert),
@@ -2330,7 +2333,13 @@ mod tests {
             cut_digest: "deadbeef".to_string(),
             binding: None,
         }
-        .apply_to_convert(&mut filled, true);
+        .apply_to_convert(
+            &mut filled,
+            &ExportOptions {
+                coverage_fill: true,
+                ..ExportOptions::default()
+            },
+        );
         assert_eq!(
             filled.zoom_ceiling, None,
             "#771: the fill needs the finest level"
@@ -2352,7 +2361,7 @@ mod tests {
             cut_digest: "deadbeef".to_string(),
             binding: None,
         };
-        coarse.apply_to_convert(&mut convert, false);
+        coarse.apply_to_convert(&mut convert, &ExportOptions::default());
         assert_eq!(convert.shard, None, "the coarse job prunes no rows");
         assert_eq!(convert.shard_plan_digest.as_deref(), Some("deadbeef"));
         assert_eq!(
@@ -2381,9 +2390,45 @@ mod tests {
             cut_digest: "deadbeef".to_string(),
             binding: None,
         }
-        .apply_to_convert(&mut convert, false);
+        .apply_to_convert(&mut convert, &ExportOptions::default());
         assert_eq!(convert.shard, Some(range));
         assert_eq!(convert.zoom_ceiling, None, "only the coarse job is capped");
+        // #768: the default smooth floors reach nine pivot tiles; an export
+        // with no floors to predict reads the tile buffer's two.
+        let margin = |convert: &ConvertOptions| convert.shard_read().unwrap().margin_tiles;
+        assert_eq!(margin(&convert), crate::shard::SHARD_READ_MARGIN_TILES);
+        let job = TilesShard {
+            role: ShardRole::Shard {
+                index: 3,
+                shards: 4,
+            },
+            range: Some(range),
+            pivot_zoom: 5,
+            cut_digest: "deadbeef".to_string(),
+            binding: None,
+        };
+        for export in [
+            ExportOptions::default().with_valve_scope(super::super::export::ValveScope::Tile),
+            ExportOptions {
+                tile_size_limit: None,
+                compressed_tile_size_limit: None,
+                ..ExportOptions::default()
+            },
+        ] {
+            job.apply_to_convert(&mut convert, &export);
+            assert_eq!(margin(&convert), crate::shard::SHARD_BUFFER_MARGIN_TILES);
+        }
+        assert_eq!(
+            ConvertOptions {
+                shard: Some(range),
+                ..ConvertOptions::default()
+            }
+            .shard_read()
+            .unwrap()
+            .margin_tiles,
+            crate::shard::SHARD_READ_MARGIN_TILES,
+            "a convert on its own cannot see its export: the wide margin"
+        );
 
         // #560: `apply_selection` is the subset a plan-only run applies —
         // the selection without a ceiling it has no pass 2 for.

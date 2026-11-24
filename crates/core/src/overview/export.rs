@@ -234,9 +234,9 @@ pub(crate) const DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR: f64 = 0.25;
 /// `--buffer` has no cap; this is a divergence, and a deliberate one, since
 /// there is no output past this value that is not also reachable below it.
 ///
-/// This is the one bound. The sharded path's read-pruning margin
-/// (`shard::SHARD_READ_MARGIN_TILES`, nine pivot tiles since #768) is
-/// wider than this, so the cap satisfies it; the
+/// This is the one bound. The sharded path's read-pruning margin (two pivot
+/// tiles, `shard::SHARD_BUFFER_MARGIN_TILES`; nine when the export predicts
+/// valve floors, #768) is wider than this, so the cap satisfies it; the
 /// compile-time check next to that constant keeps it so, and
 /// [`ExportError::TileBufferTooWideForShard`] is no longer raised.
 pub const MAX_TILE_BUFFER_PX: u32 = 256;
@@ -2808,8 +2808,8 @@ fn export_pmtiles_validated(
         });
     }
     // #498: the read-pruning safety bound. A shard's convert prunes input row
-    // groups against its tile range widened by `SHARD_READ_MARGIN_TILES`
-    // pivot tiles; a buffer wider than that margin would let a feature render
+    // groups against its tile range widened by at least
+    // `SHARD_BUFFER_MARGIN_TILES` pivot tiles; a buffer wider than that margin would let a feature render
     // into a shard's tile from a row group the shard never read. Since #433
     // the universal `MAX_TILE_BUFFER_PX` cap (checked in `validate` above) is
     // at most that margin, so no buffer that reaches here can breach it; the
