@@ -53,7 +53,7 @@ use std::ops::RangeInclusive;
 use geo::Rect;
 use rayon::prelude::*;
 
-use super::coalesce_valve::{gap_to_rect, world_xy, GAP_NONE};
+use super::coalesce_valve::{gap_to_rect, gap_to_world_box, world_box, world_xy, GAP_NONE};
 use super::{for_each_member_key, key_to_xy, ExportOptions, SizeValve, ValveScope};
 use crate::tile::TileBounds;
 
@@ -66,7 +66,7 @@ const BUCKET_OFFSET: f64 = 8.0;
 /// scan's memory at one histogram per this many memberships. A tile over a
 /// cap holds tens of thousands; the few gaps it misses before crossing do
 /// not move a quantile.
-const HIST_MIN_MEMBERS: u32 = 1024;
+const HIST_MIN_MEMBERS: u64 = 1024;
 
 /// Members in a tile's first price sample.
 pub(crate) const PRICE_MEMBERS: usize = 256;
@@ -97,7 +97,7 @@ pub(crate) type MemberBytes = (f64, f64);
 /// around them it pruned.
 #[derive(Default)]
 struct TileStat {
-    count: u32,
+    count: u64,
     /// From the member that reaches [`HIST_MIN_MEMBERS`] on: each member's
     /// gap to the tile's previous member in its band.
     hist: Option<Hist>,
@@ -148,28 +148,39 @@ pub(crate) struct Scan {
     /// Rows waiting for [`Self::flush`], and the levels they fan to.
     pending: Vec<Option<TileBounds>>,
     pending_levels: RangeInclusive<usize>,
+    /// Time spent sizing rows ([`Self::flush`]): the predictor's share of
+    /// the scan, for the log.
+    pub(crate) spent: std::time::Duration,
 }
 
-/// A row as [`Scan::flush`] sizes it: its bbox, as a rect and its centre
-/// in world units, whether its gap counts, and its band row.
-type SizedRow = (TileBounds, Rect<f64>, (f64, f64), bool, u64);
+/// A row as [`Scan::flush`] sizes it: its bbox, its corners ([`world_box`])
+/// and centre in world units, whether its gap counts, and its band row.
+/// PERF: projected once a row, not once a row and level (France points:
+/// four Web Mercator projections per membership were most of the scan's
+/// predictor time).
+type SizedRow = (TileBounds, [f64; 4], (f64, f64), bool, u64);
 
 /// Rows one [`Scan::flush`] sizes: what one pass over the levels holds.
-const FLUSH_ROWS: usize = 1 << 16;
+/// PERF: large, so each flush's fork-join over a level's maps has work
+/// enough for the pool (France points: 64Ki rows a flush kept the
+/// predictor near three cores).
+pub(crate) const FLUSH_ROWS: usize = 1 << 18;
 
 /// Maps a level's tiles are split into, by key.
-const PARTS: usize = 16;
+const PARTS: usize = 64;
 
 /// The map of [`Scan::levels`] that holds `key`.
 fn part(key: u64) -> usize {
-    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as usize
+    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize
 }
 
 /// Rows a flush fans out per task.
 const FAN_ROWS: usize = 4096;
 
-/// One run of rows' members, `(key, row)`, per map of a level.
-type Fanned = [Vec<(u64, u32)>; PARTS];
+/// One run of rows' members, per map of a level: `(key, first, last)` for
+/// each stretch of consecutive rows in one tile (Hilbert-sorted rows stay in
+/// a tile for long stretches, so a map lookup serves many members).
+type Fanned = [Vec<(u64, u32, u32)>; PARTS];
 
 /// log2 of one squared pixel at `zoom`, in squared world units.
 fn px2_log2(zoom: u8) -> f64 {
@@ -273,11 +284,14 @@ pub(crate) fn quantile(hist: &[u32; BUCKETS], q: f64, zoom: u8) -> Option<u64> {
 impl Scan {
     pub(crate) fn new(levels: usize) -> Self {
         Self {
-            levels: (0..levels).map(|_| Default::default()).collect(),
+            levels: (0..levels)
+                .map(|_| std::array::from_fn(|_| HashMap::new()))
+                .collect(),
             band: None,
             band_rows: 0,
             pending: Vec::new(),
             pending_levels: 0..=0,
+            spent: std::time::Duration::ZERO,
         }
     }
 
@@ -294,6 +308,16 @@ impl Scan {
                     + l.values().filter(|t| t.hist.is_some()).count() as u64 * hist
             })
             .sum()
+    }
+
+    /// Level `level`'s tiles and their member counts: the export scan's tile
+    /// counts, which it takes from here when it predicts.
+    pub(crate) fn tile_counts(&self, level: usize) -> std::collections::BTreeMap<u64, usize> {
+        self.levels[level]
+            .iter()
+            .flatten()
+            .map(|(&key, t)| (key, t.count as usize))
+            .collect()
     }
 
     /// Forget everything: the scan restarts from the geometry.
@@ -317,8 +341,11 @@ impl Scan {
             self.band_rows = 0;
             self.pending_levels = levels;
         }
-        for row in rows {
-            self.pending.push(*row);
+        let mut rows = rows;
+        while !rows.is_empty() {
+            let take = rows.len().min(FLUSH_ROWS - self.pending.len());
+            self.pending.extend_from_slice(&rows[..take]);
+            rows = &rows[take..];
             if self.pending.len() == FLUSH_ROWS {
                 self.flush(zooms, opts);
             }
@@ -332,6 +359,7 @@ impl Scan {
         if self.pending.is_empty() {
             return;
         }
+        let t = std::time::Instant::now();
         let band = u16::try_from(self.band.expect("a band is open")).unwrap_or(u16::MAX);
         let first = self.band_rows;
         // Each row's bbox, its centre, and whether its gap counts: lines and
@@ -349,7 +377,7 @@ impl Scan {
                 let rect = Rect::new((b.lng_min, b.lat_min), (b.lng_max, b.lat_max));
                 let c = rect.center();
                 let point = b.lng_min == b.lng_max && b.lat_min == b.lat_max;
-                Some((b, rect, world_xy(c.x, c.y), point == drop, row))
+                Some((b, world_box(&rect), world_xy(c.x, c.y), point == drop, row))
             })
             .collect();
         // Per level, per run of rows, each map's (key, row) members in file
@@ -361,10 +389,16 @@ impl Scan {
                 rows.par_chunks(FAN_ROWS)
                     .enumerate()
                     .map(|(c, run)| {
-                        let mut out = Fanned::default();
+                        let mut out: Fanned = std::array::from_fn(|_| Vec::new());
                         for (i, (b, ..)) in run.iter().enumerate() {
                             let i = (c * FAN_ROWS + i) as u32;
-                            for_each_member_key(b, zoom, opts, |key| out[part(key)].push((key, i)));
+                            for_each_member_key(b, zoom, opts, |key| {
+                                let runs = &mut out[part(key)];
+                                match runs.last_mut() {
+                                    Some(r) if r.0 == key && r.2 + 1 == i => r.2 = i,
+                                    _ => runs.push((key, i, i)),
+                                }
+                            });
                         }
                         out
                     })
@@ -377,30 +411,34 @@ impl Scan {
             .zip(&zooms[range])
             .for_each(|((level, fanned), &zoom)| {
                 level.par_iter_mut().enumerate().for_each(|(p, tiles)| {
-                    for &(key, i) in fanned.iter().flat_map(|run| &run[p]) {
-                        let (_, rect, centre, valved, row) = &rows[i as usize];
+                    for &(key, first, last) in fanned.iter().flat_map(|run| &run[p]) {
                         let t = tiles.entry(key).or_default();
-                        t.count = t.count.saturating_add(1);
-                        if t.run.0 != band || t.run.1 == 0 {
-                            if t.run.1 > t.best.1 {
-                                t.best = t.run;
+                        for i in first..=last {
+                            let (_, corners, centre, valved, row) = &rows[i as usize];
+                            t.count = t.count.saturating_add(1);
+                            if t.run.0 != band || t.run.1 == 0 {
+                                if t.run.1 > t.best.1 {
+                                    t.best = t.run;
+                                }
+                                t.run = (band, 0, *row, *row);
                             }
-                            t.run = (band, 0, *row, *row);
-                        }
-                        t.run.1 += 1;
-                        t.run.3 = *row;
-                        let gap = match t.prev {
-                            Some((b, p)) if b == band && *valved => gap_to_rect(p, rect),
-                            _ => GAP_NONE,
-                        };
-                        t.prev = Some((band, *centre));
-                        if t.count >= HIST_MIN_MEMBERS {
-                            if t.price_rows.len() < PRICE_MEMBERS {
-                                t.price_rows.push((band, *row));
-                            }
-                            let h = t.hist.get_or_insert_with(|| Box::new([0; BUCKETS]));
-                            if gap != GAP_NONE {
-                                h[bucket(gap, zoom)] += 1;
+                            t.run.1 += 1;
+                            t.run.3 = *row;
+                            let gap = match t.prev {
+                                Some((b, p)) if b == band && *valved => {
+                                    gap_to_world_box(p, corners)
+                                }
+                                _ => GAP_NONE,
+                            };
+                            t.prev = Some((band, *centre));
+                            if t.count >= HIST_MIN_MEMBERS {
+                                if t.price_rows.len() < PRICE_MEMBERS {
+                                    t.price_rows.push((band, *row));
+                                }
+                                let h = t.hist.get_or_insert_with(|| Box::new([0; BUCKETS]));
+                                if gap != GAP_NONE {
+                                    h[bucket(gap, zoom)] += 1;
+                                }
                             }
                         }
                     }
@@ -408,6 +446,7 @@ impl Scan {
             });
         self.band_rows += self.pending.len() as u64;
         self.pending.clear();
+        self.spent += t.elapsed();
     }
 
     /// The tiles that can be predicted over (those with a gap histogram), in
@@ -597,8 +636,8 @@ fn caps(opts: &ExportOptions) -> Caps {
 }
 
 /// The estimated fit of `count` members at `(raw, gzipped)` bytes each.
-fn fit(count: u32, (raw_member, gz_member): MemberBytes, (raw, gz): Caps) -> f64 {
-    let n = f64::from(count);
+fn fit(count: u64, (raw_member, gz_member): MemberBytes, (raw, gz): Caps) -> f64 {
+    let n = count as f64;
     let mut fit = f64::INFINITY;
     if let Some(l) = raw {
         fit = fit.min(l as f64 / (n * raw_member));
@@ -613,7 +652,7 @@ fn fit(count: u32, (raw_member, gz_member): MemberBytes, (raw, gz): Caps) -> f64
 /// fit (or within the margin of fitting).
 pub(crate) fn predict_need(
     hist: &[u32; BUCKETS],
-    count: u32,
+    count: u64,
     zoom: u8,
     bytes: MemberBytes,
     caps: Caps,
@@ -632,7 +671,7 @@ pub(crate) fn predict_need(
 /// `None` when it is predicted to fit. Members with a smaller gap drop.
 pub(crate) fn predict_drop_need(
     hist: &[u32; BUCKETS],
-    count: u32,
+    count: u64,
     zoom: u8,
     bytes: MemberBytes,
     caps: Caps,

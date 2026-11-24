@@ -3798,6 +3798,7 @@ fn predict_floors(
     };
     let priced = p.priced();
     let first = sample(&priced, stored_sample_rows(reader, p, &priced)?)?;
+    let t_first = t.elapsed();
     let candidates = p.candidates(&first, options);
     let mut bytes = first;
     let rows = valve_sample_rows(
@@ -3808,16 +3809,20 @@ fn predict_floors(
         &candidates,
         SAMPLE_MEMBERS,
     )?;
+    let t_rows = t.elapsed();
     bytes.extend(sample(&candidates, rows)?);
     let need = p.predict(level_zooms, &bytes, options);
     let floors = p.floors(options.valve_scope, &need, (level_zooms, &bytes), options);
     log::info!(
-        "[export] valve floors: {} tiles priced ({} by a larger sample), {} predicted over a cap, {} floors, {:.2}s",
+        "[export] valve floors: {} tiles priced ({} by a larger sample), {} predicted over a cap, {} floors, {:.2}s (first sample {:.2}s, larger sample rows {:.2}s; scan share {:.2}s)",
         bytes.len(),
         candidates.len(),
         need.len(),
         floors.len(),
         t.elapsed().as_secs_f64(),
+        t_first.as_secs_f64(),
+        (t_rows - t_first).as_secs_f64(),
+        p.spent.as_secs_f64(),
     );
     Ok(floors)
 }
@@ -3871,6 +3876,11 @@ fn stored_sample_rows(
 /// #768: the rows [`valve_sample_bytes`] samples, per row group: each
 /// tile's first `sample_members` member rows in its span, read from the
 /// bbox covering alone (the geometry when there is none).
+///
+/// PERF: tiles in parallel, each walking its span's row groups in order and
+/// stopping at its sample. Walking every row group of every span in
+/// parallel read and scanned a coarse tile's whole band for a sample its
+/// first row group already held (France points: 6 of 15 s of CPU).
 fn valve_sample_rows(
     reader: &OverviewReader,
     published: &PublishedNames,
@@ -3880,26 +3890,6 @@ fn valve_sample_rows(
     sample_members: usize,
 ) -> Result<SampleRows, ExportError> {
     let rows_of = |rg: usize| reader.parquet_metadata().row_group(rg).num_rows().max(0) as u64;
-    // Each tile's span, as `(row group, first row, last row)` per row group
-    // of its band it covers, rows counted from the row group's start.
-    let mut spans: BTreeMap<usize, Vec<(usize, u64, u64)>> = BTreeMap::new();
-    for (i, t) in tiles.iter().enumerate() {
-        let mut start = 0u64;
-        for rg in reader.band(usize::from(t.band))? {
-            let n = rows_of(rg);
-            let (lo, hi) = (t.row.max(start), t.last.min(start + n - 1));
-            if n > 0 && lo <= hi {
-                spans
-                    .entry(rg)
-                    .or_default()
-                    .push((i, lo - start, hi - start));
-            }
-            start += n;
-            if start > t.last {
-                break;
-            }
-        }
-    }
     let source = ScanBboxSource::for_reader(reader);
     let projection: Option<Vec<usize>> = match &source {
         ScanBboxSource::Covering { .. } => reader
@@ -3909,100 +3899,82 @@ fn valve_sample_rows(
         ScanBboxSource::Geometry => None,
     };
     let diagnostics = crate::diagnostics::Diagnostics::default();
-    // Read 1: per row group, each spanning tile's member rows, in order.
-    let found = spans
-        .par_iter()
-        .map(
-            |(&rg, spanning)| -> Result<Vec<(usize, usize, Vec<u32>)>, ExportError> {
-                let mut rows: Vec<Vec<u32>> = vec![Vec::new(); spanning.len()];
-                let mut base = 0u64;
-                for batch in read_row_group(reader, rg, projection.as_deref())? {
-                    let batch = batch.map_err(|e| read_error(e.into()))?;
-                    let n = batch.num_rows() as u64;
-                    let open = |&(_, lo, hi): &(usize, u64, u64)| lo < base + n && hi >= base;
-                    let wanted = |w: usize, rows: &[Vec<u32>]| {
-                        open(&spanning[w]) && rows[w].len() < sample_members
+    // One tile's first `sample_members` member rows, per row group of its
+    // span, in band order.
+    let sample_tile = |t: &valve_predict::SampleAt| -> Result<Vec<(usize, Vec<u32>)>, ExportError> {
+        let mut found: Vec<(usize, Vec<u32>)> = Vec::new();
+        let mut left = sample_members;
+        let mut start = 0u64;
+        for rg in reader.band(usize::from(t.band))? {
+            let n = rows_of(rg);
+            // The span inside this row group, rows from its start.
+            let (lo, hi) = (t.row.max(start), t.last.min((start + n).saturating_sub(1)));
+            start += n;
+            if n == 0 || lo > hi {
+                if start > t.last {
+                    break;
+                }
+                continue;
+            }
+            let (lo, hi) = (lo - (start - n), hi - (start - n));
+            let mut rows = Vec::new();
+            let mut base = 0u64;
+            for batch in read_row_group(reader, rg, projection.as_deref())? {
+                let batch = batch.map_err(|e| read_error(e.into()))?;
+                let m = batch.num_rows() as u64;
+                if lo < base + m && hi >= base {
+                    let bboxes: Vec<Option<TileBounds>> = match &source {
+                        // A malformed covering row (the scan then fell back
+                        // to geometry) is sampled as no member.
+                        ScanBboxSource::Covering { column, names } => {
+                            covering_rows(&batch, column, names, crs)?
+                                .map(Option::flatten)
+                                .collect()
+                        }
+                        ScanBboxSource::Geometry => decode_batch_bboxes(
+                            &batch,
+                            published.geometry.as_deref(),
+                            crs,
+                            &diagnostics,
+                        )?,
                     };
-                    if (0..spanning.len()).any(|w| wanted(w, &rows)) {
-                        let bboxes = match &source {
-                            // A malformed covering row (the scan then fell
-                            // back to geometry) is sampled as no member.
-                            ScanBboxSource::Covering { column, names } => {
-                                covering_rows(&batch, column, names, crs)?
-                                    .map(Option::flatten)
-                                    .collect()
-                            }
-                            ScanBboxSource::Geometry => decode_batch_bboxes(
-                                &batch,
-                                published.geometry.as_deref(),
-                                crs,
-                                &diagnostics,
-                            )?,
+                    for row in lo.max(base) - base..=hi.min(base + m - 1) - base {
+                        let Some(Some(b)) = bboxes.get(row as usize) else {
+                            continue;
                         };
-                        for (w, span) in spanning.iter().enumerate() {
-                            if !wanted(w, &rows) {
-                                continue;
-                            }
-                            let t = tiles[span.0];
-                            let (lo, hi) =
-                                (span.1.max(base) - base, span.2.min(base + n - 1) - base);
-                            for row in lo..=hi {
-                                let Some(Some(b)) = bboxes.get(row as usize) else {
-                                    continue;
-                                };
-                                let mut member = false;
-                                for_each_member_key(b, zooms[t.level], opts, |k| {
-                                    member |= k == t.key
-                                });
-                                if member {
-                                    rows[w].push((base + row) as u32);
-                                    if rows[w].len() == sample_members {
-                                        break;
-                                    }
-                                }
+                        let mut member = false;
+                        for_each_member_key(b, zooms[t.level], opts, |k| member |= k == t.key);
+                        if member {
+                            rows.push((base + row) as u32);
+                            if rows.len() == left {
+                                break;
                             }
                         }
                     }
-                    base += n;
-                    // Every span ended or already holds its sample.
-                    if spanning
-                        .iter()
-                        .zip(&rows)
-                        .all(|(&(_, _, hi), r)| hi < base || r.len() >= sample_members)
-                    {
-                        break;
-                    }
                 }
-                Ok(spanning
-                    .iter()
-                    .zip(rows)
-                    .map(|(&(i, _, _), r)| (i, rg, r))
-                    .collect())
-            },
-        )
-        .collect::<Result<Vec<_>, ExportError>>()?;
-    // Each tile's first `sample_members` member rows, in band order.
-    let mut by_tile: Vec<Vec<(usize, Vec<u32>)>> = vec![Vec::new(); tiles.len()];
-    for (i, rg, rows) in found.into_iter().flatten() {
-        by_tile[i].push((rg, rows));
-    }
-    let mut chosen = SampleRows::new();
-    for (i, mut groups) in by_tile.into_iter().enumerate() {
-        groups.sort_by_key(|&(rg, _)| {
-            reader
-                .band(usize::from(tiles[i].band))
-                .map_or(0, |b| b.iter().position(|&x| x == rg).unwrap_or(0))
-        });
-        let mut left = sample_members;
-        for (rg, mut rows) in groups {
-            rows.truncate(left);
+                base += m;
+                if base > hi || rows.len() == left {
+                    break;
+                }
+            }
             left -= rows.len();
             if !rows.is_empty() {
-                chosen.entry(rg).or_default().push((i, rows));
+                found.push((rg, rows));
             }
-            if left == 0 {
+            if left == 0 || start > t.last {
                 break;
             }
+        }
+        Ok(found)
+    };
+    let per_tile = tiles
+        .par_iter()
+        .map(sample_tile)
+        .collect::<Result<Vec<_>, ExportError>>()?;
+    let mut chosen = SampleRows::new();
+    for (i, groups) in per_tile.into_iter().enumerate() {
+        for (rg, rows) in groups {
+            chosen.entry(rg).or_default().push((i, rows));
         }
     }
     Ok(chosen)
@@ -7034,11 +7006,23 @@ fn scan_all_levels_from(
     // row-aligned bboxes in order. Not on a thread of its own: its Rayon
     // work could then wait on the only pool worker, held by this scan.
     let mut predict = predict;
+    // PERF (#768): the predictor counts every tile's members already, so the
+    // sizing below keeps only the bounds and takes its counts at the end.
+    let count_tiles = predict.is_none();
+    // PERF (#768): the predictor's flush holds the consumer; a pipe one
+    // flush deep keeps the band read going meanwhile. Covering batches are
+    // four f64 per row, so it holds a few MiB.
+    let depth = match source {
+        ScanBboxSource::Covering { .. } if predict.is_some() => {
+            valve_predict::FLUSH_ROWS / tylertoo_io::DEFAULT_BATCH_ROWS
+        }
+        _ => WAVE_READ_IN_FLIGHT,
+    };
     let predict_ref = &mut predict;
     // PERF (#817): each band is read by the ordered parallel reader, in
     // the same batches one reader makes; `bounded` keeps the one reader.
     let piped = scoped_pipe(
-        WAVE_READ_IN_FLIGHT,
+        depth,
         |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
             send_bands(
                 (reader, band),
@@ -7082,7 +7066,11 @@ fn scan_all_levels_from(
                         .zip(&zooms_ref[j..=last])
                         .for_each(|(scan, &zoom)| {
                             scan.feature_count += pending.len();
-                            let (bounds, counts) = size_bboxes(pending, zoom, opts);
+                            let (bounds, counts) = if count_tiles {
+                                size_bboxes(pending, zoom, opts)
+                            } else {
+                                (bboxes_bounds(pending), HashMap::new())
+                            };
                             if let Some(b) = bounds {
                                 match &mut scan.bounds {
                                     Some(acc) => acc.expand(&b),
@@ -7158,16 +7146,19 @@ fn scan_all_levels_from(
                     })?;
                 }
                 if let Some(p) = predict_ref.as_deref_mut() {
-                    // #768 predict: row-aligned, so the gap walk matches the
-                    // export's row groups.
-                    let rows = match source {
-                        ScanBboxSource::Covering { column, names } => {
-                            covering_row_bboxes(&batch, column, names, crs)?
-                        }
-                        ScanBboxSource::Geometry => bboxes.clone(),
-                    };
+                    // #768 predict: row-aligned, so a tile's sample rows are
+                    // its band rows. A covering batch with no null row is
+                    // aligned already; decode it again only to keep nulls.
                     let last = if partitioning { num_levels - 1 } else { j };
-                    p.batch(j, &rows, j..=last, zooms_ref, opts);
+                    match source {
+                        ScanBboxSource::Covering { column, names }
+                            if bboxes.len() != batch.num_rows() =>
+                        {
+                            let rows = covering_row_bboxes(&batch, column, names, crs)?;
+                            p.batch(j, &rows, j..=last, zooms_ref, opts);
+                        }
+                        _ => p.batch(j, &bboxes, j..=last, zooms_ref, opts),
+                    }
                 }
                 if j != pending_band {
                     size_pending(pending_band, &mut pending);
@@ -7185,6 +7176,9 @@ fn scan_all_levels_from(
     piped?;
     if let Some(p) = predict {
         p.flush(zooms_ref, opts);
+        for (level, scan) in scans.iter_mut().enumerate() {
+            scan.tile_counts = p.tile_counts(level);
+        }
     }
     #[cfg(test)]
     BAND_READ_WORKERS.with(|w| w.set(readers));
@@ -7452,6 +7446,19 @@ fn size_bboxes(
 /// the domain comes back unchanged. These are what the archive advertises, so
 /// a cell stored as `x: 178 … 181` reports `[178, 180]` and `[-180, -179]`,
 /// never lng 181.
+/// The bounds [`size_bboxes`] gives, without the tile counts.
+fn bboxes_bounds(bboxes: &[Option<TileBounds>]) -> Option<TileBounds> {
+    bboxes
+        .par_iter()
+        .with_min_len(SIZE_BBOXES_MIN_ROWS)
+        .flatten()
+        .flat_map_iter(wrapped_extents)
+        .reduce_with(|mut a, b| {
+            a.expand(&b);
+            a
+        })
+}
+
 fn wrapped_extents(bbox: &TileBounds) -> impl Iterator<Item = TileBounds> + '_ {
     wrap_shifts(bbox, 0.0).map(move |shift| {
         let lo = bbox.lng_min + shift;
@@ -16300,6 +16307,20 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        // #768: with the predictor the scan takes its tile counts from it.
+        let mut predict = valve_predict::Scan::new(reader.num_levels());
+        let predicted = scan_all_levels_from(
+            (&reader, test_band(reader.source())),
+            crs,
+            &opts,
+            &timers,
+            &source,
+            None,
+            Some(&mut predict),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
+        assert_eq!(predicted, covering, "the predictor's tile counts differ");
         let s = timers.stage_secs();
         assert!(
             s.scan_read > 0.0 && s.scan_decode > 0.0 && s.scan_size > 0.0,
