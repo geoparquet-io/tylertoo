@@ -213,28 +213,32 @@ def test_layered_losses_spill_per_layer_as_caller_owned_jsonl(tmp_path, spill):
     assert causes == {"quantized"}
 
 
-@pytest.mark.parametrize("command", ["overview", "convert"])
-def test_unsorted_input_warns_once(tmp_path, caplog, command):
-    """#768: unsorted input is one ``UserWarning``, not also a log record."""
-    caplog.set_level(logging.WARNING, logger="tylertoo_core")
+def _write_unsorted(path: Path) -> Path:
+    """A grid of points in a scrambled order: no two consecutive rows are near."""
     metadata = {
         "version": "1.1.0",
         "primary_column": "geometry",
         "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Point"]}},
     }
-    # A grid of points in a scrambled order: no two consecutive rows are near.
     side = 64
     cells = [((i * 2654435761) % (side * side)) for i in range(side * side)]
     points = [
         struct.pack("<BIdd", 1, 1, (c % side) * 0.5, (c // side) * 0.5) for c in cells
     ]
-    source = tmp_path / "unsorted.parquet"
     pq.write_table(
-        pa.table({"geometry": points, "id": range(len(points))}).replace_schema_metadata(
-            {b"geo": json.dumps(metadata).encode()}
-        ),
-        source,
+        pa.table(
+            {"geometry": points, "id": range(len(points))}
+        ).replace_schema_metadata({b"geo": json.dumps(metadata).encode()}),
+        path,
     )
+    return path
+
+
+@pytest.mark.parametrize("command", ["overview", "convert"])
+def test_unsorted_input_warns_once(tmp_path, caplog, command):
+    """#768: unsorted input is one ``UserWarning``, not also a log record."""
+    caplog.set_level(logging.WARNING, logger="tylertoo_core")
+    source = _write_unsorted(tmp_path / "unsorted.parquet")
     suffix = "pmtiles" if command == "convert" else "parquet"
     with pytest.warns(UserWarning, match="not sorted by location") as raised:
         getattr(tylertoo, command)(
@@ -246,7 +250,9 @@ def test_unsorted_input_warns_once(tmp_path, caplog, command):
 
 
 @pytest.mark.parametrize("command", ["export_pmtiles", "pyramid"])
-def test_a_shed_valve_prediction_warns_from_every_export(tmp_path, monkeypatch, command):
+def test_a_shed_valve_prediction_warns_from_every_export(
+    tmp_path, monkeypatch, command
+):
     """#768: the export's shed valve floors reach Python as one ``UserWarning``."""
     metadata = {
         "version": "1.1.0",
@@ -260,18 +266,40 @@ def test_a_shed_valve_prediction_warns_from_every_export(tmp_path, monkeypatch, 
     ]
     source = tmp_path / "dense.parquet"
     pq.write_table(
-        pa.table({"geometry": points, "id": range(len(points))}).replace_schema_metadata(
-            {b"geo": json.dumps(metadata).encode()}
-        ),
+        pa.table(
+            {"geometry": points, "id": range(len(points))}
+        ).replace_schema_metadata({b"geo": json.dumps(metadata).encode()}),
         source,
     )
     overview = tmp_path / "dense-ov.parquet"
     tylertoo.overview(str(source), str(overview), min_zoom=0, max_zoom=6)
     monkeypatch.setenv("TYLERTOO_AUTO_MEM_LIMIT_BYTES", str(1 << 10))
     out = str(tmp_path / "dense.pmtiles")
+    if command == "pyramid":
+        run = lambda: tylertoo.pyramid(  # noqa: E731
+            [f"0-6:{overview}"], out, max_compressed_tile_size=20000
+        )
+    else:
+        run = lambda: tylertoo.export_pmtiles(  # noqa: E731
+            str(overview), out, max_compressed_tile_size=20000
+        )
     with pytest.warns(UserWarning, match="outgrew") as raised:
-        if command == "pyramid":
-            tylertoo.pyramid([f"0-6:{overview}"], out, max_compressed_tile_size=20000)
-        else:
-            tylertoo.export_pmtiles(str(overview), out, max_compressed_tile_size=20000)
+        run()
     assert len([w for w in raised if "outgrew" in str(w.message)]) == 1
+
+
+def test_a_failed_run_still_warns_about_unsorted_input(tmp_path):
+    """#768: the warning is raised when pass 1 finds it, so a run that then
+    fails still tells its caller to sort the input."""
+    source = _write_unsorted(tmp_path / "unsorted.parquet")
+    with (
+        pytest.warns(UserWarning, match="not sorted by location"),
+        pytest.raises(RuntimeError, match="feature"),
+    ):
+        tylertoo.convert(
+            str(source),
+            str(tmp_path / "failed.pmtiles"),
+            min_zoom=0,
+            max_zoom=4,
+            feature_id="geometry",
+        )

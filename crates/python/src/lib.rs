@@ -75,11 +75,6 @@ fn refresh_log_levels(py: Python<'_>) {
     let handle = LOG_RESET.get_or_init(py, || {
         pyo3_log::Logger::new(py, pyo3_log::Caching::LoggersAndLevels)
             .ok()?
-            // Raised as `UserWarning`s instead (`warn_user_diagnostics`).
-            .filter_target(
-                tylertoo_core::USER_WARNING_LOG_TARGET.to_owned(),
-                log::LevelFilter::Off,
-            )
             .install()
             .ok()
     });
@@ -211,30 +206,6 @@ fn report_dict<T: serde::Serialize>(py: Python<'_>, report: &T) -> PyResult<Py<P
     Ok(pythonize::pythonize(py, report)?
         .cast_into::<PyDict>()?
         .unbind())
-}
-
-/// The diagnostics core marks as user warnings (`Diagnostic::is_user_warning`:
-/// disk-shortage rechecks, unsorted input and a shed valve prediction, #768)
-/// arrive with a successful report; the log bridge drops their log records
-/// (`refresh_log_levels`). Raised as `UserWarning`s, deduplicated across
-/// report sections (including layered runs).
-fn warn_user_diagnostics<'a>(
-    py: Python<'_>,
-    diagnostics: impl IntoIterator<Item = &'a tylertoo_core::Diagnostic>,
-) -> PyResult<()> {
-    let mut seen = std::collections::HashSet::new();
-    for diagnostic in diagnostics.into_iter().filter(|d| d.is_user_warning()) {
-        let message = diagnostic.to_string();
-        if seen.insert(message.clone()) {
-            PyErr::warn(
-                py,
-                &py.get_type::<PyUserWarning>(),
-                &CString::new(message)?,
-                1,
-            )?;
-        }
-    }
-    Ok(())
 }
 
 /// Replace display-only JSON filenames with `PyO3`'s native filesystem paths.
@@ -369,7 +340,6 @@ fn convert(
         // The combined report (#439): the two halves the two-step chain's own
         // reports would carry, keyed like the CLI's `tiles --report` JSON.
         TilesOutcome::Converted(mut report) => {
-            warn_user_diagnostics(py, report.convert.diagnostics.iter().chain(&report.export.diagnostics))?;
             report.convert.source_losses = report.convert.source_losses
                 .for_python()
                 .map_err(accounting_error_to_py)?;
@@ -383,9 +353,6 @@ fn convert(
         },
         // #821: one report per layer, each keyed like a plain run's.
         TilesOutcome::Layered(mut report) => {
-            warn_user_diagnostics(py, report.layers.iter().flat_map(|layer| {
-                layer.report.convert.diagnostics.iter().chain(&layer.report.export.diagnostics)
-            }).chain(&report.diagnostics))?;
             // The layers share one run's allowance for inline loss lists.
             let parts = report.layers.len();
             for layer in &mut report.layers {
@@ -473,7 +440,6 @@ fn overview(
             }
         })
         .map_err(convert_error_to_py)?;
-    warn_user_diagnostics(py, &report.diagnostics)?;
 
     report.source_losses = report.source_losses
                 .for_python()
@@ -498,7 +464,6 @@ fn export_pmtiles(
     let mut report = py
         .detach(|| export_pmtiles_core(&input_path, &output_path, &options))
         .map_err(export_error_to_py)?;
-    warn_user_diagnostics(py, &report.diagnostics)?;
 
     report.source_losses = report.source_losses
                 .for_python()
@@ -606,7 +571,6 @@ fn pyramid(
     let report = py
         .detach(|| build_pyramid(&bands, &output_path, &options))
         .map_err(pyramid_error_to_py)?;
-    warn_user_diagnostics(py, &report.diagnostics)?;
     // The same shape as the CLI's `pyramid --report` JSON.
     report_dict(py, &report)
 }
@@ -717,67 +681,6 @@ fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(_run_cli, m)?)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod disk_warnings {
-    use super::*;
-
-    // Free-space probes use the real filesystem; the injected probes in
-    // core's disk tests are not available to a Python conversion. Exercise
-    // the frontend mapping directly with the report's typed wire shape.
-    #[test]
-    fn reported_disk_shortages_raise_user_warnings_once_per_message() {
-        Python::attach(|py| {
-            let warnings = py.import("warnings").unwrap();
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("record", true).unwrap();
-            let catch = warnings
-                .call_method("catch_warnings", (), Some(&kwargs))
-                .unwrap();
-            let records = catch.call_method0("__enter__").unwrap();
-            warnings.call_method1("simplefilter", ("always",)).unwrap();
-            let events: Vec<tylertoo_core::Diagnostic> = serde_json::from_value(
-                serde_json::json!([
-                    {"kind": "advisory", "count": 1, "message": "pre-read staging warning"},
-                    {"kind": "disk_shortage", "count": 1, "message": "projected disk footprint after pass 1 may not fit"},
-                    {"kind": "disk_shortage", "count": 1, "message": "projected disk footprint after pass 1 may not fit"},
-                    {"kind": "disk_shortage", "count": 1, "message": "another volume may not fit"},
-                    {"kind": "unsorted_input", "count": 1, "input": "in.parquet", "parts": 1, "ratio": 5.3}
-                ])
-            ).unwrap();
-            warn_user_diagnostics(py, &events).unwrap();
-            catch
-                .call_method1("__exit__", (py.None(), py.None(), py.None()))
-                .unwrap();
-            assert_eq!(records.len().unwrap(), 3);
-            let unsorted = events[4].to_string();
-            for (index, message) in [
-                "projected disk footprint after pass 1 may not fit",
-                "another volume may not fit",
-                unsorted.as_str(),
-            ]
-            .iter()
-            .enumerate()
-            {
-                let warning = records.get_item(index).unwrap();
-                assert!(warning
-                    .getattr("category")
-                    .unwrap()
-                    .is(py.get_type::<PyUserWarning>()));
-                assert_eq!(
-                    warning
-                        .getattr("message")
-                        .unwrap()
-                        .str()
-                        .unwrap()
-                        .to_str()
-                        .unwrap(),
-                    *message
-                );
-            }
-        });
-    }
 }
 
 #[cfg(test)]

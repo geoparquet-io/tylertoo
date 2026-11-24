@@ -1222,17 +1222,6 @@ pub(super) fn resolve_read_workers_with_cores(
 }
 
 impl ConvertOptions {
-    /// Check every option rule that needs no input file (#779): numeric
-    /// ranges, the level plan, mutually exclusive and mode-incompatible
-    /// options, the spill and plan paths. Every conversion entry point runs
-    /// this first; a front end that does work before converting (the `tiles`
-    /// facade, `--max-zoom auto`) calls it up front and fails in milliseconds.
-    ///
-    /// # Errors
-    ///
-    /// The first rule broken; every error this returns is
-    /// [`ErrorKind::Usage`](crate::error::ErrorKind::Usage).
-    /// Validate these options and return the immutable engine configuration.
     /// A data shard's read window: its range, and the margin past it in
     /// pivot tiles ([`Self::shard_buffer_margin_only`]).
     pub(crate) fn shard_read(&self) -> Option<crate::shard::ShardRead> {
@@ -1246,6 +1235,17 @@ impl ConvertOptions {
         })
     }
 
+    /// Check every option rule that needs no input file (#779): numeric
+    /// ranges, the level plan, mutually exclusive and mode-incompatible
+    /// options, the spill and plan paths. Every conversion entry point runs
+    /// this first; a front end that does work before converting (the `tiles`
+    /// facade, `--max-zoom auto`) calls it up front and fails in milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// The first rule broken; every error this returns is
+    /// [`ErrorKind::Usage`](crate::error::ErrorKind::Usage).
+    /// Validate these options and return the immutable engine configuration.
     #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConvertError> {
         super::config::validate_convert(self)

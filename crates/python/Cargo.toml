@@ -42,7 +42,6 @@ tylertoo-core = { workspace = true, features = ["remote", "serve"] }
 # nothing here.
 pyo3 = { workspace = true, features = ["abi3-py311"] }
 pyo3-log = { workspace = true }
-log = { workspace = true }
 # The CLI itself, as a library: `python -m tylertoo` calls `tylertoo_cli::run`
 # (#819). No default features: forward only the allocator policy features;
 # the extension installs the allocator itself.
