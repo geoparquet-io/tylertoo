@@ -96,6 +96,7 @@ macro_rules! spelled_enum {
         }
     };
 }
+pub(crate) use spelled_enum;
 spelled_enum!(TileFormat, "tile format", [Mvt, Mlt]);
 spelled_enum!(
     MltProfile,

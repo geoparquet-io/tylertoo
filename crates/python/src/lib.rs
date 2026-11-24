@@ -208,20 +208,18 @@ fn report_dict<T: serde::Serialize>(py: Python<'_>, report: &T) -> PyResult<Py<P
         .unbind())
 }
 
-/// Disk-shortage rechecks and unsorted input (#768) arrive with a successful
-/// report; core already logged them while running. Raised as `UserWarning`s,
-/// deduplicated across report sections (including layered runs).
+/// The diagnostics core marks as user warnings (`Diagnostic::is_user_warning`:
+/// disk-shortage rechecks, unsorted input and a shed valve prediction, #768)
+/// arrive with a successful report; core already logged them while running.
+/// Raised as `UserWarning`s, deduplicated across report sections (including
+/// layered runs).
 fn warn_user_diagnostics<'a>(
     py: Python<'_>,
     diagnostics: impl IntoIterator<Item = &'a tylertoo_core::Diagnostic>,
 ) -> PyResult<()> {
     let mut seen = std::collections::HashSet::new();
-    for diagnostic in diagnostics {
-        let message = match diagnostic {
-            tylertoo_core::Diagnostic::DiskShortage { message, .. } => message.clone(),
-            tylertoo_core::Diagnostic::UnsortedInput { .. } => diagnostic.to_string(),
-            _ => continue,
-        };
+    for diagnostic in diagnostics.into_iter().filter(|d| d.is_user_warning()) {
+        let message = diagnostic.to_string();
         if seen.insert(message.clone()) {
             PyErr::warn(
                 py,

@@ -718,12 +718,15 @@ pub tylertoo_core::Diagnostic::ValidationSkipped::count: usize
 pub tylertoo_core::Diagnostic::ValveDropped::count: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::ValveFloorsShed
 pub tylertoo_core::Diagnostic::ValveFloorsShed::count: usize
+pub tylertoo_core::Diagnostic::ValveFloorsShed::predictor: bool
+pub tylertoo_core::Diagnostic::ValveFloorsShed::scope: alloc::string::String
 #[non_exhaustive] pub tylertoo_core::Diagnostic::Wrapped
 pub tylertoo_core::Diagnostic::Wrapped::context: core::option::Option<tylertoo_core::RangeContext>
 pub tylertoo_core::Diagnostic::Wrapped::count: usize
 pub tylertoo_core::Diagnostic::Wrapped::exemplars: alloc::vec::Vec<tylertoo_core::OutOfRangeExemplar>
 impl tylertoo_core::Diagnostic
 pub fn tylertoo_core::Diagnostic::count(&self) -> usize
+pub fn tylertoo_core::Diagnostic::is_user_warning(&self) -> bool
 impl core::clone::Clone for tylertoo_core::Diagnostic
 pub fn tylertoo_core::Diagnostic::clone(&self) -> tylertoo_core::Diagnostic
 impl core::cmp::PartialEq for tylertoo_core::Diagnostic

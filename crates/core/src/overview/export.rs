@@ -155,7 +155,6 @@ use crate::compression;
 #[cfg(test)]
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::{
-    batch_processor::extract_geometries_from_array,
     clip::{clip_geometry_simple, geometry_is_simple},
     compression::{Compression, TileGzipCache},
     dedup::TileHasher,
@@ -294,8 +293,8 @@ pub const DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: usize = 500 * 1024;
 /// merged feature
 /// keeps the attributes of the feature it was merged into; the absorbed
 /// features' attributes are not carried. Points are never merged; a tile of
-/// points always takes the stride of [`SizeValve::Drop`]. See
-/// `overview::export::coalesce_valve`.
+/// points always takes [`SizeValve::Drop`], which keeps its best-ranked
+/// points. See `overview::export::coalesce_valve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum SizeValve {
@@ -396,26 +395,7 @@ impl ValveScope {
     }
 }
 
-impl std::fmt::Display for ValveScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ValveScope {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "smooth" => Ok(Self::Smooth),
-            "tile" => Ok(Self::Tile),
-            "zoom" => Ok(Self::Zoom),
-            other => Err(format!(
-                "unknown valve scope {other:?}: expected smooth, tile or zoom"
-            )),
-        }
-    }
-}
+crate::tile_format::spelled_enum!(ValveScope, "valve scope", [Smooth, Tile, Zoom]);
 
 use crate::tile::WEBMERC_HALF_M;
 pub use crate::tile_format::{MltProfile, TileFormat};
@@ -844,12 +824,6 @@ impl Default for ExportOptions {
 }
 
 impl ExportOptions {
-    /// What a `smooth` valve floor keeps of itself one ring further out
-    /// (#768): `1 / valve_max_step`.
-    pub(crate) fn valve_fade(&self) -> f64 {
-        self.valve_max_step.recip()
-    }
-
     pub(crate) fn has_tile_size_cap(&self) -> bool {
         self.tile_size_limit.is_some_and(|cap| cap > 0)
             || self.compressed_tile_size_limit.is_some_and(|cap| cap > 0)
@@ -2301,17 +2275,21 @@ pub fn export_pmtiles(
 }
 
 /// #768: the valve floors an export of `overview` under `options` starts
-/// its tiles from, keyed `(zoom, tile id)`: for the shard parity oracle,
-/// which compares a shard's floors with the monolithic build's.
+/// its tiles from, keyed `(zoom, tile id)`, as `(merge, drop)`: for the
+/// shard parity oracle, which compares a shard's floors with the monolithic
+/// build's.
 ///
 /// # Errors
 ///
 /// As [`export_pmtiles`], for the scan and the price samples.
 #[doc(hidden)]
+pub type FloorPair = (u64, u64);
+
+#[doc(hidden)]
 pub fn predicted_valve_floors(
     overview: &Path,
     options: &ExportOptions,
-) -> Result<BTreeMap<(u8, u64), u64>, ExportError> {
+) -> Result<BTreeMap<(u8, u64), FloorPair>, ExportError> {
     let diagnostics = crate::diagnostics::Diagnostics::default();
     let reader = OverviewReader::open(overview)?;
     let crs = crs_from_descriptor(reader.resolved_schema(), overview, &diagnostics)?;
@@ -2333,9 +2311,14 @@ pub fn predicted_valve_floors(
         &diagnostics,
     )?;
     Ok(floors
+        .merge
         .tiles
-        .into_iter()
-        .map(|((z, x, y), floor)| ((z, tile_key(x, y, z)), floor))
+        .keys()
+        .chain(floors.drop.tiles.keys())
+        .map(|&(z, x, y)| {
+            let f = floors.for_tile((z, x, y));
+            ((z, tile_key(x, y, z)), (f.merge, f.drop))
+        })
         .collect())
 }
 
@@ -3891,7 +3874,7 @@ fn scan_with_floors(
     } else {
         predict_floors(reader, cols, crs, (options, level_zooms), &p, budget).map(|f| {
             f.unwrap_or_else(|| {
-                warn_floors_shed("its floors", diagnostics);
+                warn_floors_shed(false, options, diagnostics);
                 valve_predict::ValveFloors::default()
             })
         })
@@ -3906,18 +3889,19 @@ fn scan_with_floors(
     Ok((scans, floors))
 }
 
-/// #768: say loudly that the `--valve-scope` floors did not fit the
-/// export's memory budget (`what` outgrew it), what that costs, and how to
-/// avoid it.
-fn warn_floors_shed(what: &str, diagnostics: &crate::diagnostics::Diagnostics) {
-    log::warn!(
-        "[export] --valve-scope: {what} outgrew the export's memory budget, so this export \
-         runs as --valve-scope tile: each tile is thinned only as much as it needs on its own, \
-         and the density can jump at the edge of every tile over the size cap. To keep the \
-         smooth edges, give the export more memory (a machine or cgroup with more RAM, or --profile speed), \
-         raise --valve-max-step (shorter reach), or pass --valve-scope tile to silence this"
-    );
-    diagnostics.record(crate::diagnostics::Diagnostic::ValveFloorsShed { count: 1 });
+/// #768: say loudly (the diagnostic logs itself) that the `--valve-scope`
+/// predictor's scan state, or the floors it predicted, did not fit the
+/// export's memory budget, and that the export runs as `tile`.
+fn warn_floors_shed(
+    predictor: bool,
+    opts: &ExportOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
+    diagnostics.record(crate::diagnostics::Diagnostic::ValveFloorsShed {
+        count: 1,
+        scope: opts.valve_scope.to_string(),
+        predictor,
+    });
 }
 
 /// #768: drop the predictor's dense state when it outgrows what the scan
@@ -3926,6 +3910,7 @@ fn warn_floors_shed(what: &str, diagnostics: &crate::diagnostics::Diagnostics) {
 fn shed_over_budget(
     p: &mut valve_predict::Scan,
     (budget, profile): (&MemoryBudget, MemoryProfile),
+    opts: &ExportOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) {
     if p.is_shed() {
@@ -3937,7 +3922,8 @@ fn shed_over_budget(
         .is_err()
     {
         p.shed();
-        warn_floors_shed(&format!("its predictor ({held} bytes)"), diagnostics);
+        log::info!("[export] valve predictor state: {held} bytes, over the scan's budget");
+        warn_floors_shed(true, opts, diagnostics);
     }
 }
 
@@ -4011,9 +3997,10 @@ fn predict_floors(
             .unwrap_or(usize::MAX);
     let floors = valve_predict::valve_floors(&need, options, max_floors);
     log::info!(
-        "[export] valve floors: {} tiles priced ({} by a larger sample), {} predicted over a cap, {} floors, {:.2}s (first sample {:.2}s; scan share {:.2}s)",
+        "[export] valve floors: {} tiles priced ({} by a larger sample, {} by neither: their rows clip empty), {} predicted over a cap, {} floors, {:.2}s (first sample {:.2}s; scan share {:.2}s)",
         bytes.len(),
         candidates.len(),
+        need.unpriced,
         need.len(),
         floors.as_ref().map_or(0, valve_predict::ValveFloors::len),
         t.elapsed().as_secs_f64(),
@@ -4136,12 +4123,15 @@ fn valve_sample_rows(
                                 .map(Option::flatten)
                                 .collect()
                         }
-                        ScanBboxSource::Geometry => decode_batch_bboxes(
-                            &batch,
-                            published.geometry.as_deref(),
-                            crs,
-                            &diagnostics,
-                        )?,
+                        ScanBboxSource::Geometry => {
+                            let (sized, rows) = decode_batch_bboxes(
+                                &batch,
+                                published.geometry.as_deref(),
+                                crs,
+                                &diagnostics,
+                            )?;
+                            rows.unwrap_or(sized)
+                        }
                     };
                     for row in lo.max(base) - base..=hi.min(base + m - 1) - base {
                         let Some(Some(b)) = bboxes.get(row as usize) else {
@@ -7046,7 +7036,7 @@ fn encode_buckets(
 /// from the geometry from the start.
 #[expect(
     clippy::too_many_arguments,
-    reason = "#768: the merge predictor rides along like variable depth"
+    reason = "#768: the valve predictor rides along like variable depth"
 )]
 fn scan_all_levels(
     reader: &OverviewReader,
@@ -7146,7 +7136,7 @@ impl ScanBboxSource {
 /// ([`covering_batch_bboxes`]) and the pass is abandoned.
 #[expect(
     clippy::too_many_arguments,
-    reason = "#768: the merge predictor rides along like variable depth"
+    reason = "#768: the valve predictor rides along like variable depth"
 )]
 fn scan_all_levels_from(
     (reader, band): (&OverviewReader, BandRead<'_>),
@@ -7304,12 +7294,17 @@ fn scan_all_levels_from(
                 // band; sizing the same bbox into every target level below is
                 // bit-identical to reprojecting it once per level, since
                 // reprojection is a pure fn.
+                // A geometry batch with a null row: its rows row-aligned too.
+                let mut aligned: Option<Bboxes> = None;
                 let bboxes = ExportTimers::time(&timers.scan_decode, || match source {
                     ScanBboxSource::Covering { column, names } => {
                         covering_batch_bboxes(&batch, column, names, crs)
                     }
                     ScanBboxSource::Geometry => {
-                        decode_batch_bboxes(&batch, geometry, crs, diagnostics).map(Some)
+                        let (sized, rows) =
+                            decode_batch_bboxes(&batch, geometry, crs, diagnostics)?;
+                        aligned = rows;
+                        Ok(Some(sized))
                     }
                 })?;
                 let Some(bboxes) = bboxes else {
@@ -7362,8 +7357,9 @@ fn scan_all_levels_from(
                 }
                 if let Some(p) = predict_ref.as_deref_mut() {
                     // #768 predict: row-aligned, so a tile's sample rows are
-                    // its band rows. A covering batch with no null row is
-                    // aligned already; decode it again only to keep nulls.
+                    // its band rows. A batch with no null row is aligned
+                    // already; a covering one is decoded again only to keep
+                    // its nulls.
                     let last = if partitioning { num_levels - 1 } else { j };
                     match source {
                         ScanBboxSource::Covering { column, names }
@@ -7372,9 +7368,15 @@ fn scan_all_levels_from(
                             let rows = covering_row_bboxes(&batch, column, names, crs)?;
                             p.batch(j, &rows, j..=last, zooms_ref, opts);
                         }
-                        _ => p.batch(j, &bboxes, j..=last, zooms_ref, opts),
+                        _ => p.batch(
+                            j,
+                            aligned.as_deref().unwrap_or(&bboxes),
+                            j..=last,
+                            zooms_ref,
+                            opts,
+                        ),
                     }
-                    shed_over_budget(p, (&band.budget, band.profile), diagnostics);
+                    shed_over_budget(p, (&band.budget, band.profile), opts, diagnostics);
                 }
                 if j != pending_band {
                     size_pending(pending_band, &mut pending);
@@ -7394,7 +7396,7 @@ fn scan_all_levels_from(
     // ([`scan_with_floors`]).
     if let Some(p) = predict {
         p.flush(zooms_ref, opts);
-        shed_over_budget(p, (&band.budget, band.profile), diagnostics);
+        shed_over_budget(p, (&band.budget, band.profile), opts, diagnostics);
     }
     #[cfg(test)]
     BAND_READ_WORKERS.with(|w| w.set(readers));
@@ -7529,30 +7531,49 @@ pub(super) fn geometry_lnglat_bbox(geom: &Geometry<f64>, crs: Crs) -> Option<Til
         .map(|r| lnglat_bbox(r.min().x, r.min().y, r.max().x, r.max().y, crs))
 }
 
+/// Per-row bboxes, `None` for a row without one.
+type Bboxes = Vec<Option<TileBounds>>;
+
 /// Decode one record batch's geometries into per-feature bounding boxes,
 /// already reprojected to lon/lat (EPSG:4326) when the file is EPSG:3857 —
 /// element `i` is `None` when feature `i` has no bounding rectangle
 /// (empty/degenerate). Reprojecting the two bbox corners is monotone per axis,
 /// hence bit-identical to the bbox of the reprojected geometry.
+///
+/// With them, when a null geometry (which they drop) makes the two differ,
+/// the same rows row-aligned, `None` for a null row (#768: the valve
+/// predictor addresses a tile's sample rows by their place in the file).
 fn decode_batch_bboxes(
     batch: &RecordBatch,
     geometry: Option<&str>,
     crs: Crs,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<Vec<Option<TileBounds>>, ExportError> {
+) -> Result<(Bboxes, Option<Bboxes>), ExportError> {
     let schema = batch.schema();
     let geom_idx = batch_geometry_index(batch, geometry)?;
     let geom_field = schema.field(geom_idx).clone();
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
             .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
-    let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
-    extract_geometries_from_array(garr.as_ref(), &mut geoms, diagnostics)?;
-    let bboxes = geoms
+    let mut geoms: Vec<Option<Geometry<f64>>> = Vec::with_capacity(batch.num_rows());
+    crate::batch_processor::extract_geometries_opt_from_array(
+        garr.as_ref(),
+        &mut geoms,
+        diagnostics,
+    )?;
+    let rows: Bboxes = geoms
         .par_iter()
-        .map(|geom| geometry_lnglat_bbox(geom, crs))
+        .map(|geom| geom.as_ref().and_then(|g| geometry_lnglat_bbox(g, crs)))
         .collect();
-    Ok(bboxes)
+    if geoms.iter().all(Option::is_some) {
+        return Ok((rows, None));
+    }
+    let sized = rows
+        .iter()
+        .zip(&geoms)
+        .filter_map(|(b, g)| g.as_ref().map(|_| *b))
+        .collect();
+    Ok((sized, Some(rows)))
 }
 
 /// Every tile key one feature with `bbox` is a member of at `zoom`, once each.
@@ -7704,7 +7725,7 @@ fn scan_level(
         tile_counts: BTreeMap::new(),
     };
     for batch in batch_reader {
-        let bboxes = decode_batch_bboxes(
+        let (bboxes, _) = decode_batch_bboxes(
             &batch.map_err(|e| read_error(e.into()))?,
             geometry_name(reader),
             crs,
@@ -10500,10 +10521,10 @@ impl<T: TileFeature + ?Sized> TileFeature for &T {
 struct TileEncoding<'a> {
     options: &'a ExportOptions,
     layers: &'a [(u16, String)],
-    /// #768: every tile's valve floor (`--valve-scope smooth|zoom`).
+    /// #768: every tile's valve floors (`--valve-scope smooth|zoom`).
     floors: Option<&'a valve_predict::ValveFloors>,
-    /// The valve floor of the tile being encoded.
-    floor: u64,
+    /// The valve floors of the tile being encoded.
+    floor: valve_predict::TileFloor,
 }
 
 impl<'a> TileEncoding<'a> {
@@ -10513,7 +10534,7 @@ impl<'a> TileEncoding<'a> {
             options,
             layers: &[],
             floors: None,
-            floor: 0,
+            floor: valve_predict::TileFloor::default(),
         }
     }
 
@@ -10525,9 +10546,11 @@ impl<'a> TileEncoding<'a> {
         }
     }
 
-    /// For tile `(zoom, x, y)`: its own floor.
+    /// For tile `(zoom, x, y)`: its own floors.
     fn for_tile(self, zoom: u8, x: u32, y: u32) -> Self {
-        let floor = self.floors.map_or(0, |f| f.get((zoom, x, y)));
+        let floor = self
+            .floors
+            .map_or_else(Default::default, |f| f.for_tile((zoom, x, y)));
         Self { floor, ..self }
     }
 }
@@ -11100,7 +11123,7 @@ fn with_fill(
 
 /// #768: whether the export scan predicts valve floors: under
 /// `--valve-scope smooth` or `zoom`, with a cap in force.
-fn valve_predicts(opts: &ExportOptions) -> bool {
+pub(crate) fn valve_predicts(opts: &ExportOptions) -> bool {
     opts.valve_scope != ValveScope::Tile && opts.has_tile_size_cap()
 }
 
@@ -11188,11 +11211,13 @@ fn drop_keep(keep: usize, fit: f64, cut: u32) -> usize {
 /// One grid unit per pixel on a 512-pixel tile before losing whole features.
 const MIN_VALVE_EXTENT: u32 = 512;
 
-/// The drop valve. Under `--size-valve drop` a point tile with a #768 floor
-/// first keeps the share of its members the floor sets
+/// The drop valve. A point tile with a #768 drop floor, under either
+/// `--size-valve`, first keeps the share of its members the floor sets
 /// ([`kept_at_floor`]), before its first encode and whether or not it
 /// would fit without it: the floor is how the tiles around a dense one
-/// fade toward it. Then [`drop_members_to_fit`] holds the cap.
+/// fade toward it. Then [`drop_members_to_fit`] holds the cap. The tile
+/// counts as oversized when it was predicted over its cap on its own or the
+/// cap made it shed more; a fit tile its neighbours' floor thinned does not.
 fn drop_to_fit(
     gzip_cache: &Arc<TileGzipCache>,
     members: &[Member],
@@ -11202,25 +11227,28 @@ fn drop_to_fit(
     fill_tally: &mut FillTally,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> TileMvt {
-    if opts.floor == 0 || opts.size_valve != SizeValve::Drop || !is_point_like(members) {
+    if opts.floor.drop == 0 || !is_point_like(members) {
         return drop_members_to_fit(gzip_cache, members, tb, opts, fill, fill_tally, diagnostics);
     }
-    let kept = kept_at_floor(members, opts.floor);
+    let kept = kept_at_floor(members, opts.floor.drop);
     let mut mvt = drop_members_to_fit(gzip_cache, &kept, tb, opts, fill, fill_tally, diagnostics);
     let shed = members.len() - kept.len();
     mvt.valve.dropped += shed;
-    mvt.oversized |= shed > 0;
+    mvt.oversized |= shed > 0 && opts.floor.own;
     mvt
 }
 
-/// #768: the members a point tile keeps at drop floor `floor`: those whose
-/// [`point_rank`] is below the share `KEEP_ALL / floor` of `2^64` (all at or
-/// under [`valve_predict::KEEP_ALL`]; at least the best-ranked one). The
-/// share is a threshold on the point's own rank, not a count of the tile's
-/// members, so a point kept at one share is kept at every larger share, in
-/// any tile and zoom that holds it, and tiles at one share keep the same
-/// points along their edges. The size ladder after it still holds the cap
-/// when the floor kept too many.
+/// #768: the members a point tile keeps at drop floor `floor`: the share
+/// `KEEP_ALL / floor` of them (all at or under [`valve_predict::KEEP_ALL`];
+/// at least one) with the best [`point_rank`]. The rank is the point's own,
+/// so a larger share keeps a superset of a smaller one, and a tile and its
+/// child, or two neighbours, at one share keep nearly the same points: on
+/// Hilbert-sorted input each holds long runs of rows, whose bit-reversed
+/// ranks spread evenly. A count, not a threshold on the rank itself: rows a
+/// filter or the convert's thinning left with gaps (every odd row, say)
+/// rank all above any fixed threshold, and a threshold would keep one
+/// point. The size ladder after it still holds the cap when the floor kept
+/// too many.
 ///
 /// DIVERGENCE FROM TIPPECANOE: `--drop-densest-as-needed` drops below one
 /// gap threshold per zoom and raises it until every tile fits, which thins
@@ -11233,15 +11261,8 @@ fn kept_at_floor(members: &[Member], floor: u64) -> Vec<&Member> {
     if floor <= valve_predict::KEEP_ALL {
         return members.iter().collect();
     }
-    let below = (u128::from(valve_predict::KEEP_ALL) << 64) / u128::from(floor);
-    let kept: Vec<&Member> = members
-        .iter()
-        .filter(|m| u128::from(m.rank) < below)
-        .collect();
-    if kept.is_empty() {
-        return select_kept_by_rank(members, 1, |m| m.rank);
-    }
-    kept
+    let keep = members.len() as u128 * u128::from(valve_predict::KEEP_ALL) / u128::from(floor);
+    select_kept_by_rank(members, keep as usize, |m| m.rank)
 }
 
 /// The drop valve: while the tile is over its limit, keep a proportional
@@ -11261,29 +11282,8 @@ fn drop_members_to_fit<M: TileFeature + std::borrow::Borrow<Member>>(
     fill_tally: &mut FillTally,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> TileMvt {
-    let full = build_tile_layers(gzip_cache, opts.layers, members, tb, opts, &[], diagnostics);
-    drop_encoded_to_fit(
-        gzip_cache,
-        (members, full),
-        tb,
-        opts,
-        fill,
-        fill_tally,
-        diagnostics,
-    )
-}
-
-/// [`drop_members_to_fit`] from `members`' encode, `full`, already made.
-fn drop_encoded_to_fit<M: TileFeature + std::borrow::Borrow<Member>>(
-    gzip_cache: &Arc<TileGzipCache>,
-    (members, mut full): (&[M], TileMvt),
-    tb: &TileBounds,
-    opts: &TileEncoding<'_>,
-    fill: &[FillFeature],
-    fill_tally: &mut FillTally,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) -> TileMvt {
     let layers = opts.layers;
+    let mut full = build_tile_layers(gzip_cache, layers, members, tb, opts, &[], diagnostics);
     let mut fit = tile_fit(&mut full, opts).unwrap_or(f64::INFINITY);
     if fit >= 1.0 || members.len() <= 1 {
         // One encode, as the merge valve counts a tile that fits at once.
@@ -11457,7 +11457,7 @@ fn merge_to_fit(
     };
     let mut gaps: Option<Vec<u64>> = None;
     // #768: `--valve-scope smooth` starts the ladder at the tile's floor.
-    let mut mingap = opts.floor;
+    let mut mingap = opts.floor.merge;
     let mut keep_fraction = 1.0_f64;
     let mut prev_fit: Option<f64> = None;
     let mut stalls = 0u32;
@@ -11480,8 +11480,10 @@ fn merge_to_fit(
         };
         if fit >= 1.0 {
             let fitted = TileMvt {
-                // #768: a floored first pass that merged acted as the valve.
-                oversized: passes > 1 || absorbed > 0,
+                // #768: a floored first pass that merged acted as the valve
+                // when the tile was predicted over on its own; a fit tile
+                // its neighbours' floor merged is not oversized.
+                oversized: passes > 1 || (absorbed > 0 && opts.floor.own),
                 valve: tally,
                 ..mvt
             };
@@ -12189,7 +12191,7 @@ fn decode_batch(
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
             .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
     let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
-    extract_geometries_from_array(
+    crate::batch_processor::extract_geometries_from_array(
         garr.as_ref(),
         &mut geoms,
         &crate::diagnostics::Diagnostics::default(),
@@ -16434,6 +16436,16 @@ mod tests {
         level_geoms: &[Vec<Option<Geometry<f64>>>],
         mode: Mode,
     ) -> OverviewsMeta {
+        write_opt_batches(path, level_geoms, mode, 3)
+    }
+
+    /// [`write_mode_fixture_opt`] in row groups of up to `max_row_group_size`.
+    fn write_opt_batches(
+        path: &Path,
+        level_geoms: &[Vec<Option<Geometry<f64>>>],
+        mode: Mode,
+        max_row_group_size: usize,
+    ) -> OverviewsMeta {
         let schema = Arc::new(source_schema());
         let mut next_id = 0i64;
         let batches = level_geoms.iter().map(|geoms| {
@@ -16453,7 +16465,7 @@ mod tests {
             )
             .unwrap()
         });
-        write_mode_batches(path, mode, 3, batches)
+        write_mode_batches(path, mode, max_row_group_size, batches)
     }
 
     fn square(x: f64, y: f64, w: f64) -> geo::Polygon<f64> {
@@ -16601,20 +16613,7 @@ mod tests {
         Vec<crate::diagnostics::Diagnostic>,
     ) {
         let input = tempfile::NamedTempFile::new().unwrap();
-        // The same grid in two z2 tiles, side by side.
-        let squares: Vec<Geometry<f64>> = (0..12_000)
-            .map(|i| {
-                let east = if i < 6_000 { 0.0 } else { 90.0 };
-                let i = i % 6_000;
-                let (x, y) = (
-                    east + 1.0 + f64::from(i % 100) * 0.8,
-                    1.0 + f64::from(i / 100),
-                );
-                let d = 0.2 + f64::from((i * 7919) % 13) * 0.02;
-                Geometry::Polygon(geo::Rect::new((x, y), (x + d, y + d)).to_polygon())
-            })
-            .collect();
-        let mut squares = squares;
+        let mut squares = two_tile_squares();
         if let Some(at) = hollow {
             let l = LineString::from(vec![
                 (-10.0, 1.0),
@@ -16629,7 +16628,36 @@ mod tests {
         }
         let n = squares.len() as i64;
         write_fixture(input.path(), &[((0..n).collect(), squares)]);
-        let reader = OverviewReader::open(input.path()).unwrap();
+        floors_of_file(input.path(), budget)
+    }
+
+    /// The 12,000 squares of [`floored_scan`]: one grid in each of two z2
+    /// tiles, side by side, west first.
+    fn two_tile_squares() -> Vec<Geometry<f64>> {
+        (0..12_000)
+            .map(|i| {
+                let east = if i < 6_000 { 0.0 } else { 90.0 };
+                let i = i % 6_000;
+                let (x, y) = (
+                    east + 1.0 + f64::from(i % 100) * 0.8,
+                    1.0 + f64::from(i / 100),
+                );
+                let d = 0.2 + f64::from((i * 7919) % 13) * 0.02;
+                Geometry::Polygon(geo::Rect::new((x, y), (x + d, y + d)).to_polygon())
+            })
+            .collect()
+    }
+
+    /// [`floored_scan`]'s scan and floors of the overview at `path`.
+    fn floors_of_file(
+        path: &Path,
+        budget: &mut MemoryBudget,
+    ) -> (
+        Vec<LevelScan>,
+        valve_predict::ValveFloors,
+        Vec<crate::diagnostics::Diagnostic>,
+    ) {
+        let reader = OverviewReader::open(path).unwrap();
         let zooms = resolve_level_zooms(reader.meta(), reader.num_levels()).unwrap();
         let opts = ExportOptions {
             tile_size_limit: Some(20_000),
@@ -16677,6 +16705,7 @@ mod tests {
             let mut budget = MemoryBudget::with_available(Some(64 << 30));
             floored_scan_of(&mut budget, hollow)
                 .1
+                .merge
                 .tiles
                 .get(&west)
                 .copied()
@@ -16687,6 +16716,35 @@ mod tests {
         // need as its floor.
         let hollow = floor(Some(1_099)).expect("a floor") as f64;
         assert!(hollow / whole > 0.75, "{hollow} against {whole}");
+    }
+
+    /// #768: an overview with no usable bbox covering is scanned from its
+    /// geometry, which drops null rows; the predictor still addresses each
+    /// tile's price rows by their place in the file, so the geometry scan
+    /// predicts the floors the covering scan does over nulls before the east
+    /// tile. Read 2,000 rows early, the east tile's price rows would be the
+    /// west tile's and the nulls: no member of it, so no need of its own.
+    #[test]
+    fn nulls_before_a_tile_leave_a_geometry_scans_floors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut geoms: Vec<Option<Geometry<f64>>> =
+            two_tile_squares().into_iter().map(Some).collect();
+        geoms.splice(6_000..6_000, std::iter::repeat_n(None, 2_000));
+        let with = dir.path().join("with.parquet");
+        let without = dir.path().join("without.parquet");
+        write_opt_batches(&with, &[geoms], Mode::Duplicating, 10_000);
+        rewrite_with_float32_covering(&with, &without);
+        assert_eq!(
+            ScanBboxSource::for_reader(&OverviewReader::open(&without).unwrap()),
+            ScanBboxSource::Geometry
+        );
+        let floors = |path: &Path| {
+            let mut budget = MemoryBudget::with_available(Some(64 << 30));
+            floors_of_file(path, &mut budget).1
+        };
+        let want = floors(&with);
+        assert_eq!(want.merge.own.len(), 2, "{want:?}");
+        assert_eq!(floors(&without), want);
     }
 
     /// #768: the price samples are taken a chunk of tiles at a time, as
@@ -16701,7 +16759,7 @@ mod tests {
             (floors, SAMPLE_CHUNKS.with(std::cell::Cell::get) - before)
         };
         let (roomy, whole) = chunks(64 << 30);
-        assert!(roomy.tiles.len() >= 2, "{roomy:?}");
+        assert!(roomy.merge.tiles.len() >= 2, "{roomy:?}");
         // Two priced tiles, both candidates: one chunk a sample.
         assert_eq!(whole, 2);
         // 64 KiB holds one tile's first sample, not two.
@@ -16722,7 +16780,11 @@ mod tests {
         assert!(floors.is_empty());
         assert_eq!(
             diagnostics,
-            vec![crate::diagnostics::Diagnostic::ValveFloorsShed { count: 1 }]
+            vec![crate::diagnostics::Diagnostic::ValveFloorsShed {
+                count: 1,
+                scope: "smooth".into(),
+                predictor: true,
+            }]
         );
         let counts = |s: &[LevelScan]| s.iter().map(|l| l.tile_counts.clone()).collect::<Vec<_>>();
         assert_eq!(counts(&scans), counts(&want));
@@ -16752,7 +16814,12 @@ mod tests {
         // Room for the dense tile's state, not for 200,000 counts.
         let budget = MemoryBudget::with_available(Some(4 << 20));
         let diagnostics = crate::diagnostics::Diagnostics::default();
-        shed_over_budget(&mut p, (&budget, MemoryProfile::Bounded), &diagnostics);
+        shed_over_budget(
+            &mut p,
+            (&budget, MemoryProfile::Bounded),
+            &opts,
+            &diagnostics,
+        );
         assert!(!p.is_shed(), "{} bytes", p.resident_bytes());
         assert!(diagnostics.snapshot().is_empty());
     }
@@ -20420,7 +20487,6 @@ mod tests {
     #[test]
     fn valve_max_step_is_a_finite_ratio_above_one() {
         assert_eq!(ExportOptions::default().valve_max_step, 2.0);
-        assert_eq!(ExportOptions::default().valve_fade(), 0.5);
         for ok in [1.000_1, 1.25, 2.0, 1e9] {
             let opts = ExportOptions::default().with_valve_max_step(ok);
             assert!(opts.check().is_ok(), "{ok}");
@@ -20504,7 +20570,10 @@ mod tests {
             ..Default::default()
         };
         let floors = valve_predict::ValveFloors {
-            tiles: HashMap::from([((10, 512, 511), 101)]),
+            merge: valve_predict::Floors {
+                tiles: HashMap::from([((10, 512, 511), 101)]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let encode = |floors| {
@@ -20533,8 +20602,12 @@ mod tests {
         // Gaps 1..=100 sit under the floor of 101.
         assert_eq!((v.merged, v.passes), (100, 1), "{v:?}");
         assert_eq!(v.over_limit, 0, "{v:?}");
-        // The floor merged: the valve acted, as the drop valve counts it.
-        assert!(floored.oversized, "{v:?}");
+        // A neighbour's floor merged a tile that fits on its own: not an
+        // oversized tile. Its own predicted need would make it one.
+        assert!(!floored.oversized, "{v:?}");
+        let mut own = floors.clone();
+        own.merge.own.insert((10, 512, 511));
+        assert!(encode(Some(&own)).oversized);
     }
 
     /// #768: a merge floor short of what a binding cap needs is only where
@@ -20557,7 +20630,10 @@ mod tests {
             })
             .collect();
         let floors = valve_predict::ValveFloors {
-            tiles: HashMap::from([((10, 512, 511), 101)]),
+            merge: valve_predict::Floors {
+                tiles: HashMap::from([((10, 512, 511), 101)]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let encode = |opts: &ExportOptions, floors| {
@@ -20681,32 +20757,34 @@ mod tests {
         }
         let priced: Vec<u64> = scan.priced().iter().map(|t| t.key).collect();
         assert_eq!(priced.len(), 3, "{priced:?}");
-        let need = scan.predict(&zooms, &bytes, &opts);
+        let needs = scan.predict(&zooms, &bytes, &opts);
+        let need = &needs.drop;
         assert!(need.contains_key(&a) && need.contains_key(&b), "{need:?}");
-        let floors = valve_predict::valve_floors(&need, &opts, usize::MAX).unwrap();
+        let floors = valve_predict::valve_floors(&needs, &opts, usize::MAX).unwrap();
+        let floors_of = |k| floors.drop.get(k);
         // One fade rule: each need halves a ring, onto every tile in reach,
         // until it is back to keep-all.
         let fade = |k: valve_predict::Key, d: i32| {
             need.get(&k)
                 .map_or(0, |&n| (n as f64 * 0.5f64.powi(d)) as u64)
         };
-        assert_eq!(floors.get(b), need[&a] / 2);
-        assert!(floors.get(b) > need[&b], "the denser neighbour binds");
+        assert_eq!(floors_of(b), need[&a] / 2);
+        assert!(floors_of(b) > need[&b], "the denser neighbour binds");
         assert_eq!(
-            floors.get(west),
+            floors_of(west),
             fade(a, 1),
             "a tile that fits is floored too"
         );
         let two_out = fade(a, 2).max(fade(b, 1));
         assert!(two_out > valve_predict::KEEP_ALL, "{two_out}");
-        assert_eq!(floors.get((10, 542, 483)), two_out, "the fade goes on");
+        assert_eq!(floors_of((10, 542, 483)), two_out, "the fade goes on");
 
         // The over-cap tile, encoded as the export does with its floor: it
         // keeps the share the dense neighbour's halved floor implies, which
         // fits, so nothing more drops.
         let thinned = encode(&on_pairs, &opts, Some(&floors), b);
-        let keep = kept_at_floor(&on_pairs, floors.get(b)).len();
-        let share = 25_088 * valve_predict::KEEP_ALL / floors.get(b);
+        let keep = kept_at_floor(&on_pairs, floors_of(b)).len();
+        let share = 25_088 * valve_predict::KEEP_ALL / floors_of(b);
         assert!(
             keep.abs_diff(share as usize) < 25_088 / 100,
             "{keep} {share}"
@@ -20721,9 +20799,13 @@ mod tests {
         let west_mvt = encode(&on_sparse, &opts, Some(&floors), west);
         assert_eq!(
             west_mvt.valve.dropped,
-            on_sparse.len() - kept_at_floor(&on_sparse, floors.get(west)).len()
+            on_sparse.len() - kept_at_floor(&on_sparse, floors_of(west)).len()
         );
         assert!(west_mvt.valve.dropped > 0 && west_mvt.data.len() <= cap);
+        assert!(
+            !west_mvt.oversized,
+            "a tile that fits, thinned only by its neighbour's floor, is not oversized"
+        );
         // `tile` sets no floors: the plain drop valve thins it by rank.
         let alone = encode(&on_pairs, &opts, None, b);
         assert!(alone.valve.dropped > 0, "{:?}", alone.valve);
@@ -20798,10 +20880,16 @@ mod tests {
         (valve_predict::KEEP_ALL as f64 / share) as u64
     }
 
+    /// How many of `want` `got` lacks.
+    fn lacks(got: &[u64], want: &[u64]) -> usize {
+        want.iter().filter(|r| !got.contains(r)).count()
+    }
+
     /// #768: point thinning keeps points by a rank of their own, not a
     /// stride counted from each tile's first member: a point a tile keeps
     /// is kept by a child tile that keeps at least the same share, and two
-    /// tiles at one share keep, between them, what their union would.
+    /// tiles at one share keep, between them, what their union would, but
+    /// for the odd point where a tile's count rounds.
     #[test]
     fn point_thinning_nests_across_zooms_and_agrees_at_tile_edges() {
         let parent = run_of_points(0..4_096);
@@ -20812,9 +20900,9 @@ mod tests {
             .into_iter()
             .filter(|r| (1_000..2_100).contains(r))
             .collect();
-        assert_eq!(
-            kept_rows(&kept_at_floor(&child, share_floor(1.0 / 8.0))),
-            in_child,
+        let at_parents = kept_rows(&kept_at_floor(&child, share_floor(1.0 / 8.0)));
+        assert!(
+            lacks(&at_parents, &in_child) <= 1,
             "the child at the parent's share keeps the parent's points"
         );
         let deeper = kept_rows(&kept_at_floor(&child, share_floor(0.3)));
@@ -20825,7 +20913,8 @@ mod tests {
             &run_of_points(1_500..4_096),
             share_floor(0.125),
         )));
-        assert_eq!(halves, kept_rows(&kept));
+        assert!(lacks(&halves, &kept_rows(&kept)) <= 1);
+        assert!(halves.len().abs_diff(kept.len()) <= 1);
         // The ladder after the floor keeps nested counts too.
         let few = kept_rows(&select_kept_members(&child, 50));
         let more = kept_rows(&select_kept_members(&child, 200));
@@ -20878,15 +20967,17 @@ mod tests {
             proptest::prop_assert!(whole.iter().all(|r| wider.contains(r)));
             let mut halves = kept_rows(&kept_at_floor(&left, share_floor(low)));
             halves.extend(kept_rows(&kept_at_floor(&right, share_floor(low))));
-            // Beyond the run's points, only a half whose share kept none
-            // keeps one more: its best-ranked point.
+            // Each half's count rounds on its own, and a half keeps at least
+            // one point; the rank's even spread (a van der Corput sequence)
+            // bounds where the whole run's cut falls in each half.
+            let slack = 2 + (len as f64).log2() as usize;
             proptest::prop_assert!(halves.len() <= whole.len() + 2);
-            proptest::prop_assert!(whole.iter().all(|r| halves.contains(r)));
+            proptest::prop_assert!(lacks(&halves, &whole) <= slack, "{:?}", (lacks(&halves, &whole), slack));
         }
     }
 
     /// #768: a point floor that keeps too many still ends under the cap.
-    /// The stride ladder finishes the tile from what the floor kept.
+    /// The rank ladder finishes the tile from what the floor kept.
     #[test]
     fn a_point_floor_short_of_the_need_still_keeps_the_cap() {
         let tb = crate::tile::tile_bounds(0, 0, 0);
@@ -20907,7 +20998,10 @@ mod tests {
             ..Default::default()
         };
         let floors = valve_predict::ValveFloors {
-            tiles: HashMap::from([((0, 0, 0), floor)]),
+            drop: valve_predict::Floors {
+                tiles: HashMap::from([((0, 0, 0), floor)]),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let drop_at = |floors: Option<&valve_predict::ValveFloors>, opts: &ExportOptions| {
@@ -20940,12 +21034,18 @@ mod tests {
         };
         assert_eq!(drop_at(Some(&floors), &loose).valve.dropped, below);
         assert!(drop_at(None, &loose).valve.dropped < below);
-        // Under merge, a point tile ignores the floor: it is a merge floor.
+        // Under merge a point tile still takes the drop valve, and reads its
+        // drop floor; a merge floor does not thin it.
         let merge = ExportOptions {
             size_valve: SizeValve::Merge,
             ..opts
         };
-        assert_eq!(drop_at(Some(&floors), &merge).valve.dropped, 0);
+        assert_eq!(drop_at(Some(&floors), &merge).valve.dropped, below);
+        let gap = valve_predict::ValveFloors {
+            merge: floors.drop.clone(),
+            ..Default::default()
+        };
+        assert_eq!(drop_at(Some(&gap), &merge).valve.dropped, 0);
     }
 
     /// #768: the encoder consumes a floor without knowing the scope: under
@@ -20958,7 +21058,11 @@ mod tests {
             .map(|i| point_member(-170.0 + 0.85 * i as f64, 0.37 * i as f64 - 70.0, i))
             .collect();
         let floors = valve_predict::ValveFloors {
-            tiles: HashMap::from([((0, 0, 0), u64::MAX)]),
+            drop: valve_predict::Floors {
+                tiles: HashMap::from([((0, 0, 0), u64::MAX)]),
+                own: [(0, 0, 0)].into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let encode = |scope| {
@@ -22613,13 +22717,15 @@ mod tests {
         assert!(":asc".parse::<FeatureOrder>().is_err());
     }
 
-    /// #280 spatial fairness: on a point-dominated tile, vertex count carries no
-    /// ranking signal, so the valve must keep a uniform stride across member
-    /// (≈ Hilbert) order — not a first-N prefix that would clump survivors.
+    /// #280 spatial fairness: on a point-dominated tile, vertex count carries
+    /// no ranking signal, so the valve keeps the best-ranked points (#768:
+    /// the input row bit-reversed), spread across member (≈ Hilbert) order,
+    /// not a first-N prefix that would clump survivors, nor a stride from the
+    /// tile's first member, which other tiles would not share.
     #[test]
-    fn drop_valve_point_tile_keeps_uniform_stride() {
+    fn drop_valve_point_tile_keeps_its_best_ranked_points() {
         let members: Vec<Member> = (0..10).map(|i| point_member(i as f64, 0.0, i)).collect();
-        let kept = select_kept_members(&members, 5);
+        let kept = select_kept_members(&members, 3);
         let xs: Vec<f64> = kept
             .iter()
             .map(|m| match &*m.geom {
@@ -22627,8 +22733,9 @@ mod tests {
                 _ => unreachable!("built points"),
             })
             .collect();
-        // Even stride 0,2,4,6,8 — spread across the tile — not the prefix 0..5.
-        assert_eq!(xs, vec![0.0, 2.0, 4.0, 6.0, 8.0]);
+        // Rows 0, 8 and 4 rank best: spread across the tile, not the prefix
+        // 0..3, nor a stride 0, 3, 6.
+        assert_eq!(xs, vec![0.0, 4.0, 8.0]);
     }
 
     /// Sized geometries keep the largest-by-vertex-count survivors (pre-#280

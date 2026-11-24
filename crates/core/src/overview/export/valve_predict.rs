@@ -1,17 +1,23 @@
 //! `--valve-scope smooth|zoom` (#768): each tile's valve need, predicted
 //! from the export scan, and the floors it puts on the tiles around it.
-//! Under `--size-valve merge` the need is a merge threshold over the gaps of
-//! lines and polygons; under `drop`, the share of a point tile's members to
-//! keep ([`predict_drop_need`]).
+//! The need is the one the tile's own valve reads, decided per tile as the
+//! encoder decides it: a point tile (every member a point) always takes the
+//! drop valve, so its need is the share of its members to keep
+//! ([`predict_drop_need`]) under either `--size-valve`; under `merge`, any
+//! other tile's need is a merge threshold over the gaps of its lines and
+//! polygons ([`predict_need`]). The two are separate floor maps
+//! ([`ValveFloors`]): a point tile reads only drop floors, a tile it merges
+//! only merge floors.
 //!
 //! The export scan ([`super::scan_all_levels`]) already visits every row's
 //! bbox and every tile it lands in. With `smooth` it also follows each
-//! tile's own members in file order ([`Scan`]): a member count, and once a
-//! tile holds 1,023 members the band holding most of them from there on and,
-//! from its 1,024th member on, a half-octave histogram of each member's gap
+//! tile's own members in file order ([`Scan`]): a member count and whether
+//! every member is a point, and once a tile holds 1,023 members the band
+//! holding most of them from there on and, under `merge`, from its 1,024th
+//! member on, a half-octave histogram of each line or polygon member's gap
 //! to the tile's previous member in its band (the merge valve's gap measure,
-//! [`super::coalesce_valve::gap_to_rect`]). A tile below that holds only its count, as the scan's
-//! tile counts do; the rest is checked against the scan's memory budget
+//! [`super::coalesce_valve::gap_to_rect`]). A tile below that holds only its
+//! count, as the scan's tile counts do; the rest is checked against the scan's memory budget
 //! after every batch, and dropped with a warning when it is over
 //! (`--valve-scope tile` from there on).
 //!
@@ -24,13 +30,15 @@
 //!    the way MVT does (a value table deduplicated per tile, tags that gzip
 //!    to nothing when a column is constant, nested columns written as JSON),
 //!    and gzip ratios run 0.2 (Madagascar adm4, 53 columns) to 0.6. Every
-//!    tile with a histogram is priced by the 256 members the scan kept from
+//!    point tile and every tile with a histogram is priced by the 256 members the scan kept from
 //!    its 1,024th on; those that puts near a cap, by its first 4,096 from
 //!    its 1,023rd on in the band holding most of them. Only tiles estimated
 //!    well over (`f < PREDICT_BELOW_FIT`)
 //!    get a need: a false positive puts floors on its neighbours, a missed
-//!    near-cap tile only skips a small step.
-//! 2. Need: the merge valve's threshold is a gap quantile. It keeps about
+//!    near-cap tile only skips a small step. A tile whose sample prices
+//!    nothing (most of its rows clip empty) is priced at its level's mean.
+//! 2. Need: a point tile keeps `DROP_KEEP × f` of its members. The merge
+//!    valve's threshold is a gap quantile. It keeps about
 //!    `0.8 × f` of the features on its second encode, a little less when it
 //!    takes more (`KEEP_EXP`). The need is the histogram's `1 − keep`
 //!    quantile.
@@ -39,21 +47,19 @@
 //! needs, faded by `1 / --valve-max-step` a ring, one rule for both valves.
 //! Every tile within reach starts from its floor before its first encode,
 //! a tile that would fit on its own too: `merge_to_fit` starts its ladder
-//! at it, and under `drop` a point tile first keeps the share of its
-//! members its floor sets, by rank (`kept_at_floor`). The size ladder after
-//! the floor stays the backstop that holds the cap.
+//! at it, and a point tile first keeps the share of its members its drop
+//! floor sets, by rank (`kept_at_floor`). The size ladder after the floor
+//! stays the backstop that holds the cap.
 //!
 //! Sharding: everything a tile's need depends on comes from its own
 //! members, in file order, never from row positions or other tiles, and a
 //! shard holds every row of the tiles in its range and of their neighbours
 //! out to [`MAX_RINGS`]. So a shard computes the floors the full build
-//! does for every tile it owns, whatever row groups it pruned.
-//! shortcut: a geometry-sourced scan (an overview with no bbox covering)
-//! drops null rows before the predictor sees them, so a tile's sample rows
-//! can be a few rows off after a null; walk row-aligned bboxes there too if
-//! a covering-less overview ever needs sharded smooth floors.
+//! does for every tile it owns, whatever row groups it pruned. The scan
+//! hands the predictor row-aligned bboxes from either bbox source (a null
+//! row is `None`), so a tile's band rows are its rows in the file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 
 use geo::Rect;
@@ -109,9 +115,10 @@ pub(crate) type MemberBytes = (f64, f64);
 /// holds all of a tile's rows (any tile in its range) computes what a
 /// monolithic build does, whatever rows around them it pruned.
 struct Dense {
-    /// From the member that reaches [`HIST_MIN_MEMBERS`] on: each member's
-    /// gap to the tile's previous member in its band.
-    hist: Hist,
+    /// Under merge, from the member that reaches [`HIST_MIN_MEMBERS`] on:
+    /// each line or polygon member's gap to the tile's previous member in
+    /// its band. `None` until the first such gap: a point tile has none.
+    hist: Option<Hist>,
     /// The previous member's band and bbox centre (world units).
     prev: Option<(u16, (f64, f64))>,
     /// The band being counted: `(band, members, first and last member's
@@ -141,7 +148,7 @@ fn unpack_row(packed: u64) -> (u16, u64) {
 impl Default for Dense {
     fn default() -> Self {
         Self {
-            hist: Box::new([0; BUCKETS]),
+            hist: None,
             prev: None,
             run: Run::default(),
             best: Run::default(),
@@ -150,15 +157,23 @@ impl Default for Dense {
     }
 }
 
-/// One of a level's [`PARTS`] maps: every tile's member count, and the
+/// One of a level's [`PARTS`] maps: every tile's member count, with
+/// [`NON_POINT`] set once it holds a member that is not a point, and the
 /// state of those past [`DENSE_FROM`].
 #[derive(Default)]
 struct Part {
     counts: HashMap<u64, u64>,
     dense: HashMap<u64, Dense>,
+    /// Histograms its dense tiles hold.
+    hists: usize,
 }
 
 type Run = (u16, u32, u64, u64);
+
+/// The bit of a [`Part::counts`] entry set once the tile holds a member that
+/// is not a point: the encoder sends a tile of points alone to the drop
+/// valve, under either `--size-valve`. A count is far below 2^63.
+const NON_POINT: u64 = 1 << 63;
 
 impl Dense {
     /// The band its members are sampled in: the one holding the most of
@@ -203,7 +218,7 @@ pub(crate) struct Scan {
 }
 
 /// A row as [`Scan::flush`] sizes it: its bbox, its corners ([`world_box`])
-/// and centre in world units, whether its gap counts, and its band row.
+/// and centre in world units, whether it is a point, and its band row.
 /// PERF: projected once a row, not once a row and level (France points:
 /// four Web Mercator projections per membership were most of the scan's
 /// predictor time).
@@ -226,10 +241,11 @@ fn part(key: u64) -> usize {
 /// Rows a flush fans out per task.
 const FAN_ROWS: usize = 4096;
 
-/// One run of rows' members, per map of a level: `(key, first, last)` for
-/// each stretch of consecutive rows in one tile (Hilbert-sorted rows stay in
-/// a tile for long stretches, so a map lookup serves many members).
-type Fanned = [Vec<(u64, u32, u32)>; PARTS];
+/// One run of rows' members, per map of a level: `(key, first, last, any
+/// row not a point)` for each stretch of consecutive rows in one tile
+/// (Hilbert-sorted rows stay in a tile for long stretches, so a map lookup
+/// serves many members).
+type Fanned = [Vec<(u64, u32, u32, bool)>; PARTS];
 
 /// log2 of one squared pixel at `zoom`, in squared world units.
 fn px2_log2(zoom: u8) -> f64 {
@@ -238,33 +254,101 @@ fn px2_log2(zoom: u8) -> f64 {
 /// A tile, `(zoom, x, y)`.
 pub(crate) type Key = (u8, u32, u32);
 
-/// Each tile's starting valve threshold: its own, keyed `(zoom, x, y)`, or
-/// under `--valve-scope zoom` its zoom's. A tile starts from the larger.
+/// Each tile's predicted need, by the valve that reads it.
 #[derive(Debug, Default, Clone, PartialEq)]
-pub(crate) struct ValveFloors {
-    pub(crate) tiles: HashMap<Key, u64>,
-    pub(crate) zooms: HashMap<u8, u64>,
+pub(crate) struct Needs {
+    /// Merge thresholds of the tiles the merge valve fits (`--size-valve
+    /// merge`, a tile not all points).
+    pub(crate) merge: HashMap<Key, u64>,
+    /// Drop floors of point tiles, under either valve.
+    pub(crate) drop: HashMap<Key, u64>,
+    /// Tiles that could be over a cap but that neither sample priced: most
+    /// of their rows reach them by bbox but clip empty there.
+    pub(crate) unpriced: usize,
 }
 
-impl ValveFloors {
+impl Needs {
+    pub(crate) fn len(&self) -> usize {
+        self.merge.len() + self.drop.len()
+    }
+}
+
+/// One valve's starting thresholds: each tile's own, keyed `(zoom, x, y)`,
+/// or under `--valve-scope zoom` its zoom's. A tile starts from the larger.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct Floors {
+    pub(crate) tiles: HashMap<Key, u64>,
+    pub(crate) zooms: HashMap<u8, u64>,
+    /// The tiles predicted over their cap on their own, whose needs the
+    /// floors come from. A tile thinned only by a neighbour's floor is not
+    /// an oversized tile.
+    pub(crate) own: HashSet<Key>,
+}
+
+impl Floors {
     /// The floor of tile `(zoom, x, y)`; 0 for none.
     pub(crate) fn get(&self, (zoom, x, y): Key) -> u64 {
         let own = self.tiles.get(&(zoom, x, y)).copied().unwrap_or(0);
         own.max(self.zooms.get(&zoom).copied().unwrap_or(0))
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.tiles.is_empty() && self.zooms.values().all(|&f| f == 0)
     }
 
-    pub(crate) fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.tiles.len() + self.zooms.len()
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        (self.tiles.capacity() + self.zooms.capacity() + self.own.capacity()) as u64
+            * FLOOR_ENTRY_BYTES
+    }
+}
+
+/// Every tile's starting valve thresholds, one map for each valve a tile can
+/// take: the encoder sends a tile of points to the drop valve under either
+/// `--size-valve`, so a point tile reads a kept share ([`Self::drop`]); a
+/// tile the merge valve fits reads a merge gap ([`Self::merge`]).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct ValveFloors {
+    pub(crate) merge: Floors,
+    pub(crate) drop: Floors,
+}
+
+/// One tile's floors ([`ValveFloors::for_tile`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct TileFloor {
+    /// Its merge floor, read when the merge valve fits it.
+    pub(crate) merge: u64,
+    /// Its drop floor, read when it is a point tile.
+    pub(crate) drop: u64,
+    /// It was predicted over its cap on its own ([`Floors::own`]).
+    pub(crate) own: bool,
+}
+
+impl ValveFloors {
+    /// Tile `key`'s floors; 0 for none.
+    pub(crate) fn for_tile(&self, key: Key) -> TileFloor {
+        TileFloor {
+            merge: self.merge.get(key),
+            drop: self.drop.get(key),
+            own: self.merge.own.contains(&key) || self.drop.own.contains(&key),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.merge.is_empty() && self.drop.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.merge.len() + self.drop.len()
     }
 
     /// Bytes the floors hold through the export ([`FLOOR_ENTRY_BYTES`] a
     /// tile floor).
     pub(crate) fn resident_bytes(&self) -> u64 {
-        (self.tiles.capacity() + self.zooms.capacity()) as u64 * FLOOR_ENTRY_BYTES
+        self.merge.resident_bytes() + self.drop.resident_bytes()
     }
 }
 
@@ -284,8 +368,8 @@ const _: () = assert!(
     "a shard must read every row of the tiles its valve floors reach"
 );
 
-/// Resident bytes of one floor in [`ValveFloors::tiles`], with the map's
-/// slack: a 24-byte entry, its control byte, at most half the table empty.
+/// Resident bytes of one floor in [`Floors::tiles`], with the map's slack: a
+/// 24-byte entry, its control byte, at most half the table empty.
 pub(crate) const FLOOR_ENTRY_BYTES: u64 = 52;
 
 /// The floor at or under which a valve does nothing at `zoom`: under drop
@@ -305,8 +389,9 @@ pub(crate) fn no_op_floor(valve: SizeValve, zoom: u8) -> u64 {
 /// faded value still constrains a tile (above `stop` at its zoom), at most
 /// [`MAX_RINGS`]: a need too large to fade back to `stop` by then at
 /// `factor` fades at the even, steeper factor that does, so its reach ends
-/// without a cliff. `None` once the map would hold more than `max_floors`:
-/// it does not fit the export's memory.
+/// without a cliff. Columns wrap across the antimeridian, as the tiles a
+/// feature draws in do; rows stop at the poles. `None` once the map would
+/// hold more than `max_floors`: it does not fit the export's memory.
 pub(crate) fn floors(
     need: &HashMap<Key, u64>,
     factor: f64,
@@ -329,8 +414,8 @@ pub(crate) fn floors(
                 .flat_map(|dx| [(dx, -d), (dx, d)])
                 .chain((1 - d..d).flat_map(|dy| [(-d, dy), (d, dy)]));
             for (dx, dy) in ring {
-                let (tx, ty) = (i64::from(x) + dx, i64::from(y) + dy);
-                if tx < 0 || ty < 0 || tx >= n || ty >= n {
+                let (tx, ty) = ((i64::from(x) + dx).rem_euclid(n), i64::from(y) + dy);
+                if ty < 0 || ty >= n {
                     continue;
                 }
                 let e = out.entry((z, tx as u32, ty as u32)).or_insert(0);
@@ -391,12 +476,16 @@ impl Scan {
     /// scan's budget after every batch.
     pub(crate) fn resident_bytes(&self) -> u64 {
         let dense = std::mem::size_of::<(u64, Dense)>() as u64 + 1;
-        let heap = std::mem::size_of::<[u32; BUCKETS]>() as u64
-            + (PRICE_MEMBERS * std::mem::size_of::<u64>()) as u64;
+        let rows = (PRICE_MEMBERS * std::mem::size_of::<u64>()) as u64;
+        let hist = std::mem::size_of::<[u32; BUCKETS]>() as u64;
         self.levels
             .iter()
             .flatten()
-            .map(|p| p.dense.capacity() as u64 * dense + p.dense.len() as u64 * heap)
+            .map(|p| {
+                p.dense.capacity() as u64 * dense
+                    + p.dense.len() as u64 * rows
+                    + p.hists as u64 * hist
+            })
             .sum()
     }
 
@@ -407,6 +496,7 @@ impl Scan {
         self.shed = true;
         for p in self.levels.iter_mut().flatten() {
             p.dense = HashMap::new();
+            p.hists = 0;
         }
     }
 
@@ -424,7 +514,11 @@ impl Scan {
                 let mut out = std::collections::BTreeMap::new();
                 for p in parts {
                     drop(p.dense);
-                    out.extend(p.counts.into_iter().map(|(k, c)| (k, c as usize)));
+                    out.extend(
+                        p.counts
+                            .into_iter()
+                            .map(|(k, c)| (k, (c & !NON_POINT) as usize)),
+                    );
                 }
                 out
             })
@@ -476,9 +570,9 @@ impl Scan {
         let t = std::time::Instant::now();
         let band = u16::try_from(self.band.expect("a band is open")).unwrap_or(u16::MAX);
         let first = self.band_rows;
-        // Each row's bbox, its centre, and whether its gap counts: lines and
-        // polygons under merge (points never merge), points under drop (the
-        // only members a drop floor thins). Computed once for every level.
+        // Each row's bbox, its centre, and whether it is a point (a point's
+        // gap never counts: points never merge). Computed once for every
+        // level. Under drop only a point tile has a need, and no gap counts.
         let drop = opts.size_valve == SizeValve::Drop;
         let rows: Vec<SizedRow> = self
             .pending
@@ -491,7 +585,7 @@ impl Scan {
                 let rect = Rect::new((b.lng_min, b.lat_min), (b.lng_max, b.lat_max));
                 let c = rect.center();
                 let point = b.lng_min == b.lng_max && b.lat_min == b.lat_max;
-                Some((b, world_box(&rect), world_xy(c.x, c.y), point == drop, row))
+                Some((b, world_box(&rect), world_xy(c.x, c.y), point, row))
             })
             .collect();
         // Per level, per run of rows, each map's (key, row) members in file
@@ -505,13 +599,16 @@ impl Scan {
                     .enumerate()
                     .map(|(c, run)| {
                         let mut out: Fanned = std::array::from_fn(|_| Vec::new());
-                        for (i, (b, ..)) in run.iter().enumerate() {
+                        for (i, (b, _, _, point, _)) in run.iter().enumerate() {
                             let i = (c * FAN_ROWS + i) as u32;
                             for_each_member_key(b, zoom, opts, |key| {
                                 let runs = &mut out[part(key)];
                                 match runs.last_mut() {
-                                    Some(r) if r.0 == key && r.2 + 1 == i => r.2 = i,
-                                    _ => runs.push((key, i, i)),
+                                    Some(r) if r.0 == key && r.2 + 1 == i => {
+                                        r.2 = i;
+                                        r.3 |= !point;
+                                    }
+                                    _ => runs.push((key, i, i, !point)),
                                 }
                             });
                         }
@@ -526,11 +623,21 @@ impl Scan {
             .zip(&zooms[range])
             .for_each(|((level, fanned), &zoom)| {
                 level.par_iter_mut().enumerate().for_each(|(p, part)| {
-                    for &(key, first, last) in fanned.iter().flat_map(|run| &run[p]) {
-                        let count = part.counts.entry(key).or_insert(0);
-                        let before = *count;
-                        *count += u64::from(last - first) + 1;
-                        if shed || *count < DENSE_FROM {
+                    for &(key, first, last, lines) in fanned.iter().flat_map(|run| &run[p]) {
+                        let entry = part.counts.entry(key).or_insert(0);
+                        let before = *entry & !NON_POINT;
+                        *entry += u64::from(last - first) + 1;
+                        if lines {
+                            *entry |= NON_POINT;
+                        }
+                        let (count, lines) = (*entry & !NON_POINT, *entry & NON_POINT != 0);
+                        if shed || count < DENSE_FROM {
+                            continue;
+                        }
+                        if drop && lines {
+                            // Under drop a tile that is not all points has
+                            // no need: the drop valve fits it alone.
+                            part.dense.remove(&key);
                             continue;
                         }
                         // The members before the tile's `DENSE_FROM`th need
@@ -538,7 +645,7 @@ impl Scan {
                         let skip = DENSE_FROM.saturating_sub(before + 1) as u32;
                         let t = part.dense.entry(key).or_default();
                         for (n, i) in (before + 1 + u64::from(skip)..).zip(first + skip..=last) {
-                            let (_, corners, centre, valved, row) = &rows[i as usize];
+                            let (_, corners, centre, point, row) = &rows[i as usize];
                             if t.run.0 != band || t.run.1 == 0 {
                                 if t.run.1 > t.best.1 {
                                     t.best = t.run;
@@ -547,20 +654,25 @@ impl Scan {
                             }
                             t.run.1 += 1;
                             t.run.3 = *row;
+                            if n >= HIST_MIN_MEMBERS && t.price_rows.len() < PRICE_MEMBERS {
+                                t.price_rows.push(pack_row(band, *row));
+                            }
+                            if drop {
+                                continue;
+                            }
                             let gap = match t.prev {
-                                Some((b, p)) if b == band && *valved => {
+                                Some((b, p)) if b == band && !*point => {
                                     gap_to_world_box(p, corners)
                                 }
                                 _ => GAP_NONE,
                             };
                             t.prev = Some((band, *centre));
-                            if n >= HIST_MIN_MEMBERS {
-                                if t.price_rows.len() < PRICE_MEMBERS {
-                                    t.price_rows.push(pack_row(band, *row));
-                                }
-                                if gap != GAP_NONE {
-                                    t.hist[bucket(gap, zoom)] += 1;
-                                }
+                            if n >= HIST_MIN_MEMBERS && gap != GAP_NONE {
+                                let hist = t.hist.get_or_insert_with(|| {
+                                    part.hists += 1;
+                                    Box::new([0; BUCKETS])
+                                });
+                                hist[bucket(gap, zoom)] += 1;
                             }
                         }
                     }
@@ -589,7 +701,8 @@ impl Scan {
     }
 
     /// The tiles worth a larger sample: estimated under `CANDIDATE_FIT` at
-    /// their first sample's bytes a member.
+    /// their first sample's bytes a member, or that sample priced nothing
+    /// (its rows clipped empty): the larger one reads 16 times the rows.
     pub(crate) fn candidates(
         &self,
         bytes: &HashMap<(usize, u64), MemberBytes>,
@@ -599,7 +712,7 @@ impl Scan {
         self.select(|s, count| {
             bytes
                 .get(&(s.level, s.key))
-                .is_some_and(|&b| fit(count, b, caps) < CANDIDATE_FIT)
+                .is_none_or(|&b| fit(count, b, caps) < CANDIDATE_FIT)
         })
     }
 
@@ -609,22 +722,25 @@ impl Scan {
         self.levels[level][part(key)]
             .counts
             .get(&key)
-            .copied()
-            .unwrap_or(0)
+            .map_or(0, |&c| c & !NON_POINT)
     }
 
-    /// Each dense tile with a histogram, its level, key and member count.
-    fn dense(&self) -> impl Iterator<Item = (usize, u64, &Dense, u64)> + '_ {
+    /// Each dense tile that can be predicted over, its level, key, member
+    /// count and whether it is a point tile: a point tile (the drop valve
+    /// thins it, under either valve), or one with a gap histogram (an
+    /// empty one predicts nothing, so it is not worth pricing).
+    fn dense(&self) -> impl Iterator<Item = (usize, u64, &Dense, u64, bool)> + '_ {
         self.levels
             .iter()
             .enumerate()
             .flat_map(move |(level, parts)| {
                 parts.iter().flat_map(move |p| {
-                    p.dense
-                        .iter()
-                        // An empty histogram predicts nothing: not worth pricing.
-                        .filter(|(_, t)| t.hist.iter().any(|&c| c > 0))
-                        .map(move |(&key, t)| (level, key, t, p.counts[&key]))
+                    p.dense.iter().filter_map(move |(&key, t)| {
+                        let c = p.counts[&key];
+                        let points = c & NON_POINT == 0;
+                        let gaps = t.hist.as_ref().is_some_and(|h| h.iter().any(|&n| n > 0));
+                        (points || gaps).then_some((level, key, t, c & !NON_POINT, points))
+                    })
                 })
             })
     }
@@ -632,7 +748,7 @@ impl Scan {
     fn select(&self, keep: impl Fn(&SampleAt, u64) -> bool) -> Vec<SampleAt> {
         let mut out: Vec<SampleAt> = self
             .dense()
-            .map(|(level, key, t, count)| (sample_at(level, key, t), count))
+            .map(|(level, key, t, count, _)| (sample_at(level, key, t), count))
             .filter(|(s, count)| keep(s, *count))
             .map(|(s, _)| s)
             .collect();
@@ -641,67 +757,87 @@ impl Scan {
     }
 
     /// Needs of the tiles predicted over, each priced at its own sampled
-    /// `(raw, gzipped)` bytes a member; a tile without a price predicts
-    /// nothing.
+    /// `(raw, gzipped)` bytes a member, by the valve that fits it: a point
+    /// tile's drop floor, under either valve; under merge, any other tile's
+    /// merge threshold. A tile neither sample priced is counted
+    /// ([`Needs::unpriced`]), not predicted.
     pub(crate) fn predict(
         &self,
         zooms: &[u8],
         bytes: &HashMap<(usize, u64), MemberBytes>,
         opts: &ExportOptions,
-    ) -> HashMap<Key, u64> {
+    ) -> Needs {
         let caps = caps(opts);
-        let need = match opts.size_valve {
-            SizeValve::Merge => predict_need,
-            SizeValve::Drop => predict_drop_need,
-        };
-        let mut out = HashMap::new();
-        for (level, key, t, count) in self.dense() {
+        let mut out = Needs::default();
+        for (level, key, t, count, points) in self.dense() {
             let Some(&b) = bytes.get(&(level, key)) else {
+                out.unpriced += 1;
                 continue;
             };
             let zoom = zooms[level];
-            if let Some(need) = need(&t.hist, count, zoom, b, caps) {
+            let (map, need) = if points {
+                (&mut out.drop, predict_drop_need(count, b, caps))
+            } else {
+                let hist = t
+                    .hist
+                    .as_deref()
+                    .expect("dense() keeps a non-point tile by its gaps");
+                (&mut out.merge, predict_need(hist, count, zoom, b, caps))
+            };
+            if let Some(need) = need {
                 let (x, y) = key_to_xy(key, zoom);
-                out.insert((zoom, x, y), need);
+                map.insert((zoom, x, y), need);
             }
         }
         out
     }
 }
 
-/// The floors `need` sets under `opts.valve_scope`: none under
-/// [`ValveScope::Tile`]; under `zoom` each zoom's largest need for every
-/// tile at it; under `smooth` [`floors`], faded by `1 /
-/// opts.valve_max_step` a ring, for either valve. `None` when the floors
-/// would hold more than `max_floors` tiles.
+/// The floors `needs` sets under `opts.valve_scope`, each valve's from its
+/// own needs: none under [`ValveScope::Tile`]; under `zoom` each zoom's
+/// largest need for every tile at it; under `smooth` [`floors`], faded by
+/// `1 / opts.valve_max_step` a ring. `None` when the floors would hold
+/// more than `max_floors` tiles.
 pub(crate) fn valve_floors(
-    need: &HashMap<Key, u64>,
+    needs: &Needs,
     opts: &ExportOptions,
     max_floors: usize,
 ) -> Option<ValveFloors> {
-    Some(match opts.valve_scope {
-        ValveScope::Tile => ValveFloors::default(),
-        ValveScope::Zoom => {
-            let mut zooms: HashMap<u8, u64> = HashMap::new();
-            for (&(z, _, _), &m) in need {
-                let e = zooms.entry(z).or_insert(0);
-                *e = (*e).max(m);
+    let of = |need: &HashMap<Key, u64>, valve: SizeValve, max_floors: usize| {
+        let own = need.keys().copied().collect();
+        Some(match opts.valve_scope {
+            ValveScope::Tile => Floors::default(),
+            ValveScope::Zoom => {
+                let mut zooms: HashMap<u8, u64> = HashMap::new();
+                for (&(z, _, _), &m) in need {
+                    let e = zooms.entry(z).or_insert(0);
+                    *e = (*e).max(m);
+                }
+                Floors {
+                    zooms,
+                    own,
+                    ..Floors::default()
+                }
             }
-            ValveFloors {
-                tiles: HashMap::new(),
-                zooms,
-            }
-        }
-        ValveScope::Smooth => ValveFloors {
-            tiles: floors(
-                need,
-                opts.valve_fade(),
-                |z| no_op_floor(opts.size_valve, z),
-                max_floors,
-            )?,
-            zooms: HashMap::new(),
-        },
-    })
+            ValveScope::Smooth => Floors {
+                tiles: floors(
+                    need,
+                    opts.valve_max_step.recip(),
+                    |z| no_op_floor(valve, z),
+                    max_floors,
+                )?,
+                own,
+                ..Floors::default()
+            },
+        })
+    };
+    let merge = of(&needs.merge, SizeValve::Merge, max_floors)?;
+    let drop = of(
+        &needs.drop,
+        SizeValve::Drop,
+        max_floors.saturating_sub(merge.tiles.len()),
+    )?;
+    Some(ValveFloors { merge, drop })
 }
 
 fn sample_at(level: usize, key: u64, t: &Dense) -> SampleAt {
@@ -754,18 +890,10 @@ pub(crate) fn predict_need(
     quantile(hist, 1.0 - keep, zoom).map(|g| g.saturating_add(1))
 }
 
-/// #768: one point tile's predicted drop floor under `--size-valve drop`:
+/// #768: one point tile's predicted drop floor, under either valve:
 /// `KEEP_ALL / (DROP_KEEP × fit)`, the floor that keeps `DROP_KEEP × fit` of
-/// its members, or `None` when it is predicted to fit. Only a point tile
-/// has a histogram under drop (`Scan::flush` counts only point gaps), so
-/// only a point tile gets a need; its gaps themselves set nothing.
-pub(crate) fn predict_drop_need(
-    _hist: &[u32; BUCKETS],
-    count: u64,
-    _zoom: u8,
-    bytes: MemberBytes,
-    caps: Caps,
-) -> Option<u64> {
+/// its members, or `None` when it is predicted to fit.
+pub(crate) fn predict_drop_need(count: u64, bytes: MemberBytes, caps: Caps) -> Option<u64> {
     let fit = fit(count, bytes, caps);
     (fit < PREDICT_BELOW_FIT).then(|| (KEEP_ALL as f64 / (DROP_KEEP * fit)) as u64)
 }
@@ -893,7 +1021,7 @@ mod tests {
         // is not worth a larger sample.
         let near = HashMap::from([((0, key), (20.0, 5.0))]);
         assert_eq!(scan.candidates(&near, &opts), priced);
-        assert!(scan.predict(&[10], &near, &opts).is_empty());
+        assert_eq!(scan.predict(&[10], &near, &opts).len(), 0);
         let small = HashMap::from([((0, key), (2.0, 0.5))]);
         assert!(scan.candidates(&small, &opts).is_empty());
     }
@@ -932,7 +1060,7 @@ mod tests {
             let bytes = HashMap::from([((0, key), (100.0, 20.0))]);
             (
                 scan.count(0, key),
-                t.hist.clone(),
+                t.hist.clone().expect("the tile's gaps"),
                 // The sampled rows, by identity.
                 rows[s[0].row as usize].0,
                 scan.price_rows(&s[0])
@@ -954,11 +1082,11 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// #768: under drop a point tile's need is the floor that keeps
-    /// `DROP_KEEP × fit` of its members, for a tile of the point gaps the
-    /// merge valve ignores; the same on any pool.
+    /// #768: a point tile's need is the floor that keeps `DROP_KEEP × fit`
+    /// of its members under either valve, since the encoder sends a tile of
+    /// points to the drop valve under both; the same on any pool.
     #[test]
-    fn a_drop_need_is_a_kept_share_on_any_pool() {
+    fn a_point_tiles_need_is_a_kept_share_under_either_valve() {
         let zooms = [10u8];
         let rows = dense_points(70_000);
         let key = key_of(rows[0].unwrap());
@@ -979,18 +1107,45 @@ mod tests {
             size_valve: SizeValve::Drop,
             ..ExportOptions::default()
         };
-        assert_eq!(
-            need(&ExportOptions::default(), 4),
-            (0, HashMap::new()),
-            "points never merge, so merge prices no point tile"
-        );
         let (priced, got) = need(&drop, 4);
         assert_eq!(priced, 1);
+        assert!(got.merge.is_empty());
         assert_eq!((priced, got.clone()), need(&drop, 1));
+        assert_eq!(
+            need(&ExportOptions::default(), 4),
+            (priced, got.clone()),
+            "the default merge valve thins a point tile by the same share"
+        );
         // 70,000 members at 100 bytes: fit 0.30 of the 2 MiB cap.
         let f = fit(70_000, (100.0, 20.0), caps(&drop));
-        let share = KEEP_ALL as f64 / got[&(10, 540, 483)] as f64;
+        let share = KEEP_ALL as f64 / got.drop[&(10, 540, 483)] as f64;
         assert!((share / (DROP_KEEP * f) - 1.0).abs() < 1e-6, "{share} {f}");
+    }
+
+    /// #768: a tile holding any member that is not a point is the merge
+    /// valve's under merge, so its need is a merge threshold, and under drop
+    /// it has none; one point among them makes it no point tile.
+    #[test]
+    fn a_tile_not_all_points_takes_a_merge_need_and_none_under_drop() {
+        let zooms = [10u8];
+        let mut rows: Vec<_> = (0..70_000).map(|i| Some(inside(i))).collect();
+        rows[5] = dense_points(1)[0];
+        let key = key_of(inside(0));
+        let bytes = HashMap::from([((0, key), (100.0, 20.0))]);
+        let predict = |opts: &ExportOptions| {
+            let mut scan = Scan::new(1);
+            scan.batch(0, &rows, 0..=0, &zooms, opts);
+            scan.flush(&zooms, opts);
+            scan.predict(&zooms, &bytes, opts)
+        };
+        let merge = predict(&ExportOptions::default());
+        assert!(merge.drop.is_empty());
+        assert_eq!(merge.merge.len(), 1);
+        let drop = predict(&ExportOptions {
+            size_valve: SizeValve::Drop,
+            ..ExportOptions::default()
+        });
+        assert_eq!(drop.len(), 0, "{drop:?}");
     }
 
     /// #768: one fade rule: a need fades by the factor a ring and reaches
@@ -1007,6 +1162,8 @@ mod tests {
         assert_eq!(f[&(7, 35, 30)], 2);
         assert_eq!(f.get(&(7, 36, 30)), None);
         assert_eq!(f[&(8, 1, 0)], 2);
+        assert_eq!(f[&(8, 255, 0)], 2, "a column wraps across the antimeridian");
+        assert_eq!(f.get(&(8, 0, 255)), None, "rows stop at the pole");
         assert!(f.keys().all(|&(z, x, y)| x < 1 << z && y < 1 << z));
         // The reach stops where the floor no longer constrains: a need of
         // 64 above a stop of 8 reaches 2 rings at half a ring (32, 16).
@@ -1057,7 +1214,10 @@ mod tests {
     /// at each valve's own no-op floor.
     #[test]
     fn valve_scopes_set_their_floors() {
-        let need = HashMap::from([((7, 10, 10), 64 * KEEP_ALL), ((8, 0, 0), 5)]);
+        let need = Needs {
+            drop: HashMap::from([((7, 10, 10), 64 * KEEP_ALL), ((8, 0, 0), 5)]),
+            ..Needs::default()
+        };
         let opts = |valve_scope, size_valve, valve_max_step| ExportOptions {
             valve_scope,
             size_valve,
@@ -1068,12 +1228,13 @@ mod tests {
         assert_eq!(tile, Some(ValveFloors::default()));
         let zoom = valve_floors(&need, &opts(ValveScope::Zoom, SizeValve::Drop, 2.0), 0).unwrap();
         assert_eq!(
-            zoom.get((7, 99, 3)),
+            zoom.drop.get((7, 99, 3)),
             64 * KEEP_ALL,
             "every tile, the zoom's max"
         );
-        assert_eq!(zoom.get((8, 9, 9)), 5);
-        assert_eq!(zoom.get((9, 0, 0)), 0);
+        assert_eq!(zoom.drop.get((8, 9, 9)), 5);
+        assert_eq!(zoom.drop.get((9, 0, 0)), 0);
+        assert!(zoom.for_tile((7, 10, 10)).own && !zoom.for_tile((7, 99, 3)).own);
         let drop = valve_floors(
             &need,
             &opts(ValveScope::Smooth, SizeValve::Drop, 2.0),
@@ -1081,9 +1242,14 @@ mod tests {
         )
         .unwrap();
         // 64x keep-all halves back to keep-all in 6 rings; the 5 sets nothing.
-        assert_eq!(drop.get((7, 15, 10)), 2 * KEEP_ALL);
-        assert_eq!(drop.get((7, 16, 10)), 0);
-        assert_eq!(drop.get((8, 0, 0)), 0);
+        assert_eq!(drop.drop.get((7, 15, 10)), 2 * KEEP_ALL);
+        assert_eq!(drop.drop.get((7, 16, 10)), 0);
+        assert_eq!(drop.drop.get((8, 0, 0)), 0);
+        assert_eq!(
+            drop.for_tile((7, 15, 10)).merge,
+            0,
+            "a drop need sets no merge floor"
+        );
         let gentle = valve_floors(
             &need,
             &opts(ValveScope::Smooth, SizeValve::Drop, 1.25),
@@ -1093,19 +1259,23 @@ mod tests {
         // At 1.25 a ring, 64x would still keep 1/10 eight rings out, so it
         // fades at the even 64^(1/9) a ring that ends at keep-all.
         let even = (64 * KEEP_ALL) as f64 / 64f64.powf(1.0 / 9.0);
-        assert_eq!(gentle.get((7, 11, 10)), even as u64);
-        assert!(gentle.get((7, 18, 10)) > KEEP_ALL);
-        assert_eq!(gentle.get((7, 19, 10)), 0);
-        assert!(gentle.tiles.len() > drop.tiles.len());
-        // Under merge the stop is one squared grid unit at the zoom.
+        assert_eq!(gentle.drop.get((7, 11, 10)), even as u64);
+        assert!(gentle.drop.get((7, 18, 10)) > KEEP_ALL);
+        assert_eq!(gentle.drop.get((7, 19, 10)), 0);
+        assert!(gentle.drop.tiles.len() > drop.drop.tiles.len());
+        // A merge need's stop is one squared grid unit at the zoom.
         let unit = no_op_floor(SizeValve::Merge, 7);
         let merge = valve_floors(
-            &HashMap::from([((7, 10, 10), unit * 4)]),
+            &Needs {
+                merge: HashMap::from([((7, 10, 10), unit * 4)]),
+                ..Needs::default()
+            },
             &opts(ValveScope::Smooth, SizeValve::Merge, 2.0),
             usize::MAX,
         )
         .unwrap();
-        assert_eq!(merge.get((7, 11, 10)), unit * 2);
-        assert_eq!(merge.get((7, 12, 10)), 0);
+        assert_eq!(merge.merge.get((7, 11, 10)), unit * 2);
+        assert_eq!(merge.merge.get((7, 12, 10)), 0);
+        assert!(merge.drop.is_empty());
     }
 }

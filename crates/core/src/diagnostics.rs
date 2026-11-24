@@ -185,11 +185,15 @@ pub enum Diagnostic {
         parts: usize,
         ratio: f64,
     },
-    /// The `--valve-scope smooth|zoom` predictor, or the floors it set,
-    /// outgrew the export's memory budget, and the export fell back to
-    /// `tile` (#768).
+    /// The `--valve-scope smooth|zoom` predictor (`predictor`), or the
+    /// floors it set, outgrew the export's memory budget, and the export
+    /// fell back to `tile` (#768). `scope` is the `--valve-scope` asked for.
     #[non_exhaustive]
-    ValveFloorsShed { count: usize },
+    ValveFloorsShed {
+        count: usize,
+        scope: String,
+        predictor: bool,
+    },
     #[non_exhaustive]
     PyramidSharedTiles { count: usize },
     #[non_exhaustive]
@@ -318,7 +322,7 @@ macro_rules! event_count {
             | Self::DiskShortage { count, .. }
             | Self::SavedPlan { count, .. }
             | Self::SharedBordersUnpinned { count }
-            | Self::ValveFloorsShed { count }
+            | Self::ValveFloorsShed { count, .. }
             | Self::UnsortedInput { count, .. }
             | Self::PyramidSharedTiles { count }
             | Self::PyramidSkippedTiles { count }
@@ -333,6 +337,15 @@ impl Diagnostic {
     /// Number of events represented by this aggregate.
     pub fn count(&self) -> usize {
         *event_count!(self)
+    }
+    /// Whether a frontend that hands its caller a report, not a log
+    /// (Python), raises this as a warning too: advice a run that succeeded
+    /// still owes its caller (#768).
+    pub fn is_user_warning(&self) -> bool {
+        matches!(
+            self,
+            Self::DiskShortage { .. } | Self::UnsortedInput { .. } | Self::ValveFloorsShed { .. }
+        )
     }
     fn count_mut(&mut self) -> &mut usize {
         event_count!(self)
@@ -504,7 +517,15 @@ impl fmt::Display for Diagnostic {
             Self::Advisory {message,..} | Self::DiskShortage {message,..} => f.write_str(message),
             Self::MemoryBudget {machine,limit,..} => write!(f, "memory budget from cgroup limit: {limit} bytes (machine available: {machine:?} bytes)"),
             Self::SharedBordersUnpinned {..} => f.write_str("the shared-border pins outgrew the memory budget and were dropped: each polygon simplifies on its own, so neighbours may show slivers along their shared borders. Run on a machine with more memory, or pass --simplify-factor 0.25 to narrow the slivers (#802)"),
-            Self::ValveFloorsShed {..} => f.write_str("--valve-scope smooth did not fit the export's memory budget, so this export ran as --valve-scope tile: each tile over the size cap was thinned only as much as it needed on its own, and the density can jump at the edge of every such tile. To keep smooth edges, give the export more memory (more RAM, or `--profile speed`) or raise --valve-max-step, which shortens the floors' reach; pass --valve-scope tile to skip the prediction (#768)"),
+            Self::ValveFloorsShed {scope,predictor,..} => {
+                let what = if *predictor { "its predictor's scan state" } else { "the floors it predicted" };
+                write!(f, "--valve-scope {scope}: {what} outgrew the export's memory budget, so this export ran as --valve-scope tile: each tile over the size cap was thinned only as much as it needed on its own, and the density can jump at the edge of every such tile. To keep the {scope} thresholds, give the export more memory (more RAM, or `--profile speed`)")?;
+                // Only the smooth floors' reach shrinks with the step.
+                if !predictor && scope == "smooth" {
+                    f.write_str(" or raise --valve-max-step, which shortens the floors' reach")?;
+                }
+                f.write_str("; pass --valve-scope tile to skip the prediction (#768)")
+            }
             Self::UnsortedInput {input,parts,ratio,..} => {
                 write!(f, "the input is not sorted by location: consecutive rows lie {ratio:.1}x farther apart on average than in spatially sorted data. tylertoo keeps the input's row order, so tiles over the size cap will merge or drop features unevenly and may show stripes. Sort the input first: ")?;
                 if *parts > 1 {

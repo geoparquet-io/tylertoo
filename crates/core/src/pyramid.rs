@@ -5629,8 +5629,11 @@ mod tests {
         }
     }
 
+    /// A joined point tile ranks its features by bit-reversed position over
+    /// all its layers at once (#768), so keeping half keeps the even
+    /// positions of every layer.
     #[test]
-    fn merge_bands_point_drop_uses_one_stride_across_layers() {
+    fn merge_bands_point_drop_ranks_across_layers() {
         let tile = crate::vector_tile::Tile {
             layers: ["a", "b"]
                 .into_iter()
