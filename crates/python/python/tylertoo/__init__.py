@@ -16,14 +16,12 @@ when the input is not sorted by location.
 
 Advice a caller owes a response to (unsorted input, a disk that may run
 out, a size valve that fell back to `valve_scope="tile"`) is a
-`UserWarning`, raised when the run finds it, so a run that then fails
-still gives it, and not also a log record.
+`UserWarning`, not a log record: raised as the call returns, whether
+it succeeds or fails, whatever the logging configuration.
 """
 
 from __future__ import annotations
 
-import logging
-import warnings
 from typing import Any, Literal, TypedDict
 
 from tylertoo import _tylertoo
@@ -38,21 +36,6 @@ from ._tylertoo import (
     stats,
     validate,
 )
-
-
-class _UserWarnings(logging.Filter):
-    """Raise core's user-warning records as `UserWarning`s.
-
-    The records are core's `Diagnostic.is_user_warning` events, logged
-    under `tylertoo_core::user_warning`; they are not also logged.
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        warnings.warn(record.getMessage(), UserWarning, stacklevel=2)
-        return False
-
-
-logging.getLogger("tylertoo_core.user_warning").addFilter(_UserWarnings())
 
 __all__ = [
     "ConfigError",

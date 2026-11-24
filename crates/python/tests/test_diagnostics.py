@@ -5,6 +5,7 @@ import logging
 import os
 import struct
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -303,3 +304,30 @@ def test_a_failed_run_still_warns_about_unsorted_input(tmp_path):
             max_zoom=4,
             feature_id="geometry",
         )
+
+
+def test_an_unsorted_input_warning_escalated_to_an_error_raises_it(tmp_path):
+    """#768: under ``-W error`` the warning is the exception the call raises."""
+    source = _write_unsorted(tmp_path / "unsorted.parquet")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(UserWarning, match="not sorted by location"):
+            tylertoo.overview(
+                str(source), str(tmp_path / "out.parquet"), min_zoom=0, max_zoom=4
+            )
+
+
+def test_an_unsorted_input_warning_ignores_the_log_level(tmp_path):
+    """#768: quieting ``tylertoo_core``'s log does not drop the advice."""
+    source = _write_unsorted(tmp_path / "unsorted.parquet")
+    logger = logging.getLogger("tylertoo_core")
+    level = logger.level
+    logger.setLevel(logging.ERROR)
+    try:
+        with pytest.warns(UserWarning, match="not sorted by location") as raised:
+            tylertoo.overview(
+                str(source), str(tmp_path / "out.parquet"), min_zoom=0, max_zoom=4
+            )
+    finally:
+        logger.setLevel(level)
+    assert raised[0].filename == __file__

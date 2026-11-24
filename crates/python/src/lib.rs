@@ -73,14 +73,77 @@ static LOG_RESET: pyo3::sync::PyOnceLock<Option<pyo3_log::ResetHandle>> =
 /// give the CLI its own stderr logger (#819).
 fn refresh_log_levels(py: Python<'_>) {
     let handle = LOG_RESET.get_or_init(py, || {
-        pyo3_log::Logger::new(py, pyo3_log::Caching::LoggersAndLevels)
-            .ok()?
-            .install()
-            .ok()
+        let logger = pyo3_log::Logger::new(py, pyo3_log::Caching::LoggersAndLevels).ok()?;
+        let handle = logger.reset_handle();
+        log::set_boxed_logger(Box::new(Bridge(logger))).ok()?;
+        // pyo3-log's own default; Python's logging filters below it.
+        log::set_max_level(log::LevelFilter::Debug);
+        Some(handle)
     });
     if let Some(handle) = handle {
         handle.reset();
     }
+}
+
+/// Core's user-warning records (`tylertoo_core::USER_WARNING_LOG_TARGET`:
+/// unsorted input, a disk that may not fit, a shed valve prediction, #768),
+/// held for the binding that ran to raise as `UserWarning`s
+/// ([`detached`]), on success or failure, whatever Python's logging
+/// configuration.
+///
+/// shortcut: one buffer per process, so two bindings running at once on two
+/// Python threads may raise each other's warnings; key it by run if that
+/// ever matters.
+static USER_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The log bridge: pyo3-log, except for core's user warnings, which go to
+/// [`USER_WARNINGS`] instead of Python logging.
+struct Bridge(pyo3_log::Logger);
+
+impl log::Log for Bridge {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target() == tylertoo_core::USER_WARNING_LOG_TARGET || self.0.enabled(metadata)
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if record.target() == tylertoo_core::USER_WARNING_LOG_TARGET {
+            USER_WARNINGS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(record.args().to_string());
+        } else {
+            self.0.log(record);
+        }
+    }
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
+/// Run `f` with the GIL released, then raise the user warnings it logged
+/// ([`USER_WARNINGS`]), once each, from the caller's own frame; a warning
+/// escalated to an error (`-W error`) is the exception the call raises.
+fn detached<T: pyo3::marker::Ungil>(
+    py: Python<'_>,
+    f: impl pyo3::marker::Ungil + FnOnce() -> T,
+) -> PyResult<T> {
+    let out = py.detach(f);
+    let messages = std::mem::take(
+        &mut *USER_WARNINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let mut seen = std::collections::HashSet::new();
+    for message in messages {
+        if seen.insert(message.clone()) {
+            PyErr::warn(
+                py,
+                &py.get_type::<PyUserWarning>(),
+                &CString::new(message)?,
+                1,
+            )?;
+        }
+    }
+    Ok(out)
 }
 
 /// Before each binding starts work: build the worker pool, then refresh
@@ -335,7 +398,7 @@ fn convert(
     }
 
     // Release the GIL while the Rust pipelines run.
-    let outcome = py.detach(|| convert_to_pmtiles(&input, &output_path, &options));
+    let outcome = detached(py, || convert_to_pmtiles(&input, &output_path, &options))?;
     match outcome.map_err(tiles_error_to_py)? {
         // The combined report (#439): the two halves the two-step chain's own
         // reports would carry, keyed like the CLI's `tiles --report` JSON.
@@ -429,8 +492,7 @@ fn overview(
     let output_path = PathBuf::from(output);
 
     // Release the GIL while the Rust pipeline runs.
-    let mut report = py
-        .detach(|| match &parsed {
+    let mut report = detached(py, || match &parsed {
             OverviewInput::Path(input_path) => {
                 convert_to_overviews(input_path, &output_path, &options)
             }
@@ -438,7 +500,7 @@ fn overview(
                 let source = ConvertSource::from_input_list(inputs).map_err(ConvertError::from)?;
                 convert_to_overviews_sources(&source, &output_path, &options)
             }
-        })
+        })?
         .map_err(convert_error_to_py)?;
 
     report.source_losses = report.source_losses
@@ -461,8 +523,7 @@ fn export_pmtiles(
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
 
-    let mut report = py
-        .detach(|| export_pmtiles_core(&input_path, &output_path, &options))
+    let mut report = detached(py, || export_pmtiles_core(&input_path, &output_path, &options))?
         .map_err(export_error_to_py)?;
 
     report.source_losses = report.source_losses
@@ -568,8 +629,7 @@ fn pyramid(
     let bands = parse_bands(&bands).map_err(config_err)?;
     let output_path = PathBuf::from(output);
 
-    let report = py
-        .detach(|| build_pyramid(&bands, &output_path, &options))
+    let report = detached(py, || build_pyramid(&bands, &output_path, &options))?
         .map_err(pyramid_error_to_py)?;
     // The same shape as the CLI's `pyramid --report` JSON.
     report_dict(py, &report)
