@@ -3953,10 +3953,12 @@ thread_local! {
 }
 
 /// #768 predict: members in the larger price sample of a tile its first
-/// one ([`valve_predict::PRICE_MEMBERS`]) puts near a cap. Fewer than
-/// `MIN_SAMPLE_MEMBERS` prices nothing.
+/// one ([`valve_predict::PRICE_MEMBERS`]) puts near a cap. A sample that
+/// clips to fewer than `MIN_SAMPLE_MEMBERS` pieces prices nothing: below
+/// the first sample's rows, so a row whose bbox reaches the tile but whose
+/// clip there is empty does not leave the tile unpriced.
 const SAMPLE_MEMBERS: usize = 4096;
-const MIN_SAMPLE_MEMBERS: usize = 256;
+const MIN_SAMPLE_MEMBERS: usize = valve_predict::PRICE_MEMBERS * 3 / 4;
 
 /// Per row group: each tile (its index) and its rows to sample there.
 type SampleRows = BTreeMap<usize, Vec<(usize, Vec<u32>)>>;
@@ -16411,6 +16413,20 @@ mod tests {
         valve_predict::ValveFloors,
         Vec<crate::diagnostics::Diagnostic>,
     ) {
+        floored_scan_of(budget, None)
+    }
+
+    /// [`floored_scan`] with, at row `hollow`, a member of the west tile
+    /// whose bbox reaches it and whose clip there is empty: an L around its
+    /// north-west corner.
+    fn floored_scan_of(
+        budget: &mut MemoryBudget,
+        hollow: Option<usize>,
+    ) -> (
+        Vec<LevelScan>,
+        valve_predict::ValveFloors,
+        Vec<crate::diagnostics::Diagnostic>,
+    ) {
         let input = tempfile::NamedTempFile::new().unwrap();
         // The same grid in two z2 tiles, side by side.
         let squares: Vec<Geometry<f64>> = (0..12_000)
@@ -16425,7 +16441,21 @@ mod tests {
                 Geometry::Polygon(geo::Rect::new((x, y), (x + d, y + d)).to_polygon())
             })
             .collect();
-        write_fixture(input.path(), &[((0..12_000).collect(), squares)]);
+        let mut squares = squares;
+        if let Some(at) = hollow {
+            let l = LineString::from(vec![
+                (-10.0, 1.0),
+                (-5.0, 1.0),
+                (-5.0, 75.0),
+                (50.0, 75.0),
+                (50.0, 78.0),
+                (-10.0, 78.0),
+                (-10.0, 1.0),
+            ]);
+            squares.insert(at, Geometry::Polygon(geo::Polygon::new(l, vec![])));
+        }
+        let n = squares.len() as i64;
+        write_fixture(input.path(), &[((0..n).collect(), squares)]);
         let reader = OverviewReader::open(input.path()).unwrap();
         let zooms = resolve_level_zooms(reader.meta(), reader.num_levels()).unwrap();
         let opts = ExportOptions {
@@ -16460,6 +16490,28 @@ mod tests {
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_eq!(budget.available(), before);
         assert!(scans[0].tile_counts.values().sum::<usize>() >= 12_000);
+    }
+
+    /// #768: a tile is priced by the members its first sample's rows clip
+    /// to; a row whose bbox reaches the tile but whose clip is empty leaves
+    /// one fewer, and the tile is still priced.
+    #[test]
+    fn a_price_sample_with_an_empty_clip_still_prices_its_tile() {
+        let west = (2, 2, 1);
+        let floor = |hollow| {
+            let mut budget = MemoryBudget::with_available(Some(64 << 30));
+            floored_scan_of(&mut budget, hollow)
+                .1
+                .tiles
+                .get(&west)
+                .copied()
+        };
+        let whole = floor(None).expect("a floor") as f64;
+        // The west tile's 1,100th member: inside its first price sample.
+        // Unpriced, the tile would keep only its east neighbour's halved
+        // need as its floor.
+        let hollow = floor(Some(1_099)).expect("a floor") as f64;
+        assert!(hollow / whole > 0.75, "{hollow} against {whole}");
     }
 
     /// #768: the price samples are taken a chunk of tiles at a time, as
