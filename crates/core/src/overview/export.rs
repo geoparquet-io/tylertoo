@@ -485,7 +485,7 @@ pub struct ExportOptions {
         value_name = "smooth|tile|zoom",
         default_value_t = ExportOptions::default().valve_scope
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "How far the size valve's threshold reaches past the tile it fits: `smooth` predicts each tile's threshold from the export scan. Under `--size-valve merge` the tiles around a merging tile start from a threshold that fades over the next tile; under `--size-valve drop` a point tile over its cap drops its closest points down to its own predicted threshold or half an over-cap neighbour's. Density then steps down over a tile instead of at its edge. `tile` thins each tile only as much as it needs on its own. `zoom` starts every tile from the largest threshold predicted at its zoom, like tippecanoe's one threshold per zoom; not with --tile-range", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "How far the size valve's threshold reaches past the tile it fits: `smooth` predicts each tile's threshold from the export scan. Under `--size-valve merge` the tiles around a merging tile start from a threshold that fades over the next tile; under `--size-valve drop` a point tile over its cap keeps an even stride of its points: its own predicted share, or twice an over-cap neighbour's if smaller. Density then steps down over a tile instead of at its edge. `tile` thins each tile only as much as it needs on its own. `zoom` starts every tile from the largest threshold predicted at its zoom, like tippecanoe's one threshold per zoom; not with --tile-range", long_help = None))]
     pub valve_scope: ValveScope,
     /// Tile encoding, MVT by default. Each finished MVT tile is converted
     /// to MLT with mlt-core before gzip and both size caps, so the caps

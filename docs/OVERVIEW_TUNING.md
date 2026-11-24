@@ -1801,7 +1801,7 @@ reaches past the tile:
 it fits (#768):
 
 - `smooth` (the default) predicts, from the export's scan, which tiles go
-  over a cap and how far: each dense tile's gap threshold, priced by a real
+  over a cap and how far: each dense tile's threshold, priced by a real
   encode of a sample of its own members.
   - Under `merge` a tile then starts its merge at that threshold, in one
     encode, and its eight neighbours start at half of it. Merge density
@@ -1810,15 +1810,18 @@ it fits (#768):
     at z5–z7 from 2.3–3.7 to 1.0–2.4, for 6% more wall time (19.2 s to
     20.3 s, median of 3); on FTW Moldova, 1% (2.84 s to 2.87 s).
   - Under `drop` a point tile predicted over its cap is encoded first as
-    is. If it is still over, it drops the points closer to the point before
-    them than its own threshold, or than half the threshold of an over-cap
-    neighbour, whichever is larger. A point tile that fits keeps every
-    point; only tiles over a cap are thinned toward their denser
-    neighbours. On 1.8 million French points
+    is. If it is still over, it keeps a share of its points, an even stride
+    over their order: 0.9 times its predicted fit, or twice the share of an
+    over-cap neighbour, whichever is smaller. The stride keeps a city as
+    much denser than the country around it as it was, and neighbouring
+    tiles keep shares within a factor of 2 of each other. A point tile
+    that fits keeps every point; only tiles over a cap are thinned toward
+    their denser neighbours, so the density still jumps where an over-cap
+    tile meets one that fits. On 1.8 million French points
     (`--preset tippecanoe --size-valve drop --max-compressed-tile-size
     1500000`), the absolute log ratio of the kept shares on the two sides
-    of the 0° tile edge at z5 falls from 1.03–1.18 to 0.14–0.38, for 2%
-    more wall time (33.4 s to 34.2 s, median of 3).
+    of the 0° tile edge at z5 falls from 1.03–1.18 to 0.60–0.69, for
+    3% more wall time (33.7 s to 34.8 s, median of 3).
   - A tile still over its cap is reduced further, as under `tile`. Each
     tile's prediction reads only its own members, so a sharded build starts
     every tile from the same threshold as an unsharded one.
@@ -1829,7 +1832,9 @@ it fits (#768):
 - `tile` thins each tile only as much as it needs on its own. It is the
   output from before #768.
 - `zoom` starts every tile at a zoom from the largest threshold predicted
-  there, under either valve. Tippecanoe works this way: a tile too big
+  there, under either valve; under `drop`, every point tile keeps the
+  smallest share predicted at its zoom, as tippecanoe's
+  `--drop-fraction-as-needed` keeps one fraction a zoom. Tippecanoe works this way: a tile too big
   raises the zoom's threshold and the zoom is rebuilt with it, so sparse
   tiles next to dense ones are thinned too. A sharded build
   (`--tile-range`) cannot see the whole zoom and refuses it.

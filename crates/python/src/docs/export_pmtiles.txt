@@ -62,10 +62,11 @@ Args:
         tile it fits. `"smooth"` predicts each tile's threshold from the
         export scan. Under `size_valve="merge"` the tiles around a merging
         tile start from a threshold that fades over the next tile; under
-        `size_valve="drop"` a point tile over its cap drops its closest
-        points down to its own predicted threshold or half an over-cap
-        neighbour's. Density then steps down over a tile instead of at its
-        edge. `"tile"` thins each tile only as much as it needs on its own.
+        `size_valve="drop"` a point tile over its cap keeps an even stride
+        of its points: its own predicted share, or twice an over-cap
+        neighbour's if smaller. Density then steps down over a tile
+        instead of at its edge. `"tile"` thins each tile only as much as
+        it needs on its own.
         `"zoom"` starts every tile from the largest threshold predicted at
         its zoom, like tippecanoe's one threshold per zoom; not with
         `tile_range`.

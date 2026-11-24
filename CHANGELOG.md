@@ -202,13 +202,14 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The export scan predicts each dense tile's threshold. Under
   `--size-valve merge` the tiles around a merging tile start from half of
   it, so merge density steps down over a tile instead of at its edge; under
-  `--size-valve drop` a point tile still over its cap as is drops its
-  closest points, down to its own threshold or half an over-cap
-  neighbour's. The prediction stays within the export's memory budget; if
+  `--size-valve drop` a point tile still over its cap as is keeps an even
+  stride of its points: its own predicted share, or twice an over-cap
+  neighbour's if smaller, so a city stays denser than the country around
+  it. The prediction stays within the export's memory budget; if
   it cannot, the export warns and runs as `--valve-scope tile`.
   Archives change. `--valve-scope tile` restores the previous output, and
-  `--valve-scope zoom` starts every tile from its zoom's largest threshold
-  (not with `--tile-range`). The default costs at most 1.10× the build time
+  `--valve-scope zoom` starts every tile from its zoom's largest threshold,
+  for points the zoom's smallest share (not with `--tile-range`). The default costs at most 1.10× the build time
   of `tile` on the benchmark inputs (median of 3).
 - The Python wheel uses mimalloc as its global allocator on every platform,
   as the CLI does (#739, #792). On the 792 buildings input (median of 3),
