@@ -567,9 +567,21 @@ fn ring_box(ring: &TileRing) -> (i32, i32, i32, i32) {
 /// vertex only, which missed two parts that share two vertices and overlap
 /// between them (Madagascar adm4 feature 7844 at 4/10/8).
 fn parts_interact(a: &[TileRing], b: &[TileRing]) -> bool {
+    clean_parts_interact(a, b, part_clean(a) && part_clean(b))
+}
+
+/// Does a part pass the owner's check on its own?
+fn part_clean(part: &[TileRing]) -> bool {
+    !tile_polygon::polygons_invalid(&[part])
+}
+
+/// [`parts_interact`], given whether both parts pass alone: a part that
+/// fails alone fails beside any other, and two that pass alone fail only
+/// on what lies between them (#908).
+fn clean_parts_interact(a: &[TileRing], b: &[TileRing], both_clean: bool) -> bool {
     #[cfg(test)]
     crate::valve_counter::note(|c| c.parts_interact += 1);
-    tile_polygon::polygons_invalid(&[a, b])
+    !both_clean || tile_polygon::parts_cross(a, b)
 }
 
 /// Resolve overlaps *between* the parts of a multipolygon: each part is
@@ -605,11 +617,18 @@ fn joining_pairs(parts: &[Vec<TileRing>]) -> Vec<(u32, u32)> {
     #[cfg(test)]
     crate::valve_counter::note(|c| c.part_sweeps += 1);
     let boxes: Vec<_> = parts.iter().map(|p| ring_box(&p[0])).collect();
+    // Each part checked alone once, not once per pair it is in.
+    let clean: Vec<bool> = {
+        use rayon::prelude::*;
+        parts.par_iter().map(|p| part_clean(p)).collect()
+    };
     let components = uf_rush::UFRush::new(parts.len());
     // Tested only while the two are apart; `unite` is true for one join.
     par_strip_box_pairs(&boxes, |i, j| {
-        (!components.same(i, j) && parts_interact(&parts[i], &parts[j]) && components.unite(i, j))
-            .then_some((i as u32, j as u32))
+        (!components.same(i, j)
+            && clean_parts_interact(&parts[i], &parts[j], clean[i] && clean[j])
+            && components.unite(i, j))
+        .then_some((i as u32, j as u32))
     })
 }
 
@@ -4137,6 +4156,58 @@ mod tests {
         assert!(
             meet > 20 && apart > 20 && vertex_only > 5,
             "meet={meet} apart={apart} vertex_only={vertex_only}"
+        );
+    }
+
+    /// #908: the pair test splits into each part alone plus what lies
+    /// between them, and that split gives the whole check's answer, on
+    /// parts with holes, parts invalid alone, and parts far apart.
+    #[test]
+    fn pair_test_matches_the_whole_check() {
+        let mut seed = 0x9e37_79b9_u64;
+        let ring = |x: i32, y: i32, size: u32, seed: &mut u64| {
+            // Mostly rectangles, which are valid; random rings often are not.
+            if !lcg(seed).is_multiple_of(5) {
+                let (w, h) = (1 + (lcg(seed) % size) as i32, 1 + (lcg(seed) % size) as i32);
+                return closed(&[(x, y), (x + w, y), (x + w, y + h), (x, y + h)]);
+            }
+            let n = 3 + (lcg(seed) % 5) as usize;
+            let mut pts: Vec<(i32, i32)> = Vec::new();
+            while pts.len() < n {
+                let p = (x + (lcg(seed) % size) as i32, y + (lcg(seed) % size) as i32);
+                if !pts.contains(&p) {
+                    pts.push(p);
+                }
+            }
+            closed(&pts)
+        };
+        let part = |x: i32, y: i32, seed: &mut u64| {
+            let mut rings = vec![ring(x, y, 12, seed)];
+            if lcg(seed).is_multiple_of(2) {
+                rings.push(ring(x + 3, y + 3, 6, seed));
+            }
+            rings
+        };
+        let (mut clean_bad, mut clean_ok, mut unclean, mut far) = (0, 0, 0, 0);
+        for _ in 0..4000 {
+            let a = part(0, 0, &mut seed);
+            let (dx, dy) = (
+                (lcg(&mut seed) % 30) as i32 - 6,
+                (lcg(&mut seed) % 10) as i32 - 3,
+            );
+            let b = part(dx, dy, &mut seed);
+            let whole = tile_polygon::check_polygons(&[a.clone(), b.clone()]).is_err();
+            assert_eq!(parts_interact(&a, &b), whole, "{a:?} {b:?}");
+            match (part_clean(&a) && part_clean(&b), whole) {
+                (true, true) => clean_bad += 1,
+                (true, false) if dx > 12 => far += 1,
+                (true, false) => clean_ok += 1,
+                (false, _) => unclean += 1,
+            }
+        }
+        assert!(
+            clean_bad > 50 && clean_ok > 50 && unclean > 50 && far > 50,
+            "clean_bad={clean_bad} clean_ok={clean_ok} unclean={unclean} far={far}"
         );
     }
 
