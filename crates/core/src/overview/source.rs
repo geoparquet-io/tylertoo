@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::convert::ConvertError;
 use super::read::{read_in_order, ReadFlow, ReadTuning};
-use super::writer::INPUT_ROW_COLUMN;
+use super::writer::{INPUT_ROW_COLUMN, INPUT_ROW_MARKER};
 use crate::input_set::{ConvertSource, RowGroupSelection, StreamRowLocator};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -55,9 +55,12 @@ pub(super) trait BatchSource: Sync {
 }
 
 /// The overview's `input_row` field: each row's input row, last after the
-/// input's own columns.
+/// input's own columns, marked as the convert's ([`INPUT_ROW_MARKER`]).
 pub(super) fn input_row_field() -> Arc<Field> {
-    Arc::new(Field::new(INPUT_ROW_COLUMN, DataType::UInt64, false))
+    Arc::new(
+        Field::new(INPUT_ROW_COLUMN, DataType::UInt64, false)
+            .with_metadata([(INPUT_ROW_MARKER.to_string(), "1".to_string())].into()),
+    )
 }
 
 impl BatchSource for ConvertSource {

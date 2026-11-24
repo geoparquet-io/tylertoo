@@ -1216,6 +1216,32 @@ fn renamed_source_column_is_restored_in_the_exported_archive() {
     );
 }
 
+/// #768: the convert marks its own `input_row` column, so a source column
+/// of that name is renamed in the overview and published under its own
+/// name, while the convert's column ranks points and is never published.
+#[test]
+fn a_source_input_row_column_is_published_and_the_converts_is_marked() {
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tov = tempfile::NamedTempFile::new().unwrap();
+    write_input(tin.path(), &spread_points(6), true, Some("input_row"));
+    convert_to_overviews(tin.path(), tov.path(), &opts()).unwrap();
+    let reader = OverviewReader::open(tov.path()).unwrap();
+    let schema = reader.schema();
+    let ours = schema.field_with_name("input_row").unwrap();
+    assert!(
+        ours.metadata().contains_key("tylertoo:input_row"),
+        "the convert's column must keep its marker through the file: {ours:?}"
+    );
+    assert!(schema.field_with_name("input_row_").is_ok());
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    export_pmtiles(tov.path(), tout.path(), &ExportOptions::default()).unwrap();
+    let fields = archive_layer_fields(tout.path());
+    assert!(
+        fields.contains(&"input_row".to_string()) && !fields.contains(&"input_row_".to_string()),
+        "the source column publishes under its own name: {fields:?}"
+    );
+}
+
 /// The `vector_layers[].fields` keys of a PMTiles archive's JSON metadata.
 fn archive_layer_fields(path: &Path) -> Vec<String> {
     use std::io::Read;

@@ -12656,10 +12656,12 @@ fn skipped_property_columns(
         .collect()
 }
 
-/// The overview's `input_row` column (#768): convert's own, by name and type.
+/// The overview's `input_row` column (#768): the convert's own, by its
+/// marker and type. A user column of that name is a property.
 fn input_row_column(schema: &Schema) -> Option<usize> {
     let i = schema.index_of(INPUT_ROW_COLUMN).ok()?;
-    (schema.field(i).data_type() == &DataType::UInt64).then_some(i)
+    let f = schema.field(i);
+    (super::writer::is_input_row_column(f) && f.data_type() == &DataType::UInt64).then_some(i)
 }
 
 /// Every schema column that is a property candidate: not the geometry, not
@@ -12679,7 +12681,7 @@ fn candidate_columns<'a>(
         .filter(move |&(i, f)| {
             published.properties.as_ref().map_or(
                 i != geom_idx
-                    && !super::writer::is_unpublished_column(f.name())
+                    && !super::writer::is_unpublished_column(f)
                     && !super::writer::is_covering_column(f, geom, published.covering.as_deref()),
                 |indices| indices.contains(&i),
             ) && !published.is_suppressed(f.name())
@@ -20862,6 +20864,60 @@ mod tests {
         // Any floor keeps at least one member, and an empty tile none.
         assert_eq!(kept_at_floor(&members, u64::MAX).len(), 1);
         assert!(kept_at_floor(&[], u64::MAX).is_empty());
+    }
+
+    /// #768: rows a filter or the convert's thinning left with gaps (here
+    /// every odd row) still keep their floor's share, spread evenly: a floor
+    /// keeps a count of the tile's best-ranked points, not those below a
+    /// fixed rank, which every odd row's bit-reversed rank exceeds.
+    #[test]
+    fn a_drop_floor_keeps_its_share_of_gapped_rows() {
+        let odd: Vec<Member> = (0..10_000u64)
+            .map(|i| point_member(i as f64 * 1e-4, 1.0, 2 * i + 1))
+            .collect();
+        let rows = kept_rows(&kept_at_floor(&odd, share_floor(0.25)));
+        assert_eq!(rows.len(), 2_500);
+        assert!(
+            rows.windows(2).all(|w| w[1] - w[0] == 8),
+            "{:?}",
+            &rows[..8]
+        );
+    }
+
+    /// #768: an overview written before the convert marked its `input_row`
+    /// column has none of its own, so a column of that name is the user's: a
+    /// property, published, never a rank. Only the marked column ranks.
+    #[test]
+    fn only_the_converts_marked_input_row_column_is_a_rank() {
+        for marked in [false, true] {
+            let mut row = Field::new(INPUT_ROW_COLUMN, DataType::UInt64, false);
+            if marked {
+                row = row.with_metadata(
+                    [(
+                        super::super::writer::INPUT_ROW_MARKER.to_string(),
+                        "1".into(),
+                    )]
+                    .into(),
+                );
+            }
+            let schema = Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                geometry_field(),
+                row,
+            ]);
+            let published = PublishedNames::default();
+            let attrs = AttrColumns::new(&schema, 1, &published, None);
+            assert_eq!(attrs.input_row.is_some(), marked);
+            let props: Vec<String> = property_columns(&schema, 1, &published)
+                .into_iter()
+                .map(|(_, name)| name)
+                .collect();
+            assert_eq!(
+                props.contains(&INPUT_ROW_COLUMN.to_string()),
+                !marked,
+                "{props:?}"
+            );
+        }
     }
 
     /// Points on rows `rows`, one a row along a line, in input order.

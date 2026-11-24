@@ -92,11 +92,22 @@ pub const LEVEL_COLUMN: &str = "level";
 /// published as a property.
 pub(crate) const INPUT_ROW_COLUMN: &str = "input_row";
 
-/// Whether `name` is one of the columns an overview reserves for itself and
-/// never publishes: `level` or `input_row` (case-insensitively, as the
-/// collision renames match them).
-pub(crate) fn is_unpublished_column(name: &str) -> bool {
-    name.eq_ignore_ascii_case(LEVEL_COLUMN) || name.eq_ignore_ascii_case(INPUT_ROW_COLUMN)
+/// Field metadata key the convert puts on its own `input_row` column. An
+/// overview written before #768 has none, so a column of its own named
+/// `input_row` is a user property: published, and never taken for a rank.
+pub(crate) const INPUT_ROW_MARKER: &str = "tylertoo:input_row";
+
+/// Whether `field` is the convert's own `input_row` column
+/// ([`INPUT_ROW_MARKER`]).
+pub(crate) fn is_input_row_column(field: &arrow_schema::Field) -> bool {
+    field.name() == INPUT_ROW_COLUMN && field.metadata().contains_key(INPUT_ROW_MARKER)
+}
+
+/// Whether `field` is one of the columns an overview reserves for itself and
+/// never publishes: `level` (case-insensitively, as the collision renames
+/// match it) or the convert's `input_row` ([`is_input_row_column`]).
+pub(crate) fn is_unpublished_column(field: &arrow_schema::Field) -> bool {
+    field.name().eq_ignore_ascii_case(LEVEL_COLUMN) || is_input_row_column(field)
 }
 
 /// Default ZSTD compression level (spec §4.5 recommends ZSTD).

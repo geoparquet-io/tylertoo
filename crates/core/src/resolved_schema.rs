@@ -685,7 +685,7 @@ fn property_indices(
                 && (!schema
                     .metadata()
                     .contains_key(crate::overview::level::OVERVIEWS_KEY)
-                    || !crate::overview::writer::is_unpublished_column(f.name()))
+                    || !crate::overview::writer::is_unpublished_column(f))
                 && !crate::overview::writer::is_covering_column(
                     f,
                     geometry,
@@ -1149,8 +1149,7 @@ pub(crate) fn publication_names(
         .fields()
         .iter()
         .filter(|f| {
-            !crate::overview::writer::is_unpublished_column(f.name())
-                && !suppressed.contains(f.name())
+            !crate::overview::writer::is_unpublished_column(f) && !suppressed.contains(f.name())
         })
         .map(|f| f.name().to_ascii_lowercase())
         .collect();
