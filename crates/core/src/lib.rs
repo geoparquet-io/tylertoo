@@ -202,7 +202,7 @@ pub use atomic_output::OutputNotWritable;
 pub use compression::Compression;
 pub use diagnostics::{
     AccountingError, CoveringWarning, CrsWarning, Diagnostic, PolygonRepairKind, RangeContext,
-    SourceLoss, SourceLossCause, SourceLosses,
+    SourceLoss, SourceLossCause, SourceLosses, USER_WARNING_LOG_TARGET,
 };
 pub use error::{Classify, ErrorKind};
 pub use input::{FetchStats, InputError};

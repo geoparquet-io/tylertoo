@@ -333,14 +333,20 @@ macro_rules! event_count {
     }};
 }
 
+/// The log target of a [`Diagnostic::is_user_warning`] event, so a frontend
+/// that raises them itself (Python's `UserWarning`) can keep the log bridge
+/// from printing each a second time.
+pub const USER_WARNING_LOG_TARGET: &str = "tylertoo_core::user_warning";
+
 impl Diagnostic {
     /// Number of events represented by this aggregate.
     pub fn count(&self) -> usize {
         *event_count!(self)
     }
     /// Whether a frontend that hands its caller a report, not a log
-    /// (Python), raises this as a warning too: advice a run that succeeded
-    /// still owes its caller (#768).
+    /// (Python), raises this as a warning instead: advice a run that
+    /// succeeded still owes its caller (#768). Logged under
+    /// [`USER_WARNING_LOG_TARGET`], which such a frontend filters out.
     pub fn is_user_warning(&self) -> bool {
         matches!(
             self,
@@ -761,6 +767,9 @@ impl Diagnostics {
                             | CoveringWarning::Reprojected,
                         ..
                     } => log::debug!("{event}"),
+                    _ if event.is_user_warning() => {
+                        log::warn!(target: USER_WARNING_LOG_TARGET, "{event}");
+                    }
                     _ => log::warn!("{event}"),
                 }
             }

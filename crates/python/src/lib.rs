@@ -75,6 +75,11 @@ fn refresh_log_levels(py: Python<'_>) {
     let handle = LOG_RESET.get_or_init(py, || {
         pyo3_log::Logger::new(py, pyo3_log::Caching::LoggersAndLevels)
             .ok()?
+            // Raised as `UserWarning`s instead (`warn_user_diagnostics`).
+            .filter_target(
+                tylertoo_core::USER_WARNING_LOG_TARGET.to_owned(),
+                log::LevelFilter::Off,
+            )
             .install()
             .ok()
     });
@@ -210,9 +215,9 @@ fn report_dict<T: serde::Serialize>(py: Python<'_>, report: &T) -> PyResult<Py<P
 
 /// The diagnostics core marks as user warnings (`Diagnostic::is_user_warning`:
 /// disk-shortage rechecks, unsorted input and a shed valve prediction, #768)
-/// arrive with a successful report; core already logged them while running.
-/// Raised as `UserWarning`s, deduplicated across report sections (including
-/// layered runs).
+/// arrive with a successful report; the log bridge drops their log records
+/// (`refresh_log_levels`). Raised as `UserWarning`s, deduplicated across
+/// report sections (including layered runs).
 fn warn_user_diagnostics<'a>(
     py: Python<'_>,
     diagnostics: impl IntoIterator<Item = &'a tylertoo_core::Diagnostic>,

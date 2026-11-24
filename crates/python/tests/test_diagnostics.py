@@ -211,3 +211,35 @@ def test_layered_losses_spill_per_layer_as_caller_owned_jsonl(tmp_path, spill):
     assert not isinstance(losses, list)
     causes = {row["cause"] for row in _take_spilled(losses, spill_path)}
     assert causes == {"quantized"}
+
+
+@pytest.mark.parametrize("command", ["overview", "convert"])
+def test_unsorted_input_warns_once(tmp_path, caplog, command):
+    """#768: unsorted input is one ``UserWarning``, not also a log record."""
+    caplog.set_level(logging.WARNING, logger="tylertoo_core")
+    metadata = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Point"]}},
+    }
+    # A grid of points in a scrambled order: no two consecutive rows are near.
+    side = 64
+    cells = [((i * 2654435761) % (side * side)) for i in range(side * side)]
+    points = [
+        struct.pack("<BIdd", 1, 1, (c % side) * 0.5, (c // side) * 0.5) for c in cells
+    ]
+    source = tmp_path / "unsorted.parquet"
+    pq.write_table(
+        pa.table({"geometry": points, "id": range(len(points))}).replace_schema_metadata(
+            {b"geo": json.dumps(metadata).encode()}
+        ),
+        source,
+    )
+    suffix = "pmtiles" if command == "convert" else "parquet"
+    with pytest.warns(UserWarning, match="not sorted by location") as raised:
+        getattr(tylertoo, command)(
+            str(source), str(tmp_path / f"out.{suffix}"), min_zoom=0, max_zoom=4
+        )
+    assert len([w for w in raised if "not sorted" in str(w.message)]) == 1
+    logged = [r for r in caplog.records if "not sorted" in r.getMessage()]
+    assert logged == [], [r.getMessage() for r in logged]

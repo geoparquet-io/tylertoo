@@ -3641,6 +3641,7 @@ impl core::marker::Unpin for tylertoo_core::ZoomReport
 impl core::marker::UnsafeUnpin for tylertoo_core::ZoomReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ZoomReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::ZoomReport
+pub const tylertoo_core::USER_WARNING_LOG_TARGET: &str
 pub trait tylertoo_core::Classify
 pub fn tylertoo_core::Classify::kind(&self) -> tylertoo_core::ErrorKind
 impl tylertoo_core::Classify for tylertoo_core::ArchiveError

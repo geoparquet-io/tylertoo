@@ -4942,6 +4942,7 @@ name = "tylertoo-python"
 version = "0.8.0"
 dependencies = [
  "clap",
+ "log",
  "mimalloc",
  "pyo3",
  "pyo3-log",
