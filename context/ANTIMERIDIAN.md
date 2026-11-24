@@ -37,7 +37,7 @@ Export now follows tippecanoe. Its `clip_to_tile` at z0 appends a copy
 of the feature shifted by one world width whenever the bbox reaches
 within the buffer of either edge, and every child tile inherits both
 copies. tylertoo tiles each copy (`wrap_shifts` in
-`overview/export.rs`: as stored, and ±360° when that copy overlaps the
+`overview/export/collect.rs`: as stored, and ±360° when that copy overlaps the
 buffered world) through the ordinary membership and clip. Pieces two
 copies put in one tile join into one multi-geometry. Three results:
 

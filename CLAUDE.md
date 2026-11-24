@@ -24,7 +24,7 @@ owners from #818.
 | Error class: CLI exit code and Python exception | `ErrorKind` and `Classify` in `error.rs`; frontends map the kind, never match variants or message text |
 | What is stable Rust API | the crate root of `tylertoo-core`; everything else lives under the `#[doc(hidden)]` `internal` module. `crates/core/tests/public_api_gate.rs` checks the baseline |
 | Parallel ordered Parquet read (convert's passes, export's band reads and scan) | `read_in_order` / `read_in_order_capped` in `overview/read.rs`; the capped form bounds a caller's read-ahead |
-| Members an export level group holds in flight | `group_schedule` and `InFlight` in `overview/export.rs`; the variable-depth export calls the same schedule |
+| Members an export level group holds in flight | `group_schedule` and `InFlight` in `overview/export/driver.rs`; the variable-depth export calls the same schedule |
 | Remote footer and staging requests in flight | `StageAdmission::requests_within` in `input.rs` |
 | Bounded pass-2 drain width | `MemoryBudget::drain_encodes` in `overview/memory.rs` |
 

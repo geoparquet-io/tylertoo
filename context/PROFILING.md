@@ -214,7 +214,7 @@ the decoder stacks. These are admission estimates, not measured peaks.
 
 ### Export: tile counts and active members
 
-[`LevelScan`](../crates/core/src/overview/export.rs) keeps a
+[`LevelScan`](../crates/core/src/overview/export/store.rs) keeps a
 `BTreeMap<u64, usize>` per level. Each occupied tile has 16 B of key/value
 payload on a 64-bit host, plus node headers, edges, unused slots, and
 allocator overhead. Counts are tile memberships, not distinct input rows.
@@ -1004,7 +1004,7 @@ which reads, decodes, and clips every band up front. In duplicating mode
 there is no fill (`fill` is exactly 0.0) and the same work happens per wave
 inside `levels`. Use `export.mode` to tell which case you are looking at.
 
-**Stages** (`crates/core/src/overview/export.rs`). Each timer's `Instant`
+**Stages** (`crates/core/src/overview/export/`). Each timer's `Instant`
 window is taken inside the innermost per-item closure (one geometry, one
 tile), never around a whole parallel section:
 
