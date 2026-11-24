@@ -684,3 +684,379 @@ pub(crate) fn select_kept_by_size<M>(
         ranked
     }
 }
+
+#[cfg(test)]
+mod diagnostic_row_alignment {
+    use super::*;
+
+    /// A kept merge's absorbed rows have the same cause whether dropping
+    /// singles fits the tile or the extent backstop must finish it.
+    #[test]
+    fn merge_valve_source_causes_do_not_depend_on_extent_backstop() {
+        use crate::diagnostics::{Diagnostics, SourceLossCause};
+
+        let members: Vec<_> = [
+            Geometry::LineString(geo::LineString::from(vec![(-10., 0.), (10., 0.)])),
+            Geometry::LineString(geo::LineString::from(vec![(-10., 0.), (10., 0.)])),
+            Geometry::Point(geo::Point::new(0., 0.)),
+            Geometry::Point(geo::Point::new(0., 0.)),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(row, geom)| Member {
+            key: 0,
+            seq: row as u64,
+            geom: geom.into(),
+            props: SharedProps::new(vec![]),
+            id: Some(100 + row as u64),
+            gap: if row == 0 { GAP_NONE } else { 1 },
+            band: 0,
+        })
+        .collect();
+        let mut opts = ExportOptions {
+            feature_id: Some("id".into()),
+            size_valve: SizeValve::Merge,
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let cache = test_gzip_cache();
+        let tb = TileCoord::new(0, 0, 0).bounds();
+        let ordered: Vec<_> = members.iter().collect();
+        let merged = coalesce_valve::coalesce_members(&ordered, 2);
+        // Exactly enough room for the merged lines and one unmerged point.
+        let singles_limit = build_mvt(
+            &cache,
+            &merged[..2],
+            &tb,
+            &opts,
+            &[],
+            &Diagnostics::default(),
+        )
+        .data
+        .len();
+        let merged_limit = build_mvt(&cache, &merged, &tb, &opts, &[], &Diagnostics::default())
+            .data
+            .len();
+        for (limit, dropped, backstop) in [
+            (merged_limit, 0, false),
+            (1, 2, true),
+            (singles_limit, 1, false),
+        ] {
+            opts.tile_size_limit = Some(limit);
+            let diagnostics = Diagnostics::default();
+            let mvt = encode_tile(
+                &cache,
+                &members,
+                &tb,
+                &opts,
+                &[],
+                &mut FillTally::default(),
+                &diagnostics,
+            );
+            assert_eq!(mvt.valve.reduced_extent.is_some(), backstop);
+            assert_eq!(mvt.valve.merged, 1);
+            assert_eq!(mvt.valve.dropped, dropped);
+            assert!(mvt.source_ids.contains(&0), "merged feature is kept");
+            account_sources(&members, &mvt, 0, &opts, &diagnostics).unwrap();
+            let losses = diagnostics.source_losses().unwrap();
+            let actual: Vec<_> = losses
+                .iter()
+                .map(|loss| {
+                    let loss = loss.unwrap();
+                    assert_eq!(loss.feature_id, Some(100 + loss.id));
+                    (loss.id, loss.cause)
+                })
+                .collect();
+            let mut expected = vec![(1, SourceLossCause::Merged)];
+            if dropped == 2 {
+                expected.push((2, SourceLossCause::ValveDropped));
+            }
+            if dropped > 0 {
+                expected.push((3, SourceLossCause::ValveDropped));
+            }
+            assert_eq!(actual, expected, "backstop={backstop}");
+            assert_eq!(
+                mvt.source_losses, expected,
+                "valve records each source's cause"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_regression_source_loss_valve_causes() {
+        use crate::diagnostics::{Diagnostics, SourceLossCause};
+
+        let line = || Geometry::LineString(geo::LineString::from(vec![(-10., 0.), (10., 0.)]));
+        let point = || Geometry::Point(geo::Point::new(0., 0.));
+        let empty = || Geometry::GeometryCollection(geo::GeometryCollection::default());
+        // With no valve loss, every lost row has an explicit encode cause.
+        // That overrides the tile fallback, making `merged >= 0` equivalent
+        // to `merged > 0` for the recorded losses in the zero/zero case.
+        for (geoms, valve, limit, dropped, merged, expected) in [
+            (
+                vec![point(), empty()],
+                SizeValve::Drop,
+                None,
+                0,
+                0,
+                vec![(1, SourceLossCause::EncodeDropped)],
+            ),
+            (
+                vec![line(), line()],
+                SizeValve::Merge,
+                Some(1),
+                0,
+                1,
+                vec![(1, SourceLossCause::Merged)],
+            ),
+            (
+                vec![point(), point()],
+                SizeValve::Drop,
+                Some(1),
+                1,
+                0,
+                vec![(1, SourceLossCause::ValveDropped)],
+            ),
+            (
+                vec![line(), line(), point(), point()],
+                SizeValve::Merge,
+                Some(1),
+                2,
+                1,
+                vec![
+                    (1, SourceLossCause::Merged),
+                    (2, SourceLossCause::ValveDropped),
+                    (3, SourceLossCause::ValveDropped),
+                ],
+            ),
+        ] {
+            let members: Vec<_> = geoms
+                .into_iter()
+                .enumerate()
+                .map(|(row, geom)| Member {
+                    key: 0,
+                    seq: row as u64,
+                    geom: geom.into(),
+                    props: SharedProps::new(vec![]),
+                    id: Some(100 + row as u64),
+                    gap: if row == 0 { GAP_NONE } else { 1 },
+                    band: 0,
+                })
+                .collect();
+            let opts = ExportOptions {
+                feature_id: Some("id".into()),
+                size_valve: valve,
+                tile_size_limit: limit,
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            };
+            let expected_features = members.len() - expected.len();
+            let cache = test_gzip_cache();
+            let mvt = encode_tile(
+                &cache,
+                &members,
+                &TileCoord::new(0, 0, 0).bounds(),
+                &opts,
+                &[],
+                &mut FillTally::default(),
+                &Diagnostics::default(),
+            );
+            assert_eq!(
+                (mvt.valve.dropped, mvt.valve.merged),
+                (dropped, merged),
+                "valve={:?}, features={}, bytes={}",
+                mvt.valve,
+                mvt.features,
+                mvt.data.len()
+            );
+            let diagnostics = Diagnostics::default();
+            let tiles = encode_members(
+                &cache,
+                members,
+                0,
+                &opts,
+                None,
+                &ExportTimers::default(),
+                &diagnostics,
+            )
+            .unwrap();
+            assert_eq!(tiles.len(), 1);
+            assert_eq!(tiles[0].feature_count, expected_features);
+            let losses = diagnostics.source_losses().unwrap();
+            let actual: Vec<_> = losses
+                .iter()
+                .map(|loss| {
+                    let loss = loss.unwrap();
+                    assert_eq!(loss.feature_id, Some(100 + loss.id));
+                    (loss.id, loss.cause)
+                })
+                .collect();
+            assert_eq!(actual, expected, "dropped={dropped}, merged={merged}");
+        }
+    }
+
+    #[test]
+    fn duplicate_feature_ids_do_not_cancel_another_source_rows_loss() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let geoms = vec![
+            Geometry::Point(geo::Point::new(1.0, 1.0)),
+            Geometry::Polygon(geo::Polygon::new(
+                geo::LineString::from(vec![
+                    (0.0, 0.0),
+                    (0.000001, 0.0),
+                    (0.000001, 0.000001),
+                    (0.0, 0.0),
+                ]),
+                vec![],
+            )),
+        ];
+        let members: Vec<Member> = geoms
+            .into_iter()
+            .enumerate()
+            .map(|(row, geom)| {
+                diagnostics
+                    .source_member_loss(
+                        row as u64,
+                        7,
+                        0,
+                        crate::diagnostics::SourceLossCause::ClipDropped,
+                    )
+                    .unwrap();
+                Member {
+                    key: 0,
+                    seq: row as u64,
+                    geom: geom.into(),
+                    id: Some(7),
+                    props: SharedProps::new(vec![]),
+                    gap: GAP_NONE,
+                    band: 0,
+                }
+            })
+            .collect();
+        assert_eq!(members[0].source_row(), 0);
+        let tiles = encode_members(
+            &test_gzip_cache(),
+            members,
+            0,
+            &ExportOptions {
+                feature_id: Some("id".into()),
+                tile_size_limit: None,
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+            None,
+            &ExportTimers::default(),
+            &diagnostics,
+        )
+        .unwrap();
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].feature_count, 1);
+        let losses = diagnostics.source_losses().unwrap();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses.iter().next().unwrap().unwrap().id, 1);
+        assert_eq!(losses.iter().next().unwrap().unwrap().feature_id, Some(7));
+        assert_eq!(
+            losses.iter().next().unwrap().unwrap().cause,
+            crate::diagnostics::SourceLossCause::Quantized
+        );
+    }
+
+    /// A tile whose own features all quantize away is not written, so a
+    /// #750 fill drawn for it must not count its host as emitted: an
+    /// emission cancels the host's recorded loss. `features` excludes the fill, while
+    /// `source_ids` includes it, which is what the `features > 0` guard in
+    /// `encode_members` separates.
+    #[test]
+    fn mutation_regression_fill_of_an_empty_tile_does_not_emit_its_host() {
+        use crate::diagnostics::{Diagnostics, SourceLossCause};
+
+        let triangle = Geometry::Polygon(geo::Polygon::new(
+            geo::LineString::from(vec![
+                (0.0, 0.0),
+                (0.000001, 0.0),
+                (0.000001, 0.000001),
+                (0.0, 0.0),
+            ]),
+            vec![],
+        ));
+        let members = vec![Member {
+            key: 0,
+            seq: 0,
+            geom: triangle.into(),
+            props: SharedProps::new(vec![]),
+            id: Some(7),
+            gap: GAP_NONE,
+            band: 0,
+        }];
+        let fills = coverage_fill::tests::test_fill_map([(
+            0,
+            0,
+            vec![vec![vec![
+                (0, 0),
+                (1000, 0),
+                (1000, 1000),
+                (0, 1000),
+                (0, 0),
+            ]]],
+        )]);
+        let opts = ExportOptions {
+            feature_id: Some("id".into()),
+            tile_size_limit: None,
+            compressed_tile_size_limit: None,
+            ..Default::default()
+        };
+        let diagnostics = Diagnostics::default();
+        // The host was already lost upstream; an emission would cancel that.
+        diagnostics
+            .source_member_loss(0, 7, 0, SourceLossCause::ClipDropped)
+            .unwrap();
+        let tiles = encode_members(
+            &test_gzip_cache(),
+            members,
+            0,
+            &opts,
+            Some(&fills),
+            &ExportTimers::default(),
+            &diagnostics,
+        )
+        .unwrap();
+        assert!(tiles.iter().all(|t| t.feature_count == 0), "no own feature");
+        let losses = diagnostics.source_losses().unwrap();
+        let causes: Vec<_> = losses.iter().map(|l| l.unwrap().cause).collect();
+        assert_eq!(causes, vec![SourceLossCause::ClipDropped]);
+    }
+
+    #[test]
+    fn export_decode_keeps_null_geometry_rows_aligned_with_feature_ids() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        crate::overview::testutil::write_input(
+            input.path(),
+            &[None, Some(Geometry::Point(geo::Point::new(12.0, 34.0)))],
+            true,
+            None,
+        );
+        let source = crate::input::InputSource::from_path(input.path()).unwrap();
+        let batch = source
+            .open()
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let schema = batch.schema();
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let geoms = decode_batch_geometries(
+            &batch,
+            &schema,
+            geometry_index(&schema).unwrap(),
+            Crs::Epsg4326,
+            &ExportTimers::default(),
+            &diagnostics,
+        )
+        .unwrap();
+        assert_eq!(geoms.len(), 2, "null rows must retain their source ID slot");
+        assert_eq!(geoms[0].coords_count(), 0);
+        assert_eq!(geoms[1], Geometry::Point(geo::Point::new(12.0, 34.0)));
+    }
+}

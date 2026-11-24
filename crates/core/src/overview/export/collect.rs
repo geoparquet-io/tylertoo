@@ -2000,3 +2000,592 @@ pub(super) fn members_recursive_vec(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use geo::LineString;
+
+    use super::super::tests::*;
+    use super::*;
+
+    // --- recursive splitter equivalence (issue #226) -------------------------
+
+    /// #750: the fill may take a quarter of a tile's size limit (a compressed
+    /// limit read as twice that many raw bytes), so the size valve does not
+    /// have to squeeze the tile's own features into half of it.
+    #[test]
+    fn the_fill_tile_bytes_are_a_quarter_of_the_limit() {
+        let raw = ExportOptions {
+            tile_size_limit: Some(1000),
+            compressed_tile_size_limit: None,
+            ..ExportOptions::default()
+        };
+        assert_eq!(fill_tile_bytes(&raw), 250);
+        let gz = ExportOptions {
+            tile_size_limit: None,
+            compressed_tile_size_limit: Some(1000),
+            ..ExportOptions::default()
+        };
+        assert_eq!(fill_tile_bytes(&gz), 500);
+        let none = ExportOptions {
+            tile_size_limit: None,
+            compressed_tile_size_limit: None,
+            ..ExportOptions::default()
+        };
+        assert_eq!(fill_tile_bytes(&none), usize::MAX);
+    }
+
+    /// #750: fill features are drawn but not counted as tile features, so the
+    /// report and tilestats count the data's own features, and a tile whose
+    /// features all failed to encode is not written for its fill alone.
+    #[test]
+    fn fill_features_do_not_count_as_tile_features() {
+        let tb = TileCoord::new(512, 300, 10).bounds();
+        let fill = [fill_square(7, 0, 0, 100)];
+        let mvt = build_mvt::<Member>(
+            &test_gzip_cache(),
+            &[],
+            &tb,
+            &ExportOptions::default(),
+            &[&fill[0]],
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert_eq!(mvt.features, 0);
+        assert!(!mvt.data.is_empty(), "the fill is still encoded");
+        assert_eq!(
+            mvt.source_ids,
+            vec![7],
+            "drawn fill retains its host source identity"
+        );
+    }
+
+    /// A z10 tile of 400 small, merge-able squares with a tag each, and a
+    /// fill of 80 squares between them.
+    fn crowded_tile() -> (TileBounds, Vec<Member>, Vec<FillFeature>) {
+        let tb = TileCoord::new(512, 300, 10).bounds();
+        let (dx, dy) = (
+            (tb.lng_max - tb.lng_min) / 40.0,
+            (tb.lat_max - tb.lat_min) / 40.0,
+        );
+        let members: Vec<Member> = (0..400u64)
+            .map(|i| {
+                let (c, r) = ((i % 20) as f64, (i / 20) as f64);
+                let (x, y) = (tb.lng_min + 2.0 * c * dx, tb.lat_min + 2.0 * r * dy);
+                Member {
+                    key: 0,
+                    seq: i,
+                    geom: Geometry::Polygon(
+                        geo::Rect::new(
+                            geo::coord! { x: x, y: y },
+                            geo::coord! { x: x + dx, y: y + dy },
+                        )
+                        .to_polygon(),
+                    )
+                    .into(),
+                    props: SharedProps::new(vec![(Arc::from("n"), PropertyValue::UInt(i))]),
+                    id: Some(i),
+                    gap: if i == 0 { GAP_NONE } else { 10 },
+                    band: 0,
+                }
+            })
+            .collect();
+        let fill: Vec<FillFeature> = (0..80)
+            .map(|i| fill_square(i as u64, 50 * (i % 40) + 2000, 100 * (i / 40) + 2000, 40))
+            .collect();
+        (tb, members, fill)
+    }
+
+    /// #788 phase 1: this guard is already green on main. Fill geometry is
+    /// encoded once; the repeated work is the tile builder and fit checks.
+    #[test]
+    fn phase1_first_fit_encodes_fill_polygons_once() {
+        coverage_fill::cost_probe::take();
+        let (tb, members, fill) = crowded_tile();
+        let polygons: usize = fill.iter().map(|f| f.polygons).sum();
+        let mut tally = FillTally::default();
+        let mvt = encode_tile(
+            &test_gzip_cache(),
+            &members,
+            &tb,
+            &ExportOptions::default(),
+            &fill,
+            &mut tally,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let counts = coverage_fill::cost_probe::take();
+        assert_eq!(tally.polygons, polygons);
+        assert_eq!(mvt.valve.passes, 2, "one base encode plus one fill pass");
+        assert_eq!(counts.fill_polygons_encoded, polygons, "{counts:?}");
+        assert_eq!(counts.fill_passes, 1, "{counts:?}");
+    }
+
+    /// #767: the base tile already has gzip bytes after its valve fit check.
+    /// `with_fill` must reuse that answer before attempting its first fill.
+    #[test]
+    fn phase1_fill_does_not_recompress_the_cached_base_tile() {
+        coverage_fill::cost_probe::take();
+        let (tb, members, fill) = crowded_tile();
+        let mut tally = FillTally::default();
+        let mvt = encode_tile(
+            &test_gzip_cache(),
+            &members,
+            &tb,
+            &ExportOptions {
+                compressed_tile_size_limit: Some(500_000),
+                ..Default::default()
+            },
+            &fill,
+            &mut tally,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let counts = coverage_fill::cost_probe::take();
+        assert!(mvt.gzip.is_some());
+        assert_eq!(counts.fill_passes, 1);
+        assert_eq!(
+            counts.cached_gzip_rechecks, 0,
+            "a cached base tile was sent through gzip again: {counts:?}"
+        );
+    }
+
+    /// #750: the fill takes only the room the tile's own features leave. A
+    /// tile whose features fit, but not with all of its fill, sheds fill;
+    /// no feature is merged or dropped for it.
+    #[test]
+    fn the_fill_only_takes_the_slack_its_features_leave() {
+        let (tb, members, fill) = crowded_tile();
+        let bare = encode_tile(
+            &test_gzip_cache(),
+            &members,
+            &tb,
+            &ExportOptions::default(),
+            &[],
+            &mut FillTally::default(),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let all: Vec<&FillFeature> = fill.iter().collect();
+        let full = build_mvt(
+            &test_gzip_cache(),
+            &members,
+            &tb,
+            &ExportOptions::default(),
+            &all,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let limit = bare.data.len() + (full.data.len() - bare.data.len()) / 2;
+        for valve in [SizeValve::Merge, SizeValve::Drop] {
+            let opts = ExportOptions {
+                tile_size_limit: Some(limit),
+                compressed_tile_size_limit: None,
+                size_valve: valve,
+                ..ExportOptions::default()
+            };
+            let mut tally = FillTally::default();
+            let mvt = encode_tile(
+                &test_gzip_cache(),
+                &members,
+                &tb,
+                &opts,
+                &fill,
+                &mut tally,
+                &crate::diagnostics::Diagnostics::default(),
+            );
+            assert_eq!((mvt.valve.merged, mvt.valve.dropped), (0, 0), "{valve:?}");
+            assert_eq!(mvt.features, members.len(), "{valve:?}");
+            assert!(
+                mvt.data.len() <= limit,
+                "{valve:?}: {} > {limit}",
+                mvt.data.len()
+            );
+            assert!(tally.shed > 0 && tally.polygons > 0, "{valve:?}: {tally:?}");
+        }
+    }
+
+    /// #750: a tile with no room for any of its fill is written without it,
+    /// and the encodes spent trying still count as valve passes, so the
+    /// work ratchets see them.
+    #[test]
+    fn fill_that_never_fits_still_counts_its_encodes() {
+        let (tb, members, fill) = crowded_tile();
+        let bare = encode_tile(
+            &test_gzip_cache(),
+            &members,
+            &tb,
+            &ExportOptions::default(),
+            &[],
+            &mut FillTally::default(),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let opts = ExportOptions {
+            tile_size_limit: Some(bare.data.len()),
+            compressed_tile_size_limit: None,
+            ..ExportOptions::default()
+        };
+        let mut tally = FillTally::default();
+        let mvt = encode_tile(
+            &test_gzip_cache(),
+            &members,
+            &tb,
+            &opts,
+            &fill,
+            &mut tally,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert_eq!(mvt.data, bare.data, "the tile goes without its fill");
+        assert_eq!(tally.polygons, 0);
+        assert!(mvt.valve.passes > 1, "{:?}", mvt.valve);
+    }
+
+    /// #750: on a tile over its limit without the fill, the valve decides
+    /// exactly as with no fill at all.
+    #[test]
+    fn the_fill_does_not_change_what_the_valve_keeps() {
+        let (tb, members, fill) = crowded_tile();
+        let bare_size = encode_tile(
+            &test_gzip_cache(),
+            &members,
+            &tb,
+            &ExportOptions::default(),
+            &[],
+            &mut FillTally::default(),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .data
+        .len();
+        for valve in [SizeValve::Merge, SizeValve::Drop] {
+            let opts = ExportOptions {
+                tile_size_limit: Some(bare_size / 2),
+                compressed_tile_size_limit: None,
+                size_valve: valve,
+                ..ExportOptions::default()
+            };
+            let without = encode_tile(
+                &test_gzip_cache(),
+                &members,
+                &tb,
+                &opts,
+                &[],
+                &mut FillTally::default(),
+                &crate::diagnostics::Diagnostics::default(),
+            );
+            let with = encode_tile(
+                &test_gzip_cache(),
+                &members,
+                &tb,
+                &opts,
+                &fill,
+                &mut FillTally::default(),
+                &crate::diagnostics::Diagnostics::default(),
+            );
+            assert!(
+                without.valve.merged + without.valve.dropped > 0,
+                "{valve:?}"
+            );
+            assert_eq!(
+                (with.valve.merged, with.valve.dropped, with.features),
+                (
+                    without.valve.merged,
+                    without.valve.dropped,
+                    without.features
+                ),
+                "{valve:?}"
+            );
+            assert!(
+                with.data.len() <= bare_size / 2 || with.data == without.data,
+                "{valve:?}"
+            );
+        }
+    }
+
+    /// #750: each fill polygon is drawn with the id and tags of the feature
+    /// it lies in, one fill feature per host, so an attribute-styled map
+    /// colours the fill like its neighbours.
+    #[test]
+    fn fill_polygons_carry_their_host_features_tags() {
+        let zoom = 10;
+        let tb = TileCoord::new(512, 300, zoom).bounds();
+        let mid = (tb.lng_min + tb.lng_max) / 2.0;
+        let half = |lng0: f64, lng1: f64, name: &str, id: u64| Member {
+            key: 0,
+            seq: 0,
+            geom: Geometry::Polygon(
+                geo::Rect::new(
+                    geo::coord! { x: lng0, y: tb.lat_min },
+                    geo::coord! { x: lng1, y: tb.lat_max },
+                )
+                .to_polygon(),
+            )
+            .into(),
+            props: SharedProps::new(vec![(
+                Arc::from("name"),
+                PropertyValue::String(name.to_string()),
+            )]),
+            id: Some(id),
+            gap: GAP_NONE,
+            band: 0,
+        };
+        let members = [
+            half(tb.lng_min, mid, "west", 7),
+            half(mid, tb.lng_max, "east", 9),
+        ];
+        let square =
+            |x: i32, y: i32| vec![vec![(x, y), (x + 100, y), (x + 100, y + 100), (x, y + 100)]];
+        // Two polygons in the west half, one in the east half.
+        let polys = vec![square(100, 100), square(3000, 2000), square(300, 3000)];
+        let (fill, tally) = fill_features(
+            &polys,
+            &members,
+            &tb,
+            &ExportOptions::default(),
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert_eq!(
+            tally,
+            FillTally {
+                polygons: 3,
+                vertices: 12,
+                shed: 0
+            }
+        );
+        let tagged: Vec<(Option<u64>, String)> = fill
+            .iter()
+            .map(|f| match f.props.iter().next().unwrap().1 {
+                PropertyRef::String(s) => (f.id, s.to_owned()),
+                other => panic!("unexpected tag {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            tagged,
+            vec![(Some(7), "west".to_string()), (Some(9), "east".to_string())]
+        );
+        assert!(fill.iter().all(|f| !f.cmds.is_empty()));
+    }
+
+    /// The recursive cascade must emit the same tile-key set as the direct
+    /// (full-geometry, per-tile) oracle, and each tile's encoded MVT bytes must
+    /// match.
+    fn assert_recursive_matches_direct(geom: &Geometry<f64>, zoom: u8, opts: &ExportOptions) {
+        let rec = members_by_key(members_recursive_vec(geom, zoom, opts, 0, u64::MAX));
+        let dir = members_by_key(members_direct_vec(geom, zoom, opts, 0, u64::MAX));
+        let mut rk: Vec<u64> = rec.keys().copied().collect();
+        rk.sort_unstable();
+        let mut dk: Vec<u64> = dir.keys().copied().collect();
+        dk.sort_unstable();
+        assert_eq!(rk, dk, "tile key set diverges at z{zoom}");
+        for k in rk {
+            let (kx, ky) = key_to_xy(k, zoom);
+            assert_eq!(
+                tile_mvt(k, &rec[&k], zoom, opts),
+                tile_mvt(k, &dir[&k], zoom, opts),
+                "tile ({kx}, {ky}) MVT diverges at z{zoom}",
+            );
+        }
+    }
+
+    /// M1 (#817): a monster coastline holds tens of thousands of vertices in
+    /// one feature. At a coarse zoom its whole cascade ran on one thread:
+    /// each child re-clips the parent's piece, four times per node.
+    #[test]
+    fn a_huge_feature_forks_its_cascade_at_coarse_zooms() {
+        let coast = Geometry::LineString(LineString::from(
+            (0..20_000)
+                .map(|k| {
+                    let t = f64::from(k) / 20_000.0;
+                    (-150.0 + 300.0 * t, 60.0 * (t * 40.0).sin())
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let forks = pool.install(|| {
+            CASCADE_FORKS.with(|c| c.set(0));
+            members_recursive_vec(&coast, 3, &ExportOptions::default(), 0, u64::MAX);
+            CASCADE_FORKS.with(|c| c.get())
+        });
+        assert!(forks > 0, "the z3 cascade never forked");
+        assert_recursive_matches_direct(&coast, 3, &ExportOptions::default());
+    }
+
+    /// Cross-check the recursive cascade against the direct oracle across a
+    /// corpus that exercises interior, seam-crossing, concave, wide, dense and
+    /// antimeridian features at a range of zooms (incl. depth-14 cascades). The
+    /// full unbounded key range stands in for a single all-covering partition.
+    #[test]
+    fn recursive_split_matches_direct_oracle() {
+        // Pin the fast path OFF: this oracle asserts the recursive cascade and
+        // the direct clip produce byte-identical MVT, which is a property of the
+        // splitter (#226) and holds only under the deterministic i_overlay clip.
+        // With `simple_clip_fastpath` on (the default), Sutherland–Hodgman
+        // rotates a clipped simple ring to a different start vertex, and the
+        // rotation differs between the recursive-halving and direct-clip paths —
+        // render-equivalent but not byte-identical, so the two paths legitimately
+        // diverge in bytes here. That render-equivalence is covered separately by
+        // the `clip.rs` `fastpath_*_render_equivalent` tests.
+        let opts = ExportOptions {
+            simple_clip_fastpath: false,
+            ..Default::default()
+        };
+        for (name, geom, zooms) in equivalence_corpus() {
+            for z in zooms {
+                // Panics carry the feature name via the zoom-tagged messages;
+                // prefix here for quick triage.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    assert_recursive_matches_direct(&geom, z, &opts);
+                }))
+                .unwrap_or_else(|_| panic!("equivalence failed for feature '{name}' at z{z}"));
+            }
+        }
+    }
+
+    /// `tile_buffer` is documented — and named — in TILE PIXELS, the unit
+    /// tippecanoe's `--buffer` uses. It was divided by `extent`, the MVT
+    /// coordinate resolution, making the real buffer 16x narrower than the
+    /// number said (the default 8 "pixels" was half a pixel) and coupling it to
+    /// a knob that has nothing to do with it: raising `extent` narrowed the
+    /// buffer.
+    ///
+    /// Pinned in MVT units so the expected value is legible: the default 5 px
+    /// (tippecanoe's `-b 5`) of a nominal 256 px tile is 80 units at extent
+    /// 4096.
+    #[test]
+    fn tile_buffer_is_tile_pixels_not_extent_units() {
+        let opts = ExportOptions::default();
+        assert_eq!(opts.tile_buffer, 5);
+        assert_eq!(opts.extent, 4096);
+
+        let in_mvt_units = buffer_fraction(&opts) * f64::from(opts.extent);
+        assert!(
+            (in_mvt_units - 80.0).abs() < 1e-9,
+            "5 tile pixels must be 80 MVT units at extent 4096, got {in_mvt_units}"
+        );
+
+        // Raising the extent must not change how wide the buffer is on the
+        // ground — it only changes how finely that width is expressed.
+        let finer = ExportOptions {
+            extent: 8192,
+            ..Default::default()
+        };
+        assert!(
+            (buffer_fraction(&finer) - buffer_fraction(&opts)).abs() < 1e-12,
+            "extent must not affect the buffer width"
+        );
+    }
+
+    /// A feature just inside a neighbouring tile's edge buffer must be a member
+    /// of that tile too, or the neighbour has nothing to draw the overlapping
+    /// part from and the feature is sliced at the seam. `--tile-buffer` is
+    /// documented as "carried across tile seams so features don't clip at
+    /// boundaries", which only holds if buffer widens tile MEMBERSHIP and not
+    /// just the clip rectangle of tiles the feature already occupies.
+    ///
+    /// The z1 seam is at lng 0, with tile (0,0) to its west and (1,0) to its
+    /// east. A point just east of the seam is inside (0,0) once that tile is
+    /// grown by its 8 px buffer, so both tiles must carry it. tippecanoe emits
+    /// it in both. A point comfortably beyond the buffer must NOT be in (0,0) —
+    /// without that half the assertion passes for any buffer at all, including
+    /// a wildly too-wide one.
+    #[test]
+    fn point_in_neighbour_buffer_is_a_member_of_that_tile() {
+        let opts = ExportOptions::default();
+        let zoom = 1;
+        // Buffer in degrees at z1: tile_width * buffer_px / 256
+        // = 180 * 8 / 256 = 5.625°.
+        let buffer_deg = buffer_deg_at_zoom(zoom, &opts);
+        let west = tile_key(0, 0, zoom);
+        let east = tile_key(1, 0, zoom);
+
+        // Inside (0,0)'s buffer, and inside (1,0) proper.
+        let inside = 0.9 * buffer_deg;
+        let keys = members_by_key(feature_tile_members(
+            &Geometry::Point(geo::Point::new(inside, 10.0)),
+            zoom,
+            &opts,
+            0,
+            u64::MAX,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
+        assert!(keys.contains_key(&east), "must be in its own tile (1,0)");
+        assert!(
+            keys.contains_key(&west),
+            "point {inside}° is within tile (0,0)'s {buffer_deg}° buffer but was \
+             not made a member of it; emitted tiles: {:?}",
+            keys.keys().collect::<Vec<_>>()
+        );
+
+        // Beyond the buffer: (1,0) only. Pins the buffer's WIDTH, not just that
+        // some widening happens.
+        let outside = 1.5 * buffer_deg;
+        let keys = members_by_key(feature_tile_members(
+            &Geometry::Point(geo::Point::new(outside, 10.0)),
+            zoom,
+            &opts,
+            0,
+            u64::MAX,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
+        assert!(keys.contains_key(&east), "must be in its own tile (1,0)");
+        assert!(
+            !keys.contains_key(&west),
+            "point {outside}° is {buffer_deg}° beyond tile (0,0) and must not be \
+             a member of it; emitted tiles: {:?}",
+            keys.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A bbox lying wholly outside the lon/lat domain must not come back from
+    /// [`expand_bbox`] looking wrapped.
+    ///
+    /// Clamping each edge on its own crosses them over — `lng_min` floored at
+    /// -180, `lng_max` capped at +180 — and `tile_ranges_for_bbox` reads
+    /// `lng_min > lng_max` as an antimeridian crossing and returns EVERY tile
+    /// column: 16,385 of them at z14, for a feature that belongs to none. A
+    /// dataset on the 0..360 convention, or one stray Pacific point at lng
+    /// 180.001, is enough. It fires at `--tile-buffer 0` too, so the defect is
+    /// in the clamp rather than the buffer width.
+    #[test]
+    fn out_of_domain_bbox_does_not_claim_every_tile_column() {
+        for tile_buffer in [0, 8, 128] {
+            let opts = ExportOptions {
+                tile_buffer,
+                ..Default::default()
+            };
+            for zoom in [1u8, 10, 14] {
+                for lng in [180.5, -180.5] {
+                    let bbox = TileBounds::new(lng, -17.0, lng, -17.0);
+                    let widened = expand_bbox(&bbox, buffer_deg_at_zoom(zoom, &opts));
+                    assert!(
+                        widened.lng_min <= widened.lng_max,
+                        "expand_bbox manufactured a wrapped bbox at lng {lng}, z{zoom}, \
+                         buffer {tile_buffer}: {widened:?}"
+                    );
+                    let ranges = member_ranges(&bbox, zoom, &opts);
+                    assert!(
+                        ranges.x2.is_none(),
+                        "out-of-domain bbox at lng {lng}, z{zoom}, buffer {tile_buffer} \
+                         took the antimeridian branch: {ranges:?}"
+                    );
+                    let span = u64::from(ranges.x.1 - ranges.x.0 + 1);
+                    assert!(
+                        span <= 2,
+                        "out-of-domain bbox at lng {lng}, z{zoom}, buffer {tile_buffer} \
+                         claims {span} tile columns"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A bbox that arrives ALREADY wrapped must stay wrapped — the collapse
+    /// above is only for a wrap the clamp itself manufactured.
+    #[test]
+    fn genuinely_wrapped_bbox_survives_expansion() {
+        let opts = ExportOptions::default();
+        let bbox = TileBounds::new(170.0, 0.0, -170.0, 10.0);
+        let widened = expand_bbox(&bbox, buffer_deg_at_zoom(4, &opts));
+        assert!(
+            widened.lng_min > widened.lng_max,
+            "a genuinely wrapped bbox must not be collapsed: {widened:?}"
+        );
+    }
+}
