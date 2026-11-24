@@ -14520,7 +14520,7 @@ mod tests {
         super::super::testutil::write_one_row_groups(&input, &segments, true, None);
         let levels = LevelPlan::ZoomRange {
             min_zoom: 0,
-            max_zoom: 6,
+            max_zoom: 7,
         };
         let plan = dir.path().join("convert.plan");
         convert_to_overviews(
@@ -14528,7 +14528,7 @@ mod tests {
             dir.path().join("coarse.parquet"),
             &ConvertOptions {
                 levels: levels.clone(),
-                zoom_ceiling: Some(3),
+                zoom_ceiling: Some(5),
                 save_plan: Some(plan.clone()),
                 ..Default::default()
             },
@@ -14544,13 +14544,13 @@ mod tests {
     #[test]
     fn shard_chain_widening_matches_on_eager_and_streaming_input() {
         let (dir, input, levels, plan) = coarse_plan_over_one_chain();
-        // The z4 tile over lng 22.5..45: its window (two pivot tiles of
-        // margin) stops at lng -22.5.
-        let id = crate::pmtiles_writer::tile_id(4, 9, 7);
+        // The z6 tile over lng 39.4..45: its window (nine pivot tiles of
+        // margin, #768) stops at lng -11.3, east of the chain's start.
+        let id = crate::pmtiles_writer::tile_id(6, 39, 30);
         let shard = ConvertOptions {
             levels,
             plan: Some(plan),
-            shard: Some(crate::shard::TileRange::new(4, id, id).unwrap()),
+            shard: Some(crate::shard::TileRange::new(6, id, id).unwrap()),
             ..Default::default()
         };
         let build = |eager: bool| {
@@ -14606,7 +14606,7 @@ mod tests {
         let mut plan = super::super::plan_state::ConvertPlan::load(&plan_path).unwrap();
         let chains = plan.chains.as_mut().expect("the plan carries the chains");
         assert!(
-            chains.entries.iter().any(|c| c.level >= 4),
+            chains.entries.iter().any(|c| c.level >= 6),
             "chains above the coarse job's ceiling are saved too"
         );
         for c in &mut chains.entries {
@@ -14614,7 +14614,7 @@ mod tests {
         }
         plan.save(&plan_path).unwrap();
 
-        let id = crate::pmtiles_writer::tile_id(4, 9, 7);
+        let id = crate::pmtiles_writer::tile_id(6, 39, 30);
         let out = dir.path().join("shard.parquet");
         convert_to_overviews(
             &input,
@@ -14622,7 +14622,7 @@ mod tests {
             &ConvertOptions {
                 levels,
                 plan: Some(plan_path),
-                shard: Some(crate::shard::TileRange::new(4, id, id).unwrap()),
+                shard: Some(crate::shard::TileRange::new(6, id, id).unwrap()),
                 ..Default::default()
             },
         )

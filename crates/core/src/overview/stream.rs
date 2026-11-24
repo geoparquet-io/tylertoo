@@ -10827,9 +10827,10 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_multi_rg_input(tin.path(), &coords, true);
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
-        // z4 tile x=0 spans lng -180..-157.5.
-        let id = crate::pmtiles_writer::tile_id(4, 0, 7);
-        let range = crate::shard::TileRange::new(4, id, id).unwrap();
+        // z8 tile x=0 spans lng -180..-178.6; its nine-tile read margin
+        // (#768) reaches -192.7 in the west and -166 in the east.
+        let id = crate::pmtiles_writer::tile_id(8, 0, 120);
+        let range = crate::shard::TileRange::new(8, id, id).unwrap();
         let sel =
             select_row_groups_streaming(&source, None, None, None, Some(&range), Crs::Epsg4326)
                 .unwrap()
@@ -10851,10 +10852,11 @@ mod tests {
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
         let crs = Crs::Epsg4326;
 
-        // z4 tile x=1 spans lng -157.5..-135; with its read margin the
-        // bounds stay west of -90, so only the wrapped group reaches it.
-        let id = crate::pmtiles_writer::tile_id(4, 1, 7);
-        let range = crate::shard::TileRange::new(4, id, id).unwrap();
+        // z8 tile x=14 spans lng -160.3..-158.9; with its nine-tile read
+        // margin (#768) the bounds stay west of -140, so only the wrapped
+        // group reaches it.
+        let id = crate::pmtiles_writer::tile_id(8, 14, 120);
+        let range = crate::shard::TileRange::new(8, id, id).unwrap();
         let read = range.read_bounds();
         assert!(read.lng_min <= -160.0 && read.lng_max < -10.0, "{read:?}");
 

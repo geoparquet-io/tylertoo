@@ -646,8 +646,8 @@ fn export_zoom_ceiling_emits_only_the_coarse_half() {
 
 /// A `--tile-buffer` wider than the cap is refused, sharded or not.
 ///
-/// A shard prunes its input to the row groups within two pivot tiles (512
-/// px) of its range; a buffer wider than that could pull geometry into one
+/// A shard prunes its input to the row groups within nine pivot tiles
+/// (2,304 px, #768) of its range; a buffer wider than that could pull geometry into one
 /// of its tiles from a row group it never read, and the tile would come out
 /// missing geometry the monolithic run has (#498). Since #433 every export is
 /// capped at one tile width (256 px), which sits inside that margin, so the

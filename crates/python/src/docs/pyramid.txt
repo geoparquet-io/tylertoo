@@ -57,6 +57,7 @@ Args:
         limit.
     size_valve: See `export_pmtiles()`.
     valve_scope: See `export_pmtiles()`.
+    valve_max_step: See `export_pmtiles()`.
     coverage_fill: See `export_pmtiles()`.
     max_zoom_simplify_factor: See `export_pmtiles()`. Bands default
         to `0`: nothing is simplified at the max zoom. `None` selects

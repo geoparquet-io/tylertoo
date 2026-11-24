@@ -719,10 +719,10 @@ impl MemoryBudget {
         phase: MemoryPhase,
         needed: u64,
     ) -> Result<(), ConvertError> {
-        let Some(available) = self.available() else {
+        if self.limit.is_none() {
             return Ok(());
-        };
-        let available = available.min(self.allowance(profile));
+        }
+        let available = self.room(profile);
         if needed > available {
             return Err(ConvertError::BudgetExceeded {
                 phase: phase.name(),
@@ -737,6 +737,15 @@ impl MemoryBudget {
     /// fail: a working set the run is better off holding than not (the
     /// spill's page cache under a cgroup limit). Nothing when unprobed.
     /// Returns what was reserved.
+    /// What a run under `profile` may still take before
+    /// [`require_allowance`](Self::require_allowance) refuses it: the
+    /// smaller of what the reservations and grants leave and the profile's
+    /// allowance; unbounded without a limit.
+    pub(super) fn room(&self, profile: MemoryProfile) -> u64 {
+        self.available()
+            .map_or(u64::MAX, |available| available.min(self.allowance(profile)))
+    }
+
     pub(super) fn reserve_up_to(&mut self, phase: MemoryPhase, bytes: u64) -> u64 {
         let taken = self.available().map_or(0, |available| available.min(bytes));
         let slot = &mut self.reserved[phase as usize];

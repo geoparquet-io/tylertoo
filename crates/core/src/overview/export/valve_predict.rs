@@ -2,7 +2,7 @@
 //! from the export scan, and the floors it puts on the tiles around it.
 //! Under `--size-valve merge` the need is a merge threshold over the gaps of
 //! lines and polygons; under `drop`, the share of a point tile's members to
-//! keep ([`predict_drop_need`], [`Scan::drop_floors`]).
+//! keep ([`predict_drop_need`]).
 //!
 //! The export scan ([`super::scan_all_levels`]) already visits every row's
 //! bbox and every tile it lands in. With `smooth` it also follows each
@@ -36,16 +36,17 @@
 //!    quantile.
 //!
 //! The floors ([`floors`]) are each tile's own need and its neighbours'
-//! needs, halved a ring. `merge_to_fit` starts its ladder at the tile's
-//! floor, so a tile predicted over usually fits on its first encode; the
-//! ladder stays the backstop that holds the cap. Under `drop` a point tile
-//! first keeps the share of its members its floor sets, by stride
-//! (`kept_at_floor`), then thins by stride as before.
+//! needs, faded by `1 / --valve-max-step` a ring, one rule for both valves.
+//! Every tile within reach starts from its floor before its first encode,
+//! a tile that would fit on its own too: `merge_to_fit` starts its ladder
+//! at it, and under `drop` a point tile first keeps the share of its
+//! members its floor sets, by rank (`kept_at_floor`). The size ladder after
+//! the floor stays the backstop that holds the cap.
 //!
 //! Sharding: everything a tile's need depends on comes from its own
 //! members, in file order, never from row positions or other tiles, and a
 //! shard holds every row of the tiles in its range and of their neighbours
-//! out to [`SMOOTH_RINGS`]. So a shard computes the floors the full build
+//! out to [`MAX_RINGS`]. So a shard computes the floors the full build
 //! does for every tile it owns, whatever row groups it pruned.
 //! shortcut: a geometry-sourced scan (an overview with no bbox covering)
 //! drops null rows before the predictor sees them, so a tile's sample rows
@@ -89,7 +90,7 @@ const DROP_KEEP: f64 = 0.9;
 
 /// A drop floor is `KEEP_ALL / share`, the share of a point tile's members
 /// it keeps: a floor at or under this keeps them all, twice it keeps half.
-/// Halving a floor one ring out (`SMOOTH_FACTOR`) doubles the share.
+/// Halving a floor one ring out (`--valve-max-step 2`) doubles the share.
 pub(crate) const KEEP_ALL: u64 = 1 << 20;
 
 /// `keep = 0.8 × fit^KEEP_EXP`: with the true first-encode fit, 1.0 under-
@@ -259,47 +260,84 @@ impl ValveFloors {
     pub(crate) fn len(&self) -> usize {
         self.tiles.len() + self.zooms.len()
     }
+
+    /// Bytes the floors hold through the export ([`FLOOR_ENTRY_BYTES`] a
+    /// tile floor).
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        (self.tiles.capacity() + self.zooms.capacity()) as u64 * FLOOR_ENTRY_BYTES
+    }
 }
 
-/// The share of a need (a squared distance) that reaches one Chebyshev ring
-/// further: 0.5, so the linear merge distance shrinks by 1/sqrt(2) a ring.
-const SMOOTH_FACTOR: f64 = 0.5;
-
-/// Rings a tile's need reaches. One: reaches of 3 to 8 changed no
-/// density step at z5 to z9 on NZ parcels or Moldova fields by more than
-/// 0.08, nor any drawn share or edge gap.
+/// The most Chebyshev rings a tile's need reaches (#768). A floor fades by
+/// `1 / --valve-max-step` a ring and stops where it no longer constrains a
+/// tile ([`no_op_floor`]); at the default step of 2 a drop floor is back to
+/// keep-all within 8 rings for any tile keeping 1/256 of its points or
+/// more, the reach the prototype measured (step p95 about ln 2 at every
+/// zoom on France and planet points).
 ///
 /// A shard holds every row within `shard::SHARD_READ_MARGIN_TILES` pivot
 /// tiles of its range, which must cover this many rings plus a tile buffer
 /// (at most one tile) at the pivot zoom, the widest tiles a shard owns.
-pub(crate) const SMOOTH_RINGS: i64 = 1;
+pub(crate) const MAX_RINGS: i64 = 8;
 const _: () = assert!(
-    (SMOOTH_RINGS + 1) as f64 <= crate::shard::SHARD_READ_MARGIN_TILES,
-    "a shard must read every row of the tiles its merge floors reach"
+    (MAX_RINGS + 1) as f64 <= crate::shard::SHARD_READ_MARGIN_TILES,
+    "a shard must read every row of the tiles its valve floors reach"
 );
 
-/// The floors `need` puts on the tiles: the largest of each tile's own need
-/// and its neighbours' needs times `SMOOTH_FACTOR` a ring, out to
-/// `SMOOTH_RINGS`, at the same zoom.
-pub(crate) fn floors(need: &HashMap<Key, u64>) -> HashMap<Key, u64> {
-    let mut out = HashMap::new();
+/// Resident bytes of one floor in [`ValveFloors::tiles`], with the map's
+/// slack: a 24-byte entry, its control byte, at most half the table empty.
+pub(crate) const FLOOR_ENTRY_BYTES: u64 = 52;
+
+/// The floor at or under which a valve does nothing at `zoom`: under drop
+/// [`KEEP_ALL`] (it keeps every point); under merge one squared tile grid
+/// unit (4096 to a tile), below which only features that quantize onto one
+/// grid point would merge.
+pub(crate) fn no_op_floor(valve: SizeValve, zoom: u8) -> u64 {
+    match valve {
+        SizeValve::Drop => KEEP_ALL,
+        SizeValve::Merge => px2_log2(zoom).exp2() as u64,
+    }
+}
+
+/// The floors `need` puts on the tiles, one fade rule for both valves: each
+/// tile's own need, and each need times `factor` a Chebyshev ring at the
+/// same zoom, the largest where they overlap. A need reaches out while its
+/// faded value still constrains a tile (above `stop` at its zoom), at most
+/// [`MAX_RINGS`]. `None` once the map would hold more than `max_floors`:
+/// it does not fit the export's memory.
+pub(crate) fn floors(
+    need: &HashMap<Key, u64>,
+    factor: f64,
+    stop: impl Fn(u8) -> u64,
+    max_floors: usize,
+) -> Option<HashMap<Key, u64>> {
+    let mut out: HashMap<Key, u64> = HashMap::new();
     for (&(z, x, y), &m) in need {
         let n = 1i64 << z;
-        for dy in -SMOOTH_RINGS..=SMOOTH_RINGS {
-            for dx in -SMOOTH_RINGS..=SMOOTH_RINGS {
+        let stop = stop(z);
+        for d in 0..=MAX_RINGS {
+            let v = (m as f64 * factor.powi(d as i32)) as u64;
+            if v <= stop {
+                break;
+            }
+            // The ring's tiles: its top and bottom rows, then its sides.
+            let ring = (-d..=d)
+                .flat_map(|dx| [(dx, -d), (dx, d)])
+                .chain((1 - d..d).flat_map(|dy| [(-d, dy), (d, dy)]));
+            for (dx, dy) in ring {
                 let (tx, ty) = (i64::from(x) + dx, i64::from(y) + dy);
                 if tx < 0 || ty < 0 || tx >= n || ty >= n {
                     continue;
                 }
-                let d = dx.abs().max(dy.abs());
-                let v = (m as f64 * SMOOTH_FACTOR.powi(d as i32)) as u64;
                 let e = out.entry((z, tx as u32, ty as u32)).or_insert(0);
                 *e = (*e).max(v);
             }
+            if out.len() > max_floors {
+                return None;
+            }
         }
     }
-    out.retain(|_, v| *v > 0);
-    out
+    Some(out)
 }
 
 /// The histogram bucket of `gap` at `zoom`.
@@ -562,6 +600,7 @@ impl Scan {
     }
 
     /// Tile `key`'s members at `level`.
+    #[cfg(test)]
     fn count(&self, level: usize, key: u64) -> u64 {
         self.levels[level][part(key)]
             .counts
@@ -626,84 +665,39 @@ impl Scan {
     }
 }
 
-impl Scan {
-    /// The floors `need` sets under `scope` ([`ValveScope::Tile`] sets
-    /// none): under `zoom` each zoom's largest need for every tile at it;
-    /// under `smooth`, [`floors`] for merge and [`Self::drop_floors`] for
-    /// drop.
-    pub(crate) fn floors(
-        &self,
-        scope: ValveScope,
-        need: &HashMap<Key, u64>,
-        (zooms, bytes): (&[u8], &HashMap<(usize, u64), MemberBytes>),
-        opts: &ExportOptions,
-    ) -> ValveFloors {
-        match (scope, opts.size_valve) {
-            (ValveScope::Tile, _) => ValveFloors::default(),
-            (ValveScope::Zoom, _) => {
-                let mut zoom_max: HashMap<u8, u64> = HashMap::new();
-                for (&(z, _, _), &m) in need {
-                    let e = zoom_max.entry(z).or_insert(0);
-                    *e = (*e).max(m);
-                }
-                ValveFloors {
-                    tiles: HashMap::new(),
-                    zooms: zoom_max,
-                }
+/// The floors `need` sets under `opts.valve_scope`: none under
+/// [`ValveScope::Tile`]; under `zoom` each zoom's largest need for every
+/// tile at it; under `smooth` [`floors`], faded by `1 /
+/// opts.valve_max_step` a ring, for either valve. `None` when the floors
+/// would hold more than `max_floors` tiles.
+pub(crate) fn valve_floors(
+    need: &HashMap<Key, u64>,
+    opts: &ExportOptions,
+    max_floors: usize,
+) -> Option<ValveFloors> {
+    Some(match opts.valve_scope {
+        ValveScope::Tile => ValveFloors::default(),
+        ValveScope::Zoom => {
+            let mut zooms: HashMap<u8, u64> = HashMap::new();
+            for (&(z, _, _), &m) in need {
+                let e = zooms.entry(z).or_insert(0);
+                *e = (*e).max(m);
             }
-            (ValveScope::Smooth, SizeValve::Merge) => ValveFloors {
-                tiles: floors(need),
-                zooms: HashMap::new(),
-            },
-            (ValveScope::Smooth, SizeValve::Drop) => ValveFloors {
-                tiles: self.drop_floors(need, zooms, bytes, opts),
-                zooms: HashMap::new(),
-            },
-        }
-    }
-
-    /// The drop valve's floors (#768): each point tile predicted over its
-    /// cap starts from its own need, and passes half of it (`SMOOTH_FACTOR`,
-    /// twice the share) to the tiles one ring out that are themselves
-    /// estimated over their cap at their own sampled bytes a member. A tile
-    /// that fits gets no floor and keeps every point: smoothing onto tiles
-    /// that fit thinned true Africa at z5 to 0.31 of `tile` (planet, 8
-    /// rings at 0.5, a gap floor).
-    pub(crate) fn drop_floors(
-        &self,
-        need: &HashMap<Key, u64>,
-        zooms: &[u8],
-        bytes: &HashMap<(usize, u64), MemberBytes>,
-        opts: &ExportOptions,
-    ) -> HashMap<Key, u64> {
-        let caps = caps(opts);
-        let over = |(z, x, y): Key| {
-            let Some(level) = zooms.iter().position(|&lz| lz == z) else {
-                return false;
-            };
-            let key = super::tile_key(x, y, z);
-            bytes
-                .get(&(level, key))
-                .is_some_and(|&b| fit(self.count(level, key), b, caps) < 1.0)
-        };
-        let mut out = need.clone();
-        for (&(z, x, y), &m) in need {
-            let v = (m as f64 * SMOOTH_FACTOR) as u64;
-            let n = 1i64 << z;
-            for (dx, dy) in (-1..=1).flat_map(|dx| (-1..=1).map(move |dy| (dx, dy))) {
-                let (tx, ty) = (i64::from(x) + dx, i64::from(y) + dy);
-                if (dx, dy) == (0, 0) || tx < 0 || ty < 0 || tx >= n || ty >= n {
-                    continue;
-                }
-                let k = (z, tx as u32, ty as u32);
-                if v > 0 && over(k) {
-                    let e = out.entry(k).or_insert(0);
-                    *e = (*e).max(v);
-                }
+            ValveFloors {
+                tiles: HashMap::new(),
+                zooms,
             }
         }
-        out
-    }
+        ValveScope::Smooth => ValveFloors {
+            tiles: floors(
+                need,
+                opts.valve_fade(),
+                |z| no_op_floor(opts.size_valve, z),
+                max_floors,
+            )?,
+            zooms: HashMap::new(),
+        },
+    })
 }
 
 fn sample_at(level: usize, key: u64, t: &Dense) -> SampleAt {
@@ -995,31 +989,97 @@ mod tests {
         assert!((share / (DROP_KEEP * f) - 1.0).abs() < 1e-6, "{share} {f}");
     }
 
+    /// #768: one fade rule: a need fades by the factor a ring and reaches
+    /// out while it still constrains a tile, at most `MAX_RINGS`.
     #[test]
-    fn floors_fade_by_ring_and_keep_a_tiles_own_need() {
+    fn floors_fade_by_the_factor_and_reach_while_they_constrain() {
         let need = HashMap::from([((7, 10, 10), 1_000u64), ((7, 30, 30), 64), ((8, 0, 0), 5)]);
-        let f = floors(&need);
-        let zoom = Scan::new(0).floors(
-            ValveScope::Zoom,
-            &need,
-            (&[], &HashMap::new()),
-            &ExportOptions::default(),
-        );
-        assert_eq!(
-            zoom.get((7, 99, 3)),
-            1_000,
-            "zoom: every tile, the zoom's max"
-        );
-        assert_eq!(zoom.get((8, 9, 9)), 5);
-        assert_eq!(zoom.get((9, 0, 0)), 0);
+        let f = floors(&need, 0.5, |_| 0, usize::MAX).unwrap();
         assert_eq!(f[&(7, 10, 10)], 1_000, "a tile starts at its own need");
         assert_eq!(f[&(7, 11, 10)], 500);
         assert_eq!(f[&(7, 9, 9)], 500, "a diagonal neighbour is one ring out");
-        let r = SMOOTH_RINGS as u32;
-        assert_eq!(f[&(7, 10 + r, 10)], 1_000 >> r, "the last ring");
-        assert_eq!(f.get(&(7, 11 + r, 10)), None, "past the last ring");
-        assert_eq!(f[&(7, 31, 31)], 32);
+        assert_eq!(f[&(7, 13, 7)], 125, "three rings out");
+        // 64 fades to 1 at ring 6, and 0 sets nothing.
+        assert_eq!(f[&(7, 36, 30)], 1);
+        assert_eq!(f.get(&(7, 37, 30)), None);
         assert_eq!(f[&(8, 1, 0)], 2);
         assert!(f.keys().all(|&(z, x, y)| x < 1 << z && y < 1 << z));
+        // The reach stops where the floor no longer constrains: a need of
+        // 64 above a stop of 8 reaches 2 rings at half a ring (32, 16).
+        let stopped = floors(
+            &HashMap::from([((9, 100, 100), 64)]),
+            0.5,
+            |_| 8,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(stopped.len(), 25, "{stopped:?}");
+        assert_eq!(stopped[&(9, 102, 98)], 16);
+        // A gentler fade reaches further, never past MAX_RINGS.
+        let r = MAX_RINGS as u32;
+        let far = floors(
+            &HashMap::from([((12, 100, 100), u64::MAX / 2)]),
+            0.9,
+            |_| 1,
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(far.contains_key(&(12, 100 + r, 100)));
+        assert!(!far.contains_key(&(12, 101 + r, 100)));
+        assert_eq!(far.len(), (2 * r as usize + 1).pow(2));
+        // Floors past the memory they may hold are refused, not truncated.
+        assert!(floors(&need, 0.5, |_| 0, 10).is_none());
+    }
+
+    /// #768: the scopes: `tile` sets none, `zoom` the zoom's largest need
+    /// on every tile, `smooth` the fade at `1 / --valve-max-step`, stopping
+    /// at each valve's own no-op floor.
+    #[test]
+    fn valve_scopes_set_their_floors() {
+        let need = HashMap::from([((7, 10, 10), 64 * KEEP_ALL), ((8, 0, 0), 5)]);
+        let opts = |valve_scope, size_valve, valve_max_step| ExportOptions {
+            valve_scope,
+            size_valve,
+            valve_max_step,
+            ..ExportOptions::default()
+        };
+        let tile = valve_floors(&need, &opts(ValveScope::Tile, SizeValve::Drop, 2.0), 0);
+        assert_eq!(tile, Some(ValveFloors::default()));
+        let zoom = valve_floors(&need, &opts(ValveScope::Zoom, SizeValve::Drop, 2.0), 0).unwrap();
+        assert_eq!(
+            zoom.get((7, 99, 3)),
+            64 * KEEP_ALL,
+            "every tile, the zoom's max"
+        );
+        assert_eq!(zoom.get((8, 9, 9)), 5);
+        assert_eq!(zoom.get((9, 0, 0)), 0);
+        let drop = valve_floors(
+            &need,
+            &opts(ValveScope::Smooth, SizeValve::Drop, 2.0),
+            usize::MAX,
+        )
+        .unwrap();
+        // 64x keep-all halves back to keep-all in 6 rings; the 5 sets nothing.
+        assert_eq!(drop.get((7, 15, 10)), 2 * KEEP_ALL);
+        assert_eq!(drop.get((7, 16, 10)), 0);
+        assert_eq!(drop.get((8, 0, 0)), 0);
+        let gentle = valve_floors(
+            &need,
+            &opts(ValveScope::Smooth, SizeValve::Drop, 1.25),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(gentle.get((7, 11, 10)), 64 * KEEP_ALL * 4 / 5);
+        assert!(gentle.tiles.len() > drop.tiles.len());
+        // Under merge the stop is one squared grid unit at the zoom.
+        let unit = no_op_floor(SizeValve::Merge, 7);
+        let merge = valve_floors(
+            &HashMap::from([((7, 10, 10), unit * 4)]),
+            &opts(ValveScope::Smooth, SizeValve::Merge, 2.0),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(merge.get((7, 11, 10)), unit * 2);
+        assert_eq!(merge.get((7, 12, 10)), 0);
     }
 }

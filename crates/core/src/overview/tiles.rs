@@ -484,6 +484,10 @@ impl TilesOptions {
             ),
             ("--size-valve", e.size_valve != defaults.size_valve),
             ("--valve-scope", e.valve_scope != defaults.valve_scope),
+            (
+                "--valve-max-step",
+                e.valve_max_step != defaults.valve_max_step,
+            ),
             ("--tile-format", e.tile_format != defaults.tile_format),
             ("--mlt-profile", e.mlt_profile != defaults.mlt_profile),
             ("--coverage-fill", e.coverage_fill != defaults.coverage_fill),
@@ -2015,7 +2019,7 @@ mod tests {
         let fleet_convert = ConvertOptions {
             levels: LevelPlan::ZoomRange {
                 min_zoom: 0,
-                max_zoom: 6,
+                max_zoom: 8,
             },
             shard_plan_digest: Some(digest.clone()),
             ..ConvertOptions::default()
@@ -2032,9 +2036,10 @@ mod tests {
 
         // The fixture's points all sit near the middle of the world; the
         // Hilbert curve starts in a corner, so the first pivot-zoom ids own
-        // none of them.
-        let base = crate::tile::hilbert_zoom_base(4);
-        let range = TileRange::new(4, base, base + 1).expect("a valid pivot range");
+        // none of them. z6, so the shard's nine-tile read margin (#768)
+        // stays clear of them.
+        let base = crate::tile::hilbert_zoom_base(6);
+        let range = TileRange::new(6, base, base + 1).expect("a valid pivot range");
         let options = TilesOptions {
             convert: ConvertOptions {
                 plan: Some(plan),
@@ -2046,7 +2051,7 @@ mod tests {
                     shards: 4,
                 },
                 range: Some(range),
-                pivot_zoom: 4,
+                pivot_zoom: 6,
                 cut_digest: digest,
                 binding: None,
             }),
@@ -2070,12 +2075,12 @@ mod tests {
                 shards: 4
             }
         );
-        assert_eq!(empty.pivot_zoom, 4);
+        assert_eq!(empty.pivot_zoom, 6);
         // A data shard owns [pivot, finest]: the pivot it was cut at, and
         // the zoom plan's maximum — never the plan's minimum, which belongs
         // to the coarse job.
-        assert_eq!(empty.min_zoom, 4, "declares the pivot, not the plan's min");
-        assert_eq!(empty.max_zoom, 6, "declares the zoom plan's maximum");
+        assert_eq!(empty.min_zoom, 6, "declares the pivot, not the plan's min");
+        assert_eq!(empty.max_zoom, 8, "declares the zoom plan's maximum");
         assert!(!empty.why.is_empty(), "carries the convert's own words");
         let json = serde_json::to_value(&empty).unwrap();
         assert_eq!(json["total_tiles"], 0);

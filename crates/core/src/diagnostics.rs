@@ -185,8 +185,9 @@ pub enum Diagnostic {
         parts: usize,
         ratio: f64,
     },
-    /// The `--valve-scope smooth|zoom` predictor outgrew the export scan's
-    /// memory budget, and the export fell back to `tile` (#768).
+    /// The `--valve-scope smooth|zoom` predictor, or the floors it set,
+    /// outgrew the export's memory budget, and the export fell back to
+    /// `tile` (#768).
     #[non_exhaustive]
     ValveFloorsShed { count: usize },
     #[non_exhaustive]
@@ -503,7 +504,7 @@ impl fmt::Display for Diagnostic {
             Self::Advisory {message,..} | Self::DiskShortage {message,..} => f.write_str(message),
             Self::MemoryBudget {machine,limit,..} => write!(f, "memory budget from cgroup limit: {limit} bytes (machine available: {machine:?} bytes)"),
             Self::SharedBordersUnpinned {..} => f.write_str("the shared-border pins outgrew the memory budget and were dropped: each polygon simplifies on its own, so neighbours may show slivers along their shared borders. Run on a machine with more memory, or pass --simplify-factor 0.25 to narrow the slivers (#802)"),
-            Self::ValveFloorsShed {..} => f.write_str("the valve-scope predictor outgrew the export scan's memory budget and was dropped: every tile over the size cap is fitted on its own, as under --valve-scope tile, so neighbouring tiles may thin unevenly. Run on a machine with more memory, or pass --valve-scope tile to skip the prediction (#768)"),
+            Self::ValveFloorsShed {..} => f.write_str("--valve-scope smooth did not fit the export's memory budget, so this export ran as --valve-scope tile: each tile over the size cap was thinned only as much as it needed on its own, and the density can jump at the edge of every such tile. To keep smooth edges, give the export more memory (more RAM, or `--profile speed`) or raise --valve-max-step, which shortens the floors' reach; pass --valve-scope tile to skip the prediction (#768)"),
             Self::UnsortedInput {input,parts,ratio,..} => {
                 write!(f, "the input is not sorted by location: consecutive rows lie {ratio:.1}x farther apart on average than in spatially sorted data. tylertoo keeps the input's row order, so tiles over the size cap will merge or drop features unevenly and may show stripes. Sort the input first: ")?;
                 if *parts > 1 {

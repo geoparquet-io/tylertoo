@@ -2689,6 +2689,7 @@ pub tylertoo_core::ExportOptions::tile_buffer: u32
 pub tylertoo_core::ExportOptions::tile_format: tylertoo_core::TileFormat
 pub tylertoo_core::ExportOptions::tile_range: core::option::Option<tylertoo_core::TileRange>
 pub tylertoo_core::ExportOptions::tile_size_limit: core::option::Option<usize>
+pub tylertoo_core::ExportOptions::valve_max_step: f64
 pub tylertoo_core::ExportOptions::valve_scope: tylertoo_core::ValveScope
 pub tylertoo_core::ExportOptions::variable_depth: bool
 pub tylertoo_core::ExportOptions::zoom_ceiling: core::option::Option<u8>
@@ -2716,6 +2717,7 @@ pub fn tylertoo_core::ExportOptions::with_tile_buffer(self, u32) -> Self
 pub fn tylertoo_core::ExportOptions::with_tile_format(self, tylertoo_core::TileFormat) -> Self
 pub fn tylertoo_core::ExportOptions::with_tile_range(self, core::option::Option<tylertoo_core::TileRange>) -> Self
 pub fn tylertoo_core::ExportOptions::with_tile_size_limit(self, core::option::Option<usize>) -> Self
+pub fn tylertoo_core::ExportOptions::with_valve_max_step(self, f64) -> Self
 pub fn tylertoo_core::ExportOptions::with_valve_scope(self, tylertoo_core::ValveScope) -> Self
 pub fn tylertoo_core::ExportOptions::with_variable_depth(self, bool) -> Self
 pub fn tylertoo_core::ExportOptions::with_zoom_ceiling(self, core::option::Option<u8>) -> Self

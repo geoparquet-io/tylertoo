@@ -408,8 +408,9 @@ Set `SPILL` to an existing directory on real disk. To rerun shard 7, submit
   for that input. Clustering, `--accumulate-attribute`, and tiny-polygon
   carriers cost shards nothing extra.
 - **`--tile-buffer` must be at most 256 tile pixels**, the cap for every
-  export. This fits inside the two pivot tiles (512 pixels) read around each
-  shard's range.
+  export. This fits inside the nine pivot tiles read around each shard's
+  range, a margin wide enough for `--valve-scope smooth` to fade a dense
+  tile's thinning over the tiles around it.
 - **CLI only.** The Python bindings do not expose sharding.
 - **Manual ranges.** `export-pmtiles --tile-range LO..HI` takes two tile ids
   at one zoom, and `--zoom-ceiling Z` emits the coarse half.

@@ -107,18 +107,23 @@ pub(crate) const MAX_SHARD_PIVOT_ZOOM: u8 = 10;
 /// zoom has the widest tiles of any zoom a shard owns, so its buffer is the
 /// largest absolute margin any of them needs.
 ///
-/// Two pivot tiles therefore covers every `--tile-buffer` up to **512** tile
-/// pixels — two full tile widths, against a default of 8 and a tippecanoe
-/// default of 5. Since #433 every export, sharded or not, is capped at
+/// The `--valve-scope smooth` floors set the width (#768): a tile's floor
+/// comes from the needs of the tiles up to
+/// [`MAX_RINGS`](crate::overview::export::valve_predict::MAX_RINGS) rings
+/// away, each predicted from every one of its rows, so a shard reads those
+/// rings plus a one-tile buffer: nine pivot tiles. That covers every
+/// `--tile-buffer` up to 2,304 tile pixels. Since #433 every export, sharded or not, is capped at
 /// [`MAX_TILE_BUFFER_PX`](crate::overview::export::MAX_TILE_BUFFER_PX) (one
 /// tile width) by
 /// [`ExportError::TileBufferTooWide`](crate::overview::export::ExportError::TileBufferTooWide),
 /// and the compile-time check below keeps that cap within this margin, so
 /// the bound is enforced, not merely assumed.
 ///
-/// The cost of the margin is bounded and small: a couple more row groups read
-/// per shard, on an input whose row groups are Hilbert-compact.
-pub(crate) const SHARD_READ_MARGIN_TILES: f64 = 2.0;
+/// The cost: a shard reads the row groups up to nine pivot tiles past its
+/// range, on an input whose row groups are Hilbert-compact (two before #768).
+/// The wider margin's cost is measured in `docs/OVERVIEW_TUNING.md`.
+pub(crate) const SHARD_READ_MARGIN_TILES: f64 =
+    (crate::overview::export::valve_predict::MAX_RINGS + 1) as f64;
 
 /// The largest `--tile-buffer` (in tile pixels) the read-pruning margin
 /// [`SHARD_READ_MARGIN_TILES`] covers. See that constant for the derivation.

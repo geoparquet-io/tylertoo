@@ -1125,6 +1125,62 @@ mod config_parity {
         );
     }
 
+    /// #768: `--valve-max-step` and `valve_max_step=` set the same field
+    /// on every command that exports, and both refuse a ratio of 1.
+    #[test]
+    fn valve_max_step_cli_python_core_configs_are_equal() {
+        let flags = ["--valve-max-step", "1.25"];
+        let keywords = |step: f64| native_keywords(json!({"valve_max_step": step}));
+        let core = ExportOptions::default().with_valve_max_step(1.25);
+
+        let args = cli::ExportPmtilesArgs::parse_from(
+            [&["export-pmtiles", "in", "out"][..], &flags].concat(),
+        );
+        let expected = serde_json::to_value(&core).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli::export_options(&args).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(export_config(keywords(1.25)).unwrap()).unwrap(),
+            expected
+        );
+        let args = cli::TilesArgs::parse_from([&["tiles", "in", "out"][..], &flags].concat());
+        assert_eq!(
+            cli::tiles_options(&args).unwrap().export.valve_max_step,
+            1.25
+        );
+        assert_eq!(
+            tiles_config(keywords(1.25)).unwrap().export.valve_max_step,
+            1.25
+        );
+        let args = cli::PyramidArgs::parse_from(
+            [
+                &["pyramid", "out", "--band", "0-3:never-read.parquet"][..],
+                &flags,
+            ]
+            .concat(),
+        );
+        assert_eq!(cli::pyramid_options(&args).export.valve_max_step, 1.25);
+        assert_eq!(
+            pyramid_config(keywords(1.25))
+                .unwrap()
+                .export
+                .valve_max_step,
+            1.25
+        );
+
+        let args = cli::ExportPmtilesArgs::parse_from([
+            "export-pmtiles",
+            "in",
+            "out",
+            "--valve-max-step",
+            "1",
+        ]);
+        assert!(cli::export_options(&args).unwrap().validate().is_err());
+        assert!(export_config(keywords(1.0)).unwrap().validate().is_err());
+    }
+
     /// #823: `--tile-format` and `--mlt-profile` on every command that
     /// takes them. MLT validates only in a build with the `mlt` feature.
     #[cfg(feature = "mlt")]

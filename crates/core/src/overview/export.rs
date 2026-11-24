@@ -170,7 +170,7 @@ use crate::{
 
 mod coalesce_valve;
 mod tile_data;
-mod valve_predict;
+pub(crate) mod valve_predict;
 use tile_data::TileData;
 
 mod coverage_fill;
@@ -236,8 +236,8 @@ pub(crate) const DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR: f64 = 0.25;
 /// there is no output past this value that is not also reachable below it.
 ///
 /// This is the one bound. The sharded path's read-pruning margin
-/// (`shard::SHARD_READ_MARGIN_TILES`, two pivot tiles = 512 px) is
-/// wider than this, so the cap satisfies it with 2x headroom; the
+/// (`shard::SHARD_READ_MARGIN_TILES`, nine pivot tiles since #768) is
+/// wider than this, so the cap satisfies it; the
 /// compile-time check next to that constant keeps it so, and
 /// [`ExportError::TileBufferTooWideForShard`] is no longer raised.
 pub const MAX_TILE_BUFFER_PX: u32 = 256;
@@ -360,18 +360,21 @@ impl std::str::FromStr for SizeValve {
 /// zoom, as `--drop-fraction-as-needed` keeps. [`ValveScope::Tile`] fits each tile
 /// alone, as tylertoo did before #768, so the density can jump at a tile
 /// edge where one tile needed thinning and its neighbour did not.
-/// [`ValveScope::Smooth`] predicts each tile's need and starts the tiles
-/// around it from half that threshold, so the density steps down over a
-/// tile and the rest of the zoom keeps its features.
+/// [`ValveScope::Smooth`] predicts each tile's need and starts every tile
+/// around it from that threshold faded by `1 / --valve-max-step` a tile, so
+/// the density steps down over several tiles and the rest of the zoom keeps
+/// its features.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ValveScope {
-    /// The default. Under `merge`, the eight tiles around a tile predicted
-    /// over its cap start from a fading floor of its merge threshold. Under
-    /// `drop`, a point tile predicted over its cap that is over it as is
-    /// keeps an even stride of its points: its own predicted share, or
-    /// twice an over-cap neighbour's, whichever is smaller; a point tile
-    /// that fits keeps all.
+    /// The default. Each tile predicted over its cap starts from its
+    /// predicted threshold, and every tile around it, one that fits too,
+    /// from that threshold faded by `1 / --valve-max-step` a ring of tiles,
+    /// out to where it no longer thins anything (at most
+    /// `valve_predict::MAX_RINGS` rings). Under `merge` the threshold is a
+    /// merge gap; under `drop`, the share of its points a point tile keeps,
+    /// by rank, so a tile keeps at most `--valve-max-step` times its
+    /// neighbour's share.
     #[default]
     Smooth,
     /// Each tile is thinned only as much as it needs on its own.
@@ -491,8 +494,21 @@ pub struct ExportOptions {
         value_name = "smooth|tile|zoom",
         default_value_t = ExportOptions::default().valve_scope
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "How far the size valve's threshold reaches past the tile it fits: `smooth` predicts each tile's threshold from the export scan. Under `--size-valve merge` the tiles around a merging tile start from a threshold that fades over the next tile; under `--size-valve drop` a point tile over its cap keeps an even stride of its points: its own predicted share, or twice an over-cap neighbour's if smaller. Density then steps down over a tile instead of at its edge. `tile` thins each tile only as much as it needs on its own. `zoom` starts every tile from the largest threshold predicted at its zoom, like tippecanoe's one threshold per zoom; not with --tile-range", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "How far the size valve's thinning reaches past the tile that needs it: `smooth` predicts each tile's threshold from the export scan and fades it over the tiles around, so neighbouring tiles differ by at most `--valve-max-step` (under `--size-valve drop`, in the share of points they keep) and the density steps down over several tiles instead of jumping at a tile edge; tiles near a dense one are thinned too. `tile` thins each tile only as much as it needs on its own: the most detail, with visible steps at tile edges. `zoom` starts every tile from the largest threshold predicted at its zoom, like tippecanoe's one threshold per zoom: no edges, the least detail; `--preset tippecanoe` sets it; not with --tile-range", long_help = None))]
     pub valve_scope: ValveScope,
+    /// The largest density step `--valve-scope smooth` allows between
+    /// neighbouring tiles (#768): a tile keeps at most this many times the
+    /// share of points its neighbour keeps, or merges at most this many
+    /// times less hard. Each tile's floor fades by `1 / valve_max_step` a
+    /// ring and reaches out until it no longer thins anything. Must be
+    /// finite and above 1; default 2.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "RATIO",
+        default_value_t = ExportOptions::default().valve_max_step
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "With `--valve-scope smooth`, the largest density step allowed between neighbouring tiles: a tile keeps at most RATIO times the points its neighbour keeps, or merges at most RATIO times less hard, so the thinning around a dense tile fades over the tiles beside it. 1.25 makes edges barely visible but spreads the thinning further; larger values come closer to `--valve-scope tile`. Must be above 1", long_help = None))]
+    pub valve_max_step: f64,
     /// Tile encoding, MVT by default. Each finished MVT tile is converted
     /// to MLT with mlt-core before gzip and both size caps, so the caps
     /// measure MLT bytes. MLT uses PMTiles tile type 6 and metadata format
@@ -773,6 +789,7 @@ with_setters!(ExportOptions {
     with_compressed_tile_size_limit => compressed_tile_size_limit: Option<usize>,
     with_size_valve => size_valve: SizeValve,
     with_valve_scope => valve_scope: ValveScope,
+    with_valve_max_step => valve_max_step: f64,
     with_tile_format => tile_format: TileFormat,
     with_mlt_profile => mlt_profile: MltProfile,
     with_coverage_fill => coverage_fill: bool,
@@ -802,6 +819,7 @@ impl Default for ExportOptions {
             compressed_tile_size_limit: Some(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT),
             size_valve: SizeValve::Merge,
             valve_scope: ValveScope::Smooth,
+            valve_max_step: 2.0,
             tile_format: TileFormat::Mvt,
             mlt_profile: MltProfile::Web,
             coverage_fill: false,
@@ -824,6 +842,12 @@ impl Default for ExportOptions {
 }
 
 impl ExportOptions {
+    /// What a `smooth` valve floor keeps of itself one ring further out
+    /// (#768): `1 / valve_max_step`.
+    pub(crate) fn valve_fade(&self) -> f64 {
+        self.valve_max_step.recip()
+    }
+
     pub(crate) fn has_tile_size_cap(&self) -> bool {
         self.tile_size_limit.is_some_and(|cap| cap > 0)
             || self.compressed_tile_size_limit.is_some_and(|cap| cap > 0)
@@ -892,6 +916,17 @@ impl ExportOptions {
                 message: format!("{option} must be a finite number >= 0, got {factor}"),
             });
         }
+        if !(self.valve_max_step.is_finite() && self.valve_max_step > 1.0) {
+            let option = "--valve-max-step / valve_max_step";
+            return Err(ConfigError::InvalidSpec {
+                option,
+                message: format!(
+                    "{option} is the largest density step between neighbouring tiles and must \
+                     be a finite number above 1 (2 is the default), got {}",
+                    self.valve_max_step
+                ),
+            });
+        }
         if self.tile_format == TileFormat::Mlt && !crate::tile_format::MLT_SUPPORTED {
             return Err(ConfigError::InvalidSpec {
                 option: "--tile-format / tile_format",
@@ -935,7 +970,8 @@ impl ExportOptions {
             return Err(ConfigError::InvalidSpec {
                 option: "--valve-scope / valve_scope",
                 message: "--valve-scope zoom takes each zoom's largest predicted need over the \
-                          whole input, which a shard (--tile-range) cannot see; use smooth or tile"
+                          whole input, which a shard (--tile-range) cannot see; use smooth or \
+                          tile (--preset tippecanoe sets zoom)"
                     .into(),
             });
         }
@@ -3842,13 +3878,35 @@ fn scan_with_floors(
     let floors = if p.is_shed() {
         Ok(valve_predict::ValveFloors::default())
     } else {
-        predict_floors(reader, cols, crs, (options, level_zooms), &p, budget)
+        predict_floors(reader, cols, crs, (options, level_zooms), &p, budget).map(|f| {
+            f.unwrap_or_else(|| {
+                warn_floors_shed("its floors", diagnostics);
+                valve_predict::ValveFloors::default()
+            })
+        })
     };
     budget.unreserve(MemoryPhase::Scan, held);
     for (scan, counts) in scans.iter_mut().zip(p.into_tile_counts()) {
         scan.tile_counts = counts;
     }
-    Ok((scans, floors?))
+    let floors = floors?;
+    // Held through pass 2: every tile reads its floor there.
+    budget.reserve_up_to(MemoryPhase::Scan, floors.resident_bytes());
+    Ok((scans, floors))
+}
+
+/// #768: say loudly that the `--valve-scope` floors did not fit the
+/// export's memory budget (`what` outgrew it), what that costs, and how to
+/// avoid it.
+fn warn_floors_shed(what: &str, diagnostics: &crate::diagnostics::Diagnostics) {
+    log::warn!(
+        "[export] --valve-scope: {what} outgrew the export's memory budget, so this export \
+         runs as --valve-scope tile: each tile is thinned only as much as it needs on its own, \
+         and the density can jump at the edge of every tile over the size cap. To keep the \
+         smooth edges, give the export more memory (a machine or cgroup with more RAM, or --profile speed), \
+         raise --valve-max-step (shorter reach), or pass --valve-scope tile to silence this"
+    );
+    diagnostics.record(crate::diagnostics::Diagnostic::ValveFloorsShed { count: 1 });
 }
 
 /// #768: drop the predictor's dense state when it outgrows what the scan
@@ -3867,12 +3925,8 @@ fn shed_over_budget(
         .require_allowance(profile, MemoryPhase::Scan, held)
         .is_err()
     {
-        log::warn!(
-            "[export] the valve-scope predictor holds {held} bytes, over the scan's memory budget: \
-             dropped, fitting every tile on its own"
-        );
         p.shed();
-        diagnostics.record(crate::diagnostics::Diagnostic::ValveFloorsShed { count: 1 });
+        warn_floors_shed(&format!("its predictor ({held} bytes)"), diagnostics);
     }
 }
 
@@ -3886,7 +3940,7 @@ fn predict_floors(
     (options, level_zooms): (&ExportOptions, &[u8]),
     p: &valve_predict::Scan,
     budget: &MemoryBudget,
-) -> Result<valve_predict::ValveFloors, ExportError> {
+) -> Result<Option<valve_predict::ValveFloors>, ExportError> {
     let t = Instant::now();
     // A sampled member's resident bytes, as pass 2 prices one.
     let member = export_member_bytes(reader, cols.0, reader.finest_level_mean_row_bytes())
@@ -3939,13 +3993,18 @@ fn predict_floors(
         )
     })?);
     let need = p.predict(level_zooms, &bytes, options);
-    let floors = p.floors(options.valve_scope, &need, (level_zooms, &bytes), options);
+    // The floors stay resident through the export, so they get what the
+    // budget has left beside the predictor's own state.
+    let max_floors =
+        usize::try_from(budget.room(options.profile) / valve_predict::FLOOR_ENTRY_BYTES)
+            .unwrap_or(usize::MAX);
+    let floors = valve_predict::valve_floors(&need, options, max_floors);
     log::info!(
         "[export] valve floors: {} tiles priced ({} by a larger sample), {} predicted over a cap, {} floors, {:.2}s (first sample {:.2}s; scan share {:.2}s)",
         bytes.len(),
         candidates.len(),
         need.len(),
-        floors.len(),
+        floors.as_ref().map_or(0, valve_predict::ValveFloors::len),
         t.elapsed().as_secs_f64(),
         t_first.as_secs_f64(),
         p.spent.as_secs_f64(),
@@ -11120,10 +11179,9 @@ const MIN_VALVE_EXTENT: u32 = 512;
 
 /// The drop valve. Under `--size-valve drop` a point tile with a #768 floor
 /// first keeps the share of its members the floor sets
-/// ([`kept_at_floor`]); then [`drop_members_to_fit`]. Under
-/// `--valve-scope smooth` the floor is a prediction: it applies only when
-/// the tile is over its cap without it, so a mispredicted tile keeps every
-/// point. Under `zoom` it is the zoom's share and always applies.
+/// ([`kept_at_floor`]), before its first encode and whether or not it
+/// would fit without it: the floor is how the tiles around a dense one
+/// fade toward it. Then [`drop_members_to_fit`] holds the cap.
 fn drop_to_fit(
     gzip_cache: &Arc<TileGzipCache>,
     members: &[Member],
@@ -11136,27 +11194,10 @@ fn drop_to_fit(
     if opts.floor == 0 || opts.size_valve != SizeValve::Drop || !is_point_like(members) {
         return drop_members_to_fit(gzip_cache, members, tb, opts, fill, fill_tally, diagnostics);
     }
-    let tried = opts.valve_scope == ValveScope::Smooth;
-    if tried {
-        let mut full =
-            build_tile_layers(gzip_cache, opts.layers, members, tb, opts, &[], diagnostics);
-        if tile_fit(&mut full, opts).unwrap_or(f64::INFINITY) >= 1.0 {
-            return drop_encoded_to_fit(
-                gzip_cache,
-                (members, full),
-                tb,
-                opts,
-                fill,
-                fill_tally,
-                diagnostics,
-            );
-        }
-    }
     let kept = kept_at_floor(members, opts.floor);
     let mut mvt = drop_members_to_fit(gzip_cache, &kept, tb, opts, fill, fill_tally, diagnostics);
     let shed = members.len() - kept.len();
     mvt.valve.dropped += shed;
-    mvt.valve.passes += u32::from(tried);
     mvt.oversized |= shed > 0;
     mvt
 }
@@ -16601,15 +16642,17 @@ mod tests {
     }
 
     /// #768: the predictor's state is charged to the export's budget while
-    /// its floors are priced, and returned once they are built.
+    /// its floors are priced, and returned once they are built; the floors
+    /// themselves stay charged, since pass 2 reads them.
     #[test]
     fn scan_with_floors_returns_the_budget_it_held() {
         let mut budget = MemoryBudget::with_available(Some(64 << 30));
-        let before = budget.available();
+        let before = budget.available().unwrap();
         let (scans, floors, diagnostics) = floored_scan(&mut budget);
         assert!(!floors.is_empty(), "the cap must bind");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        assert_eq!(budget.available(), before);
+        assert!(floors.resident_bytes() > 0);
+        assert_eq!(budget.available(), Some(before - floors.resident_bytes()));
         assert!(scans[0].tile_counts.values().sum::<usize>() >= 12_000);
     }
 
@@ -20361,6 +20404,29 @@ mod tests {
         assert!("neighbours".parse::<ValveScope>().is_err());
     }
 
+    /// #768: `--valve-max-step` is a ratio above 1 (2 by default); its
+    /// fade is the reciprocal, and anything else fails before any I/O.
+    #[test]
+    fn valve_max_step_is_a_finite_ratio_above_one() {
+        assert_eq!(ExportOptions::default().valve_max_step, 2.0);
+        assert_eq!(ExportOptions::default().valve_fade(), 0.5);
+        for ok in [1.000_1, 1.25, 2.0, 1e9] {
+            let opts = ExportOptions::default().with_valve_max_step(ok);
+            assert!(opts.check().is_ok(), "{ok}");
+        }
+        for bad in [1.0, 0.5, 0.0, -2.0, f64::NAN, f64::INFINITY] {
+            let err = ExportOptions::default()
+                .with_valve_max_step(bad)
+                .check()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("--valve-max-step") && err.contains("above 1"),
+                "{err}"
+            );
+        }
+    }
+
     /// #768: `tile` predicts nothing, so every tile is fitted alone as
     /// before; `smooth` and `zoom` predict under either valve, with a cap.
     /// `zoom` needs the whole input, so a shard refuses it.
@@ -20509,10 +20575,10 @@ mod tests {
     /// thinned toward it under the default `--valve-scope smooth`: the denser
     /// tile's predicted need, halved one ring out, keeps twice the dense
     /// tile's share of its points, fewer than its own need would. A tile
-    /// that fits on its own beside the
-    /// dense one gets no floor and keeps every point (true Africa beside the
-    /// Mediterranean on the planet). Each tile is priced at its own real
-    /// encode, and the cap binds the pairs' tile without the floor.
+    /// that fits on its own beside the dense one is thinned toward it too,
+    /// so the density fades instead of jumping at its edge. Each tile is
+    /// priced at its own real encode, and the cap binds the pairs' tile
+    /// without the floor.
     #[test]
     fn an_over_cap_point_tile_beside_a_denser_one_thins_toward_it() {
         let zooms = [10u8];
@@ -20595,11 +20661,23 @@ mod tests {
         assert_eq!(priced.len(), 3, "{priced:?}");
         let need = scan.predict(&zooms, &bytes, &opts);
         assert!(need.contains_key(&a) && need.contains_key(&b), "{need:?}");
-        let floors = scan.floors(opts.valve_scope, &need, (&zooms, &bytes), &opts);
+        let floors = valve_predict::valve_floors(&need, &opts, usize::MAX).unwrap();
+        // One fade rule: each need halves a ring, onto every tile in reach,
+        // until it is back to keep-all.
+        let fade = |k: valve_predict::Key, d: i32| {
+            need.get(&k)
+                .map_or(0, |&n| (n as f64 * 0.5f64.powi(d)) as u64)
+        };
         assert_eq!(floors.get(b), need[&a] / 2);
         assert!(floors.get(b) > need[&b], "the denser neighbour binds");
-        assert_eq!(floors.get(west), 0, "a tile that fits keeps its points");
-        assert_eq!(floors.get((10, 542, 483)), 0, "one ring only");
+        assert_eq!(
+            floors.get(west),
+            fade(a, 1),
+            "a tile that fits is floored too"
+        );
+        let two_out = fade(a, 2).max(fade(b, 1));
+        assert!(two_out > valve_predict::KEEP_ALL, "{two_out}");
+        assert_eq!(floors.get((10, 542, 483)), two_out, "the fade goes on");
 
         // The over-cap tile, encoded as the export does with its floor: it
         // keeps the share the dense neighbour's halved floor implies, which
@@ -20615,7 +20693,16 @@ mod tests {
         assert_eq!(thinned.valve.over_limit, 0);
         assert!(thinned.data.len() <= cap);
         assert!(thinned.oversized);
-        // `tile` sets no floors: the plain drop valve thins it by stride.
+        // The sparse tile fits on its own, yet its floor thins it toward its
+        // dense neighbour, before any encode, and it still fits the cap.
+        let on_sparse = members(&sparse, 2);
+        let west_mvt = encode(&on_sparse, &opts, Some(&floors), west);
+        assert_eq!(
+            west_mvt.valve.dropped,
+            on_sparse.len() - kept_at_floor(&on_sparse, floors.get(west)).len()
+        );
+        assert!(west_mvt.valve.dropped > 0 && west_mvt.data.len() <= cap);
+        // `tile` sets no floors: the plain drop valve thins it by rank.
         let alone = encode(&on_pairs, &opts, None, b);
         assert!(alone.valve.dropped > 0, "{:?}", alone.valve);
         let plain = drop_members_to_fit(
@@ -20839,11 +20926,11 @@ mod tests {
         assert_eq!(drop_at(Some(&floors), &merge).valve.dropped, 0);
     }
 
-    /// #768: under `smooth` a drop floor is a prediction, so a point tile
-    /// that fits without it keeps every point and is not oversized; under
-    /// `zoom` it is the zoom's threshold, which thins every tile at it.
+    /// #768: the encoder consumes a floor without knowing the scope: under
+    /// `smooth` and `zoom` alike a point tile that fits without its floor
+    /// is thinned to it before its first encode (one encode, no trial).
     #[test]
-    fn a_smooth_drop_floor_spares_a_tile_that_fits() {
+    fn a_drop_floor_thins_a_tile_that_fits_under_any_scope() {
         let tb = crate::tile::tile_bounds(0, 0, 0);
         let members: Vec<Member> = (0..400u64)
             .map(|i| point_member(-170.0 + 0.85 * i as f64, 0.37 * i as f64 - 70.0, i))
@@ -20872,13 +20959,13 @@ mod tests {
         };
         let smooth = encode(ValveScope::Smooth);
         assert_eq!(
-            (smooth.valve.dropped, smooth.oversized),
-            (0, false),
+            (smooth.valve.dropped, smooth.oversized, smooth.valve.passes),
+            (399, true, 1),
             "{:?}",
             smooth.valve
         );
         let zoom = encode(ValveScope::Zoom);
-        assert!(zoom.valve.dropped > 0 && zoom.oversized, "{:?}", zoom.valve);
+        assert_eq!(zoom.data, smooth.data);
     }
 
     /// #873: the margin starts on the second cut, so a tile that fits on

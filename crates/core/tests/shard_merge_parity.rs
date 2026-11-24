@@ -22,7 +22,7 @@
 //!   and absent `geo` metadata mean nothing prunes, so this is purely about
 //!   clipping and emission at a seam.
 //! * **`sharding-grid.parquet`** (1,440 synthetic polygons over the whole
-//!   world in 20 row groups *with* covering statistics, z0–z5, pivot z3,
+//!   world in 20 row groups *with* covering statistics, z0–z7, pivot z6,
 //!   N = 2, 3 and 4) — here every shard prunes, so the shared convert plan's
 //!   row-indexed winner table has to be re-addressed onto a narrower row
 //!   stream. That is the step where an off-by-one row group produces an
@@ -959,8 +959,10 @@ fn grid() -> PathBuf {
 fn grid_build(shards: usize, flavor: Flavor) -> Build {
     Build {
         min_zoom: 0,
-        max_zoom: 5,
-        pivot: 3,
+        // z6: a shard reads nine pivot tiles past its range (#768), so a
+        // coarser pivot reads the whole world grid and prunes nothing.
+        max_zoom: 7,
+        pivot: 6,
         shards,
         expect_row_group_pruning: true,
         flavor,
@@ -1058,9 +1060,9 @@ fn sharded_build_matches_monolithic_with_merge_floors_and_a_feature_order() {
 
 /// #768: under `--size-valve drop` every data shard predicts the point
 /// tiles' drop floors over its own pruned overview file, and thins each
-/// over-cap point tile to its floor's share by a stride over the tile's own
-/// members, so the sharded build is byte-identical to the monolithic one
-/// outright.
+/// point tile in their reach to its floor's share by the rank of each
+/// point's input row, so the sharded build is byte-identical to the
+/// monolithic one outright.
 #[test]
 fn sharded_build_matches_monolithic_with_drop_floors() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1080,7 +1082,29 @@ fn sharded_build_matches_monolithic_with_drop_floors() {
     assert_sharded_build_matches_monolithic(&input, build);
 }
 
-/// #768: points in a 40 x 2.5 degree strip inside one row of z7 tiles,
+/// #768: the drop floors under `--feature-order`: a tile's members are
+/// sorted by a column, but each keeps the rank its input row gives it, so
+/// a shard keeps the same points as the monolithic build.
+#[test]
+fn sharded_build_matches_monolithic_with_drop_floors_and_a_feature_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("points.parquet");
+    write_dense_points(&input);
+    let build = Build {
+        min_zoom: 0,
+        max_zoom: 8,
+        pivot: 7,
+        shards: 3,
+        expect_row_group_pruning: true,
+        flavor: Flavor::UnthinnedPoints,
+        coarse_level_ceiling: false,
+        tile_cap: Some((24 * 1024, ValveScope::Smooth, SizeValve::Drop)),
+        feature_order: Some("weight"),
+    };
+    assert_sharded_build_matches_monolithic(&input, build);
+}
+
+/// #768: points in a 100 x 2.5 degree strip inside one row of z7 tiles,
 /// every other z7 tile two and a half times as dense, longitude-sorted into
 /// 20 row groups: under a small cap both kinds of z7 tile are over, so the
 /// sparser take drop floors from their denser neighbours.
@@ -1096,7 +1120,7 @@ fn write_dense_points(path: &Path) {
     let mut rows = Vec::new();
     let mut x = 0.0f64;
     let mut i = 0i64;
-    while x < 40.0 {
+    while x < 100.0 {
         let mut y = 0.2;
         for j in 0..50i64 {
             let id = i * 50 + j;
@@ -1112,7 +1136,7 @@ fn write_dense_points(path: &Path) {
     write_covered_grid(path, rows, "Point", per_group);
 }
 
-/// #768: small squares in a 40 x 2.5 degree strip inside one row of z7
+/// #768: small squares in a 100 x 2.5 degree strip inside one row of z7
 /// tiles, every other z7 tile four times as dense, longitude-sorted into 20
 /// row groups. A small cap merges the dense z7 tiles, their sparse
 /// neighbours fit and take floors from them, and the z7 shards prune.
@@ -1138,7 +1162,7 @@ fn write_dense_squares(path: &Path) {
     let mut rows = Vec::new();
     let mut x = 0.0f64;
     let mut i = 0i64;
-    while x < 40.0 {
+    while x < 100.0 {
         let mut y = 0.2;
         for j in 0..50i64 {
             let id = i * 50 + j;
@@ -1346,7 +1370,7 @@ fn sharded_build_matches_monolithic_with_coalesced_line_chains() {
     let build = Build {
         min_zoom: 0,
         max_zoom: 7,
-        pivot: 4,
+        pivot: 6,
         shards: 4,
         expect_row_group_pruning: true,
         flavor: Flavor::Defaults,

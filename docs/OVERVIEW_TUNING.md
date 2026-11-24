@@ -1649,7 +1649,7 @@ matching tippecanoe's `--buffer` (default 5).
 At 256, a tile already includes features from all eight neighbors. Larger
 buffers would reach nonadjacent tiles and risk O(features × tiles) export,
 so tylertoo rejects them before conversion or export. Sharded builds read
-two pivot tiles (512 px) beyond their range, covering this margin. See
+nine pivot tiles beyond their range, covering this margin. See
 [Scaling](guides/scaling.md#sharded-builds).
 
 ### Max-zoom simplification
