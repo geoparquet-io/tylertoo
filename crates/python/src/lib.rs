@@ -92,8 +92,9 @@ fn refresh_log_levels(py: Python<'_>) {
 /// configuration.
 ///
 /// shortcut: one buffer per process, so two bindings running at once on two
-/// Python threads may raise each other's warnings (none is lost, unless a
-/// run panics, which empties it); key it by run if that ever matters.
+/// Python threads may raise each other's warnings, and a run that panics,
+/// or a `_run_cli` beside a binding, takes the others' with it; key it by
+/// run if that ever matters.
 static USER_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// The log bridge: pyo3-log, except for core's user warnings, which go to
@@ -733,13 +734,10 @@ fn _defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
 fn _run_cli(py: Python<'_>, argv: Vec<std::ffi::OsString>) -> u8 {
     let code = py.detach(|| tylertoo_cli::run(argv));
     // After a binding installed the bridge, the CLI's user warnings land in
-    // the buffer; print them as the CLI's own logger would, unless
-    // `--quiet` or a lower cap hides warnings.
-    let messages = take_user_warnings();
-    if log::max_level() >= log::LevelFilter::Warn {
-        for message in messages {
-            eprintln!("{message}");
-        }
+    // the buffer (and `RUST_LOG` is not read); print them, as `--quiet`
+    // keeps warnings too.
+    for message in take_user_warnings() {
+        eprintln!("{message}");
     }
     code
 }
