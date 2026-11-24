@@ -470,7 +470,7 @@ pub(super) fn level_read_backing(
             (affordable as u64).saturating_mul(per_member) >> 20
         )
     };
-    log::debug!(
+    log::debug!(target: LOG_TARGET,
         "[profile]     z{} level store grants: wave {} MiB ({wave_members} members), \
          level {} of {} MiB wanted ({level_members} members at {per_member} B), \
          {affordable} was affordable",
@@ -1246,7 +1246,7 @@ pub(super) fn fill_member_store(
     // Every spill flush (during routing and the final one) → `spill_write`;
     // `fanout_batch_members` already kept its share out of `decode`.
     add_nanos(&timers.spill_write, store.flush_time);
-    log::info!(
+    log::info!(target: LOG_TARGET,
         "[export] pass2 fill (#235): {seq} row(s) read once and fanned across \
          {num_levels} level(s) in {:.2}s",
         t_fill.elapsed().as_secs_f64(),

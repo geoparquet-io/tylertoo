@@ -296,7 +296,7 @@ impl PublishedNames {
     ) -> Self {
         let restored = crate::resolved_schema::publication_names(schema, renames, &suppressed);
         for (renamed, source) in &restored {
-            log::info!(
+            log::info!(target: LOG_TARGET,
                 "[export] publishing overview column {renamed:?} under its \
                  source name {source:?} (it was renamed on convert to clear \
                  the reserved overview column, #288/#359)"
@@ -341,7 +341,7 @@ impl PublishedNames {
                 None => reader.int_column_max(column) == Some(1),
             };
             if never_merged {
-                log::info!(
+                log::info!(target: LOG_TARGET,
                     "[export] not exporting {column:?}: it is 1 on every row \
                      (no lines were merged), so it says nothing about the data; \
                      the overview file keeps it (#379)"
@@ -448,7 +448,7 @@ impl PublishedNames {
                     .find(|n| self.is_suppressed(n) && self.publish(n) == name)
                     .cloned();
                 if let Some(schema_name) = withheld {
-                    log::info!(
+                    log::info!(target: LOG_TARGET,
                         "[export] exporting {schema_name:?} after all: it was withheld \
                          (#379) but --include-property names it"
                     );
@@ -509,7 +509,7 @@ impl PublishedNames {
             .collect();
         for name in &selection.exclude {
             if !candidates.iter().any(|(_, n)| n == name) {
-                log::warn!(
+                log::warn!(target: LOG_TARGET,
                     "[export] excluded property {name:?} is not exported by this file anyway"
                 );
             }
@@ -536,7 +536,7 @@ impl PublishedNames {
             .copied()
             .filter(|n| selection.keeps(n))
             .collect();
-        log::info!(
+        log::info!(target: LOG_TARGET,
             "[export] property selection: keeping {} of {} ({}), dropping {dropped}",
             kept.len(),
             published.len(),
@@ -1062,7 +1062,7 @@ pub(super) fn extract_property_column(col: &dyn arrow_array::Array) -> Vec<Optio
                 // format, and `field_metadata` gates on the same predicate, so
                 // an un-formattable column is never selected or advertised.
                 Err(e) => {
-                    log::warn!("cannot format {dt:?} column as text, dropping it: {e}");
+                    log::warn!(target: LOG_TARGET, "cannot format {dt:?} column as text, dropping it: {e}");
                     vec![None; n]
                 }
             };
@@ -1075,7 +1075,7 @@ pub(super) fn extract_property_column(col: &dyn arrow_array::Array) -> Vec<Optio
         DataType::Dictionary(_, value) => match arrow_cast::cast(col, value) {
             Ok(flat) => extract_property_column(flat.as_ref()),
             Err(e) => {
-                log::warn!(
+                log::warn!(target: LOG_TARGET,
                     "cannot unwrap {:?} column, dropping it: {e}",
                     col.data_type()
                 );

@@ -10400,3 +10400,10 @@ fn build_mvt_omits_ids_past_the_first_parallel_chunk() {
         .collect();
     assert_eq!(ids, vec![None; n]);
 }
+
+/// The stage submodules log as `overview::export` (#916), so `RUST_LOG`
+/// filters, CLI stderr and Python logger names stayed what they were.
+#[test]
+fn stage_logs_keep_the_export_target() {
+    assert_eq!(LOG_TARGET, "tylertoo_core::overview::export");
+}

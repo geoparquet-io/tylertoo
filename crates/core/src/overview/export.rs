@@ -224,6 +224,11 @@ use feature_id::{
 };
 pub use feature_id::{FeatureIdColumnProblem, InvalidFeatureIdReason};
 
+/// Log target of every stage submodule: the stages log as `overview::export`,
+/// as they did before #916 split them out, so `RUST_LOG` filters, CLI stderr
+/// and Python logger names do not change.
+const LOG_TARGET: &str = module_path!();
+
 /// Default MVT tile extent (matches [`crate::mvt::DEFAULT_EXTENT`]).
 pub(crate) const DEFAULT_EXTENT: u32 = 4096;
 

@@ -156,7 +156,7 @@ pub(super) fn warn_if_order_column_is_absent(
     if !order_column_is_absent(schema, published, order) {
         return;
     }
-    log::warn!(
+    log::warn!(target: LOG_TARGET,
         "--feature-order names {name:?}, which this layer does not publish, so \
          the order is unchanged (input row order). Available: {}",
         published_property_names(schema, published).join(", ")
@@ -896,7 +896,7 @@ impl<'a> JoinedTileFitter<'a> {
                 })
             })
             .collect::<Result<Vec<_>, ExportError>>()?;
-        log::debug!(
+        log::debug!(target: LOG_TARGET,
             "[profile] joined plans: {} overview(s), {:.3}s",
             sources.len(),
             started.elapsed().as_secs_f64()
@@ -1033,7 +1033,7 @@ impl<'a> JoinedTileFitter<'a> {
             }
         }
         let stages = timers.stage_secs();
-        log::debug!(
+        log::debug!(target: LOG_TARGET,
             "[profile] joined z{zoom}: {} tile(s), wall={:.3}s; \
              core-seconds read={:.3} decode={:.3} clip={:.3} encode={:.3}",
             tiles.len(),

@@ -224,7 +224,7 @@ pub(super) fn drop_to_fit(
         let mut shed = build_tile_layers(gzip_cache, layers, &kept, tb, opts, &[], diagnostics);
         fit = tile_fit(&mut shed, opts).unwrap_or(f64::INFINITY);
         if fit >= 1.0 || keep <= 1 || passes >= MAX_DROP_PASSES {
-            log::debug!(
+            log::debug!(target: LOG_TARGET,
                 "oversized tile ({} bytes): dropped {} of {} features ({passes} encodes){}",
                 full_bytes,
                 members.len() - keep,
@@ -491,7 +491,7 @@ pub(super) fn merge_to_fit(
                 &mut tally,
             );
         }
-        log::debug!(
+        log::debug!(target: LOG_TARGET,
             "oversized tile: merged {absorbed} of {} features and dropped {} sources \
              ({} merged features carrying {} sources){}",
             members.len(),
@@ -581,7 +581,7 @@ pub(super) fn reduce_merged_to_fit(
     tally.over_limit_merged = fit < 1.0 && kept.len() == 1 && kept[0].absorbed > 0;
     tally.reduced_extent = (reduced.extent < opts.extent).then_some(reduced.extent);
     if let Some(extent) = tally.reduced_extent {
-        log::debug!("tile bounds {tb:?} written at extent {extent}");
+        log::debug!(target: LOG_TARGET, "tile bounds {tb:?} written at extent {extent}");
     }
     out
 }

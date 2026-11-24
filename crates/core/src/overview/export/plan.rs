@@ -440,7 +440,7 @@ pub(super) fn check_levels_fit(
         } else {
             return Err(err);
         };
-        log::warn!("[export] continuing because {why}, but it may be OOM-killed: {err}");
+        log::warn!(target: LOG_TARGET, "[export] continuing because {why}, but it may be OOM-killed: {err}");
     }
     Ok(())
 }
@@ -510,13 +510,13 @@ pub(super) fn resolve_and_log_partition_wave(
             usize::MAX => "unlimited".to_string(),
             cap => cap.to_string(),
         };
-        log::info!(
+        log::info!(target: LOG_TARGET,
             "[export] partition wave: {wave} partition(s) per band read \
              (auto: {cores} core(s), memory-safe cap {cap} under {}, avail {avail_str})",
             profile.as_str(),
         );
     } else {
-        log::info!(
+        log::info!(target: LOG_TARGET,
             "[export] partition wave: {wave} partition(s) per band read \
              (explicit; {cores} core(s) detected)"
         );
@@ -611,7 +611,7 @@ pub(super) fn plan_level(
             .max()
             .unwrap_or(0);
         let narrowest = level.waves().map(<[Partition]>::len).min().unwrap_or(0);
-        log::info!(
+        log::info!(target: LOG_TARGET,
             "[export] {}: {} waves of {narrowest}–{} partitions, ceiling {ceiling_wave} \
              (densest partition {densest} members × ~{} B/member resident, {} MiB budget) \
              — #311 density guard",

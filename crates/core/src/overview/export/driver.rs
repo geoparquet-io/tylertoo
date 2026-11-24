@@ -156,7 +156,7 @@ pub(super) fn checkpoint_if_due(
     progress.profile.checkpoints += 1;
     #[cfg(test)]
     progress.checkpoint_zooms.push(zoom);
-    log::info!(
+    log::info!(target: LOG_TARGET,
         "[export] checkpoint written: zooms {}..={zoom} salvageable at {} ({:.2}s)",
         ckpt.coarsest_zoom,
         writer.salvage_path().unwrap_or(ckpt.output_path).display(),
@@ -192,7 +192,7 @@ pub(super) fn fill_backing(
         mean_member_bytes,
         None,
     );
-    log::info!(
+    log::info!(target: LOG_TARGET,
         "[export] pass2 single-read fan-out (#235): ~{buffered_rows} buffered \
          member row(s) across {num_levels} level(s), {} → {b:?}",
         profile.as_str(),
@@ -409,7 +409,7 @@ pub(super) fn resolve_export_columns(
                 path: Some(reader.path().display().to_string()),
             })?;
     if let Some(by_name) = reader.resolved_schema().geometry_name_disagreement() {
-        log::warn!(
+        log::warn!(target: LOG_TARGET,
             "[export] tiling geometry column {:?}, the file's `primary_column`, not {:?}, \
              which its name suggests; an overview converted before #675 may declare the \
              wrong one when its input had several geometry columns: re-convert it if \
@@ -429,7 +429,7 @@ pub(super) fn resolve_export_columns(
     // it for every row group of every level.
     let skipped = skipped_property_columns(reader.schema(), geom_idx, &published);
     for col in &skipped {
-        log::warn!(
+        log::warn!(target: LOG_TARGET,
             "[export] not exporting property {:?}: its type {} has no MVT encoding \
              (strings, numbers, booleans, temporals and decimals are encoded directly; \
              struct/list/map columns as JSON strings); cast or encode it as text first, \
@@ -587,7 +587,7 @@ pub(super) fn export_level(
         write_encoded_tiles(writer, zoom, &results, level.terminals, &mut tally, timers)?;
 
         if last_wave_log.elapsed() >= WAVE_LOG_INTERVAL {
-            log::info!(
+            log::info!(target: LOG_TARGET,
                 "[export] level {}/{num_levels} z{zoom}: wave {}/{total_waves}, \
                  {} tiles, {:.0}s",
                 level_idx + 1,
@@ -631,14 +631,14 @@ pub(super) fn build_fills_if_asked(
         return Ok(None);
     }
     if options.tile_range.is_some() {
-        log::warn!(
+        log::warn!(target: LOG_TARGET,
             "[export] --coverage-fill is ignored with --tile-range: a data shard does not \
              build the fill; the coarse job (--zoom-ceiling) does"
         );
         return Ok(None);
     }
     if options.extent != coverage_fill::FILL_EXTENT as u32 {
-        log::warn!(
+        log::warn!(target: LOG_TARGET,
             "[export] --coverage-fill is ignored at extent {}: the fill is sized for \
              the default extent of 4096",
             options.extent
@@ -1426,7 +1426,7 @@ impl GroupCommit<'_> {
                 .last_log
                 .is_some_and(|t| t.elapsed() >= WAVE_LOG_INTERVAL)
             {
-                log::info!(
+                log::info!(target: LOG_TARGET,
                     "[export] level {}/{} z{zoom}: wave {}/{waves}, {} tiles, {:.0}s",
                     level.level_idx + 1,
                     level.num_levels,
@@ -1670,7 +1670,7 @@ pub(super) fn finish_level(
     let tile_count = tally.tile_count;
     // Per-level summary at info so operators see progress without RUST_LOG
     // (env_logger defaults to info). Detailed clip/write split stays debug.
-    log::info!(
+    log::info!(target: LOG_TARGET,
         "[export] level {}/{num_levels} z{zoom} done: {} feats, {tile_count} tiles, \
          {} partitions, {wall_secs:.1}s (total {:.0}s)",
         level_idx + 1,
@@ -1678,7 +1678,7 @@ pub(super) fn finish_level(
         plan.partitions.len(),
         start.elapsed().as_secs_f64(),
     );
-    log::debug!(
+    log::debug!(target: LOG_TARGET,
         "[profile] z{zoom} (level {level_idx}, {} feats, {tile_count} tiles, {} partitions): \
          clip+encode+gzip={work_secs:.2}s write={:.2}s",
         scan.feature_count,

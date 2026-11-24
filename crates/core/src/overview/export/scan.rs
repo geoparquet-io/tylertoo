@@ -39,7 +39,7 @@ pub(super) fn scan_all_levels(
 ) -> Result<Vec<LevelScan>, ExportError> {
     let t_scan = Instant::now();
     let done = |scans: Vec<LevelScan>, from: &str| {
-        log::info!(
+        log::info!(target: LOG_TARGET,
             "[export] scan complete: {} levels, single read, bboxes from the {from}, {:.2}s",
             scans.len(),
             t_scan.elapsed().as_secs_f64()
@@ -59,7 +59,7 @@ pub(super) fn scan_all_levels(
         )? {
             return Ok(done(scans, "bbox covering"));
         }
-        log::info!(
+        log::info!(target: LOG_TARGET,
             "[export] the bbox covering has an empty or non-finite row; \
              rescanning from the geometry"
         );

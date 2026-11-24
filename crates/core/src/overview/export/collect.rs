@@ -38,7 +38,7 @@ pub(super) fn process_wave(
         diagnostics,
     )?;
     let n_tiles: usize = tiles.iter().map(Vec::len).sum();
-    log::debug!(
+    log::debug!(target: LOG_TARGET,
         "[profile]     z{} wave [{:x}..{:x}] ({} partitions): rows_read={rows_read} \
          members={n_members} tiles={n_tiles} collect={collect_secs:.2}s \
          sort+encode={:.2}s",
@@ -137,7 +137,7 @@ pub(super) fn fill_level_store(
         let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
         *work.level_spill_bytes.entry(ctx.level_idx).or_default() += store.spilled_bytes();
     }
-    log::debug!(
+    log::debug!(target: LOG_TARGET,
         "[profile]     z{} level read ({} partitions, {} waves): rows_read={rows_read} \
          collect={:.2}s ({:?}, buffer {} MiB, resident {} MiB, spilled {} MiB)",
         ctx.zoom,
