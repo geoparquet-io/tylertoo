@@ -630,7 +630,15 @@ fn check_saturation(line: &serde_json::Value, holder: &serde_json::Value, phases
     let mut last_t = -1.0;
     for row in timeline {
         let row = row.as_array().expect("timeline row array");
-        assert_eq!(row.len(), 6, "[t, cpu, rss, read, write, rchar]: {line}");
+        assert_eq!(
+            row.len(),
+            7,
+            "[t, cpu, rss, read, write, rchar, busy]: {line}"
+        );
+        assert!(
+            row[6].is_null(),
+            "busy is null without TYLERTOO_TILE_TRACE: {line}"
+        );
         let t = row[0].as_f64().expect("t_secs");
         assert!(t >= last_t, "timeline must be in time order: {line}");
         last_t = t;
@@ -1376,4 +1384,79 @@ fn cli_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set() {
     let threads = |env| run_tiles_with_profile(&fixture, "0", "2", env).2["threads"].as_u64();
     assert_eq!(threads(None), Some(cores.min(40) as u64));
     assert_eq!(threads(Some("48")), Some(48));
+}
+
+/// #876: `TYLERTOO_TILE_TRACE` writes one JSONL event per line, one `tile`
+/// event per written tile (the profile's per-zoom counts), valve passes and
+/// waits, and an archive byte-identical to the untraced run's.
+#[test]
+fn tile_trace_has_one_tile_event_per_written_tile_and_changes_no_byte() {
+    let Some(fixture) = fixture::realdata("ftw-moldova-z10.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let run = |name: &str, trace: Option<&std::path::Path>| {
+        let out = dir.path().join(format!("{name}.pmtiles"));
+        let profile = dir.path().join(format!("{name}.jsonl"));
+        let output = Command::new(tylertoo_bin())
+            .args(["tiles", fixture.to_str().unwrap(), out.to_str().unwrap()])
+            .args(["--max-zoom", "8", "--max-compressed-tile-size", "2000"])
+            .env("TYLERTOO_PROFILE_JSON", &profile)
+            .env_remove("TYLERTOO_TILE_TRACE")
+            .envs(trace.map(|t| ("TYLERTOO_TILE_TRACE", t)))
+            .output()
+            .expect("run tylertoo tiles");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let export: serde_json::Value = std::fs::read_to_string(&profile)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|v| v["phase"] == "export")
+            .expect("an export profile line");
+        (std::fs::read(&out).unwrap(), export)
+    };
+    let trace = dir.path().join("trace.jsonl");
+    let (plain, _) = run("plain", None);
+    let (traced, export) = run("traced", Some(&trace));
+    assert!(plain == traced, "tracing changed the archive");
+
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}")))
+        .collect();
+    let of = |ev: &'static str| events.iter().filter(move |e| e["ev"] == ev);
+    assert!(
+        events.iter().all(|e| e["tid"].is_u64()),
+        "every event has a tid"
+    );
+    assert_eq!(of("start").count(), 1);
+    assert_eq!(of("end").count(), 1);
+    let mut written = std::collections::BTreeMap::<u64, u64>::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for t in of("tile").filter(|t| t["raw_bytes"].as_u64() > Some(0)) {
+        assert!(t["end_ns"].as_u64() >= t["start_ns"].as_u64(), "{t}");
+        let key = ["z", "x", "y"].map(|k| t[k].as_u64().unwrap());
+        assert!(seen.insert(key), "{t}");
+        *written.entry(t["z"].as_u64().unwrap()).or_default() += 1;
+    }
+    let expected: std::collections::BTreeMap<u64, u64> = export["export"]["per_zoom"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|z| (z["zoom"].as_u64().unwrap(), z["tiles"].as_u64().unwrap()))
+        .filter(|&(_, n)| n > 0)
+        .collect();
+    assert_eq!(written, expected, "one tile event per written tile");
+    assert!(
+        of("pass").any(|p| p["pass"].as_u64() > Some(1)),
+        "the 2000-byte cap runs the valve past its first pass"
+    );
+    assert!(of("wait").any(|w| w["site"] == "tiles" && w["calls"].as_u64() > Some(0)));
+    assert!(of("occ").count() >= 1);
+    assert!(of("phase").any(|p| p["phase"] == "levels"));
 }

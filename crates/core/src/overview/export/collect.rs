@@ -845,19 +845,23 @@ pub(super) fn clip_group(
             geoms
                 .into_par_iter()
                 .map(|g| {
-                    ExportTimers::time(&timers.clip, || {
-                        let mut members = shared_tile_members(
-                            MemberSource::Owned(g),
-                            finest_zoom,
-                            ctx.zoom,
-                            ctx.opts,
-                            (key_lo, key_hi),
-                            diagnostics,
-                        );
-                        if let Some(tiles) = ctx.tiles {
-                            members.retain(|(key, _)| tiles.contains_key(key));
-                        }
-                        members
+                    // #876: a clip a tile's thread runs is foreign to the tile.
+                    let zoom = || crate::tile_trace::Ctx::zoom(ctx.zoom);
+                    crate::tile_trace::job(zoom, || {
+                        ExportTimers::time(&timers.clip, || {
+                            let mut members = shared_tile_members(
+                                MemberSource::Owned(g),
+                                finest_zoom,
+                                ctx.zoom,
+                                ctx.opts,
+                                (key_lo, key_hi),
+                                diagnostics,
+                            );
+                            if let Some(tiles) = ctx.tiles {
+                                members.retain(|(key, _)| tiles.contains_key(key));
+                            }
+                            members
+                        })
                     })
                 })
                 .collect()

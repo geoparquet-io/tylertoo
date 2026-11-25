@@ -222,7 +222,10 @@ pub(super) fn compare_by_feature_order(
 }
 
 pub(super) fn sort_members_for_encode(members: &mut [Member], order: &FeatureOrder) {
-    members.par_sort_unstable_by_key(|m| (m.key, m.seq));
+    // #876: timed as a wall only; a per-key body would cost more than the key.
+    crate::tile_trace::wait("sort", |_| {
+        members.par_sort_unstable_by_key(|m| (m.key, m.seq));
+    });
     let FeatureOrder::Column { name, descending } = order else {
         return;
     };
@@ -372,7 +375,7 @@ pub(super) fn encode_layer_members(
     // match the writer's `tile_compression` (Gzip) so `add_tile_precompressed`
     // stays byte-identical to the old serial `add_tile_with_count` path.
     // #535: `encode` is timed per tile, inside this closure (core-seconds).
-    let encode_group = |g: &[Member]| -> Option<Result<EncodedTile, ExportError>> {
+    let encode_tile = |g: &[Member]| -> Option<Result<EncodedTile, ExportError>> {
         let _encode = ExportTimers::scope(&timers.encode);
         let (x, y) = key_to_xy(g[0].key, zoom);
         let tb = TileCoord::new(x, y, zoom).bounds();
@@ -406,17 +409,36 @@ pub(super) fn encode_layer_members(
         }
         Some(encoded_tile(x, y, mvt, fill_tally))
     };
+    // #876: each tile's span in the trace, with what it encoded to.
+    let encode_group = |g: &[Member]| {
+        let span = crate::tile_trace::tile(g[0].key, zoom);
+        let done = encode_tile(g);
+        if let Some(span) = span {
+            let t = done.as_ref().and_then(|r| r.as_ref().ok());
+            span.close(&crate::tile_trace::TileFacts {
+                members: g.len(),
+                vertices: g.iter().map(|m| m.geom.coords_count()).sum(),
+                passes: t.map_or(0, |t| t.valve.passes),
+                merged: t.map_or(0, |t| t.valve.merged),
+                raw_bytes: t.map_or(0, |t| t.raw_len),
+            });
+        }
+        done
+    };
     // Longest tile first, one tile per task: a tile's valve passes are a
     // serial chain, so a dense tile that starts late sets the wall of its
     // level group. The results are put back in key order, so the output is
     // unchanged.
     let mut order: Vec<usize> = (0..groups.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(groups[i].len()));
-    let mut done: Vec<(usize, Option<Result<EncodedTile, ExportError>>)> = order
-        .into_par_iter()
-        .with_max_len(1)
-        .map(|i| (i, encode_group(groups[i])))
-        .collect();
+    let mut done: Vec<(usize, Option<Result<EncodedTile, ExportError>>)> =
+        crate::tile_trace::wait("tiles", |site| {
+            order
+                .into_par_iter()
+                .with_max_len(1)
+                .map(|i| (i, site.body(|| encode_group(groups[i]))))
+                .collect()
+        });
     done.sort_unstable_by_key(|(i, _)| *i);
     done.into_iter().filter_map(|(_, r)| r).collect()
 }
@@ -1267,17 +1289,21 @@ pub(super) fn build_tile_layers_with<M: TileFeature>(
     grouped.retain(|(_, members)| !members.is_empty());
     // Layers encode independently; the joint valve re-encodes all of them on
     // every pass, so build them in parallel and join in layer order.
-    let built: Vec<TileMvt> = grouped
-        .into_par_iter()
-        .map(|(name, selected)| {
-            let layer_opts = ExportOptions {
-                layer_name: name.clone(),
-                tile_format: TileFormat::Mvt,
-                ..opts.clone()
-            };
-            build_mvt_with(cache, &selected, &layer_opts, &[], |m| encode(*m))
-        })
-        .collect();
+    let built: Vec<TileMvt> = crate::tile_trace::wait("layers", |site| {
+        grouped
+            .into_par_iter()
+            .map(|(name, selected)| {
+                site.body(|| {
+                    let layer_opts = ExportOptions {
+                        layer_name: name.clone(),
+                        tile_format: TileFormat::Mvt,
+                        ..opts.clone()
+                    };
+                    build_mvt_with(cache, &selected, &layer_opts, &[], |m| encode(*m))
+                })
+            })
+            .collect()
+    });
     for layer in built {
         bytes.extend_from_slice(&layer.data);
         out.features += layer.features;
@@ -1357,7 +1383,10 @@ pub(super) fn build_mvt_within<M: TileFeature>(
         // projection runs in parallel, exactly as before.
         const GEOMETRY_CHUNK_MEMBERS: usize = 4096;
         for chunk in members.chunks(GEOMETRY_CHUNK_MEMBERS) {
-            let encoded: Vec<EncodedFeatureGeometry> = chunk.par_iter().map(&encode).collect();
+            let encoded: Vec<EncodedFeatureGeometry> =
+                crate::tile_trace::wait("geometry_chunks", |site| {
+                    chunk.par_iter().map(|m| site.body(|| encode(m))).collect()
+                });
             for (m, geom) in chunk.iter().zip(encoded) {
                 track(m.feature_id().map(|_| m.source_row()), &geom);
                 layer.add_borrowed_feature(m.feature_id(), geom, m.properties().iter());

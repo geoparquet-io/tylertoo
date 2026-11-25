@@ -621,7 +621,12 @@ fn joining_pairs(parts: &[Vec<TileRing>]) -> Vec<(u32, u32)> {
     // Each part checked alone once, not once per pair it is in.
     let clean: Vec<bool> = {
         use rayon::prelude::*;
-        parts.par_iter().map(|p| part_clean(p)).collect()
+        crate::tile_trace::wait("part_clean", |site| {
+            parts
+                .par_iter()
+                .map(|p| site.body(|| part_clean(p)))
+                .collect()
+        })
     };
     let components = uf_rush::UFRush::new(parts.len());
     // Tested only while the two are apart; `unite` is true for one join.
@@ -639,6 +644,17 @@ fn joining_pairs(parts: &[Vec<TileRing>]) -> Vec<(u32, u32)> {
 /// The output depends only on which pairs interact, not on their order, and
 /// the pairs are joined as they come rather than stored.
 fn union_interacting_with(
+    parts: Vec<Vec<TileRing>>,
+    pairs: impl FnOnce(&[Vec<TileRing>], &mut PartJoin<'_>),
+    union: impl FnMut(&[usize], &[Vec<TileRing>]) -> Vec<Vec<TileRing>>,
+) -> Vec<Vec<TileRing>> {
+    crate::tile_trace::stage(crate::tile_trace::Stage::Union, || {
+        union_interacting_parts(parts, pairs, union)
+    })
+}
+
+/// [`union_interacting_with`]'s work, timed there as the valve's union stage.
+fn union_interacting_parts(
     parts: Vec<Vec<TileRing>>,
     pairs: impl FnOnce(&[Vec<TileRing>], &mut PartJoin<'_>),
     mut union: impl FnMut(&[usize], &[Vec<TileRing>]) -> Vec<Vec<TileRing>>,
@@ -693,6 +709,7 @@ fn union_interacting_with(
 /// in order.
 fn union_group(group: &[usize], parts: &[Vec<TileRing>]) -> Vec<Vec<TileRing>> {
     let members: Vec<&[TileRing]> = group.iter().map(|&k| &parts[k][..]).collect();
+    crate::tile_trace::note_component(|| members.iter().flat_map(|p| p.iter()).map(Vec::len).sum());
     tile_polygon::repair_polygons(&members)
 }
 
@@ -877,28 +894,29 @@ impl QuantizedPolygons {
         // Keep projection parallel without staging every feature's outer
         // polygon Vec beside the flattened parts of the whole tile.
         for (geometries, feature_keys) in geometries.chunks(4096).zip(feature_keys.chunks(4096)) {
-            let quantized: Vec<Option<Quantized>> = geometries
-                .par_iter()
-                .map(|g| {
-                    #[cfg(test)]
-                    let _count_rings = crate::valve_counter::quantizing();
-                    let (parts, multi) = match g {
-                        Geometry::Polygon(p) => (quantized_polygons(p, &proj), false),
-                        Geometry::MultiPolygon(mp) => (
-                            mp.0.iter()
-                                .flat_map(|p| quantized_polygons(p, &proj))
-                                .collect(),
-                            true,
-                        ),
-                        Geometry::Rect(r) => (quantized_polygons(&r.to_polygon(), &proj), false),
-                        Geometry::Triangle(t) => {
-                            (quantized_polygons(&t.to_polygon(), &proj), false)
-                        }
-                        _ => return None,
-                    };
-                    Some((parts, multi, g.coords_count() > 0))
-                })
-                .collect();
+            let quantize = |g: &&Geometry| {
+                #[cfg(test)]
+                let _count_rings = crate::valve_counter::quantizing();
+                let (parts, multi) = match g {
+                    Geometry::Polygon(p) => (quantized_polygons(p, &proj), false),
+                    Geometry::MultiPolygon(mp) => (
+                        mp.0.iter()
+                            .flat_map(|p| quantized_polygons(p, &proj))
+                            .collect(),
+                        true,
+                    ),
+                    Geometry::Rect(r) => (quantized_polygons(&r.to_polygon(), &proj), false),
+                    Geometry::Triangle(t) => (quantized_polygons(&t.to_polygon(), &proj), false),
+                    _ => return None,
+                };
+                Some((parts, multi, g.coords_count() > 0))
+            };
+            let quantized: Vec<Option<Quantized>> = crate::tile_trace::wait("quantize", |site| {
+                geometries
+                    .par_iter()
+                    .map(|g| site.body(|| quantize(g)))
+                    .collect()
+            });
             let count = quantized.iter().flatten().map(|(p, _, _)| p.len()).sum();
             parts.reserve(count);
             keys.reserve(count);
@@ -1024,8 +1042,10 @@ impl QuantizedPolygons {
             found
         };
         if let Some(u) = found {
+            crate::tile_trace::note(crate::tile_trace::Count::UnionHit);
             return u.as_ref().clone();
         }
+        crate::tile_trace::note(crate::tile_trace::Count::UnionMiss);
         let pieces = std::sync::Arc::new(union_group(group, parts));
         self.unions
             .lock()
@@ -1215,7 +1235,11 @@ impl QuantizedPolygons {
         };
         if todo.len() >= 256 {
             use rayon::prelude::*;
-            todo.par_iter().filter_map(hit).collect()
+            // #876: timed as a wall only; most tests are answered from
+            // the cache in less time than a timed body costs.
+            crate::tile_trace::wait("pairs_within", |_| {
+                todo.par_iter().filter_map(hit).collect()
+            })
         } else {
             todo.iter().filter_map(hit).collect()
         }

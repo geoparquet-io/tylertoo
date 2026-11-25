@@ -144,6 +144,7 @@ pub(crate) mod test_env;
 pub(crate) mod test_log;
 mod tile;
 mod tile_format;
+mod tile_trace;
 #[cfg(test)]
 mod valve_counter;
 mod wkb;

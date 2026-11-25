@@ -563,6 +563,8 @@ struct TimelineSample {
     cpu_secs: Option<f64>,
     rss_bytes: Option<u64>,
     io: Option<ProcIo>,
+    /// #876: threads doing traced tile work, when `TYLERTOO_TILE_TRACE` is on.
+    busy: Option<u32>,
 }
 
 /// Samples a timeline keeps before it halves itself.
@@ -766,6 +768,7 @@ impl RssSampler {
                     cpu_secs: tick.cpu.map(|(u, s)| u + s),
                     rss_bytes: mib.map(|m| (m * 1024.0 * 1024.0) as u64),
                     io: tick.io,
+                    busy: crate::tile_trace::occupancy(),
                 });
             }
             // A timeout is the next tick; a message or a dropped sender
@@ -4621,6 +4624,7 @@ fn timeline_row(s: &TimelineSample) -> serde_json::Value {
         s.io.map(|io| io.read_bytes),
         s.io.map(|io| io.write_bytes),
         s.io.map(|io| io.rchar),
+        s.busy,
     ])
 }
 
@@ -9672,6 +9676,7 @@ mod tests {
             cpu_secs: None,
             rss_bytes: None,
             io: None,
+            busy: None,
         };
         for i in 0..TIMELINE_CAP * 3 {
             tl.push(sample(i as f64));

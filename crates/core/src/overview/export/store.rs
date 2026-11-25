@@ -1337,16 +1337,22 @@ pub(super) fn fanout_batch_members(
         let clipped: RowMembers = geoms
             .par_iter()
             .map(|g| {
-                ExportTimers::time(&timers.clip, || {
-                    shared_tile_members(
-                        MemberSource::Shared(g),
-                        finest,
-                        plan.zoom,
-                        opts,
-                        (0, u64::MAX),
-                        diagnostics,
-                    )
-                })
+                // #876: a clip a tile's thread runs is foreign to the tile.
+                crate::tile_trace::job(
+                    || crate::tile_trace::Ctx::zoom(plan.zoom),
+                    || {
+                        ExportTimers::time(&timers.clip, || {
+                            shared_tile_members(
+                                MemberSource::Shared(g),
+                                finest,
+                                plan.zoom,
+                                opts,
+                                (0, u64::MAX),
+                                diagnostics,
+                            )
+                        })
+                    },
+                )
             })
             .collect();
         let t_level = Instant::now();
@@ -1451,16 +1457,28 @@ pub(super) fn encode_buckets(
     timers: &ExportTimers,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
-    buckets
-        .into_par_iter()
-        .map(|members| {
-            let n = members.len();
-            let tiles =
-                encode_layer_members(gzip_cache, members, zoom, opts, fills, timers, diagnostics);
-            if let Some(a) = admitted {
-                a.encoded(n, tiles.as_deref().unwrap_or_default());
-            }
-            tiles
-        })
-        .collect::<Result<_, _>>()
+    crate::tile_trace::wait("encode_buckets", |site| {
+        buckets
+            .into_par_iter()
+            .enumerate()
+            .map(|(part, members)| {
+                site.part(part, || {
+                    let n = members.len();
+                    let tiles = encode_layer_members(
+                        gzip_cache,
+                        members,
+                        zoom,
+                        opts,
+                        fills,
+                        timers,
+                        diagnostics,
+                    );
+                    if let Some(a) = admitted {
+                        a.encoded(n, tiles.as_deref().unwrap_or_default());
+                    }
+                    tiles
+                })
+            })
+            .collect::<Result<_, _>>()
+    })
 }

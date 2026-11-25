@@ -104,6 +104,11 @@ impl Repair {
 /// [`finalize_polygons`] without recording anything: the verdict, and the
 /// repair when there was one.
 pub(crate) fn finalize(parts: Vec<Vec<TileRing>>) -> Finalized {
+    crate::tile_trace::stage(crate::tile_trace::Stage::Finalize, || finalize_parts(parts))
+}
+
+/// [`finalize`]'s work, timed there as the valve's finalize stage.
+fn finalize_parts(parts: Vec<Vec<TileRing>>) -> Finalized {
     if parts.is_empty() {
         return Finalized::Valid(parts);
     }
@@ -112,6 +117,7 @@ pub(crate) fn finalize(parts: Vec<Vec<TileRing>>) -> Finalized {
     };
     let (repaired, passed) = repair_and_check(&parts);
     let still_invalid = !passed && check_polygons(&repaired).is_err();
+    crate::tile_trace::note(crate::tile_trace::Count::Repaired);
     Finalized::Repaired(Repair {
         parts: repaired,
         defect,

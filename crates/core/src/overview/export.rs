@@ -2002,6 +2002,8 @@ fn export_pmtiles_validated(
     // #452: and the output, before the input is opened.
     crate::atomic_output::check_writable(output_path.as_ref())?;
     let start = Instant::now();
+    // #876: the per-tile trace, drained to its file when the export returns.
+    let _tile_trace = crate::tile_trace::Session::start(diagnostics);
     let input_path = input_path.as_ref();
 
     let reader = OverviewReader::open(input_path)?;
