@@ -646,8 +646,8 @@ fn export_zoom_ceiling_emits_only_the_coarse_half() {
 
 /// A `--tile-buffer` wider than the cap is refused, sharded or not.
 ///
-/// A shard prunes its input to the row groups within two pivot tiles (512
-/// px) of its range; a buffer wider than that could pull geometry into one
+/// A shard prunes its input to the row groups within nine pivot tiles
+/// (2,304 px, #768) of its range; a buffer wider than that could pull geometry into one
 /// of its tiles from a row group it never read, and the tile would come out
 /// missing geometry the monolithic run has (#498). Since #433 every export is
 /// capped at one tile width (256 px), which sits inside that margin, so the
@@ -952,7 +952,9 @@ fn a_shard_given_a_different_cut_than_the_plan_is_refused() {
 #[test]
 fn a_shard_that_owns_no_rows_writes_an_empty_archive_and_the_fleet_still_merges() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let plan = cut_plan(dir.path(), "4", "4");
+    // Pivot z6: a shard reads nine pivot tiles past its range (#768), so
+    // at a coarser pivot every shard reaches the patch below.
+    let plan = cut_plan(dir.path(), "4", "6");
     let convert_plan = dir.path().join("convert.plan");
     // A bbox confining the build to one patch of the world, away from the
     // antimeridian (a shard reads across it, #546), so most of the four
@@ -970,7 +972,7 @@ fn a_shard_that_owns_no_rows_writes_an_empty_archive_and_the_fleet_still_merges(
             "--min-zoom".into(),
             "0".into(),
             "--max-zoom".into(),
-            "4".into(),
+            "6".into(),
             format!("--bbox={bbox}"),
             "--no-coalesce-lines".into(),
             "--shard-plan".into(),

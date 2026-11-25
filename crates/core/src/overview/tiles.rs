@@ -232,21 +232,24 @@ impl TilesShard {
     /// and the level assignment stay full-range, so any saved plan is
     /// byte-identical to a full run's).
     ///
-    /// `keep_finest_level` skips that ceiling: the coverage fill (#771)
+    /// `export.coverage_fill` skips that ceiling: the coverage fill (#771)
     /// draws each coarse tile from the finest level, so a coarse job that
-    /// builds the fill needs every level in its intermediate.
+    /// builds the fill needs every level in its intermediate. A data shard
+    /// whose `export` predicts no valve floors (#768: `--valve-scope tile`,
+    /// or no size cap) reads only the tile buffer's margin past its range.
     ///
     /// The facade's own (#709): it applies this to its copy of
     /// [`TilesOptions::convert`], so no caller hand-syncs the two.
     /// Idempotent.
-    pub(crate) fn apply_to_convert(&self, convert: &mut ConvertOptions, keep_finest_level: bool) {
+    pub(crate) fn apply_to_convert(&self, convert: &mut ConvertOptions, export: &ExportOptions) {
         self.apply_selection(convert);
         if self.range.is_none()
-            && !keep_finest_level
+            && !export.coverage_fill
             && matches!(convert.levels, LevelPlan::ZoomRange { .. })
         {
             convert.zoom_ceiling = Some(self.pivot_zoom.saturating_sub(1));
         }
+        convert.shard_buffer_margin_only = !super::export::valve_predicts(export);
     }
 }
 
@@ -483,6 +486,11 @@ impl TilesOptions {
                 e.compressed_tile_size_limit != defaults.compressed_tile_size_limit,
             ),
             ("--size-valve", e.size_valve != defaults.size_valve),
+            ("--valve-scope", e.valve_scope != defaults.valve_scope),
+            (
+                "--valve-max-step",
+                e.valve_max_step != defaults.valve_max_step,
+            ),
             ("--tile-format", e.tile_format != defaults.tile_format),
             ("--mlt-profile", e.mlt_profile != defaults.mlt_profile),
             ("--coverage-fill", e.coverage_fill != defaults.coverage_fill),
@@ -555,18 +563,19 @@ impl TilesOptions {
                 }
             }
         }
-        self.convert.validate().map_err(TilesError::Convert)?;
-        // Under the layer name the export will get, so its rules (an MLT
-        // layer needs one) hold before the convert runs.
-        match &self.layer_name {
-            Some(name) => ExportOptions {
-                layer_name: name.clone(),
-                ..self.export.clone()
-            }
-            .validate()
-            .map(|_| ())?,
-            None => self.export.validate().map(|_| ())?,
+        // Under the layer name and tile range the export will get, so its
+        // rules (an MLT layer needs a name; `--valve-scope zoom` no range)
+        // hold before the convert runs.
+        ExportOptions {
+            layer_name: self
+                .layer_name
+                .clone()
+                .unwrap_or_else(|| self.export.layer_name.clone()),
+            tile_range: resolve_tile_range(self.shard.as_ref(), self.export.tile_range),
+            ..self.export.clone()
         }
+        .validate()?;
+        self.convert.validate().map_err(TilesError::Convert)?;
         if self.export.variable_depth {
             super::export::variable_depth::check_convert(&self.convert, self.shard.is_some())?;
         }
@@ -1179,7 +1188,7 @@ pub(super) fn convert_to_pmtiles_retaining_overview(
     let convert_options = match &options.shard {
         Some(job) => {
             let mut convert = options.convert.clone();
-            job.apply_to_convert(&mut convert, options.export.coverage_fill);
+            job.apply_to_convert(&mut convert, &options.export);
             Cow::Owned(convert)
         }
         None => Cow::Borrowed(&options.convert),
@@ -2014,7 +2023,7 @@ mod tests {
         let fleet_convert = ConvertOptions {
             levels: LevelPlan::ZoomRange {
                 min_zoom: 0,
-                max_zoom: 6,
+                max_zoom: 8,
             },
             shard_plan_digest: Some(digest.clone()),
             ..ConvertOptions::default()
@@ -2031,9 +2040,10 @@ mod tests {
 
         // The fixture's points all sit near the middle of the world; the
         // Hilbert curve starts in a corner, so the first pivot-zoom ids own
-        // none of them.
-        let base = crate::tile::hilbert_zoom_base(4);
-        let range = TileRange::new(4, base, base + 1).expect("a valid pivot range");
+        // none of them. z6, so the shard's nine-tile read margin (#768)
+        // stays clear of them.
+        let base = crate::tile::hilbert_zoom_base(6);
+        let range = TileRange::new(6, base, base + 1).expect("a valid pivot range");
         let options = TilesOptions {
             convert: ConvertOptions {
                 plan: Some(plan),
@@ -2045,7 +2055,7 @@ mod tests {
                     shards: 4,
                 },
                 range: Some(range),
-                pivot_zoom: 4,
+                pivot_zoom: 6,
                 cut_digest: digest,
                 binding: None,
             }),
@@ -2069,12 +2079,12 @@ mod tests {
                 shards: 4
             }
         );
-        assert_eq!(empty.pivot_zoom, 4);
+        assert_eq!(empty.pivot_zoom, 6);
         // A data shard owns [pivot, finest]: the pivot it was cut at, and
         // the zoom plan's maximum — never the plan's minimum, which belongs
         // to the coarse job.
-        assert_eq!(empty.min_zoom, 4, "declares the pivot, not the plan's min");
-        assert_eq!(empty.max_zoom, 6, "declares the zoom plan's maximum");
+        assert_eq!(empty.min_zoom, 6, "declares the pivot, not the plan's min");
+        assert_eq!(empty.max_zoom, 8, "declares the zoom plan's maximum");
         assert!(!empty.why.is_empty(), "carries the convert's own words");
         let json = serde_json::to_value(&empty).unwrap();
         assert_eq!(json["total_tiles"], 0);
@@ -2260,6 +2270,50 @@ mod tests {
         );
     }
 
+    /// #768: a data shard's export runs under its tile range, so the
+    /// export rules that hang on one (`--valve-scope zoom`, which
+    /// `--preset tippecanoe` sets) refuse it before the convert runs, not
+    /// after; the coarse job sees the whole input and keeps `zoom`.
+    #[test]
+    fn a_data_shard_refuses_valve_scope_zoom_before_any_io() {
+        let job = |range| TilesShard {
+            role: match range {
+                Some(_) => ShardRole::Shard {
+                    index: 0,
+                    shards: 2,
+                },
+                None => ShardRole::Coarse,
+            },
+            range,
+            pivot_zoom: 6,
+            cut_digest: "deadbeef".to_string(),
+            binding: None,
+        };
+        let base = crate::tile::hilbert_zoom_base(6);
+        let options = |shard| TilesOptions {
+            convert: ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 8,
+                },
+                plan: Some("never-read.plan".into()),
+                ..ConvertOptions::default()
+            },
+            export: ExportOptions {
+                valve_scope: crate::overview::export::ValveScope::Zoom,
+                ..ExportOptions::default()
+            },
+            shard: Some(shard),
+            ..TilesOptions::default()
+        };
+        let data = options(job(Some(TileRange::new(6, base, base + 9).unwrap())));
+        let err = data.validate().unwrap_err().to_string();
+        assert!(err.contains("--valve-scope zoom"), "{err}");
+        let mut coarse = options(job(None));
+        coarse.convert.plan = None;
+        coarse.validate().expect("the coarse job keeps zoom");
+    }
+
     /// the row pruning, the fingerprinted cut digest and the coarse job's
     /// ceiling — the three fields callers used to hand-sync.
     #[test]
@@ -2279,7 +2333,13 @@ mod tests {
             cut_digest: "deadbeef".to_string(),
             binding: None,
         }
-        .apply_to_convert(&mut filled, true);
+        .apply_to_convert(
+            &mut filled,
+            &ExportOptions {
+                coverage_fill: true,
+                ..ExportOptions::default()
+            },
+        );
         assert_eq!(
             filled.zoom_ceiling, None,
             "#771: the fill needs the finest level"
@@ -2301,7 +2361,7 @@ mod tests {
             cut_digest: "deadbeef".to_string(),
             binding: None,
         };
-        coarse.apply_to_convert(&mut convert, false);
+        coarse.apply_to_convert(&mut convert, &ExportOptions::default());
         assert_eq!(convert.shard, None, "the coarse job prunes no rows");
         assert_eq!(convert.shard_plan_digest.as_deref(), Some("deadbeef"));
         assert_eq!(
@@ -2330,9 +2390,45 @@ mod tests {
             cut_digest: "deadbeef".to_string(),
             binding: None,
         }
-        .apply_to_convert(&mut convert, false);
+        .apply_to_convert(&mut convert, &ExportOptions::default());
         assert_eq!(convert.shard, Some(range));
         assert_eq!(convert.zoom_ceiling, None, "only the coarse job is capped");
+        // #768: the default smooth floors reach nine pivot tiles; an export
+        // with no floors to predict reads the tile buffer's two.
+        let margin = |convert: &ConvertOptions| convert.shard_read().unwrap().margin_tiles;
+        assert_eq!(margin(&convert), crate::shard::SHARD_READ_MARGIN_TILES);
+        let job = TilesShard {
+            role: ShardRole::Shard {
+                index: 3,
+                shards: 4,
+            },
+            range: Some(range),
+            pivot_zoom: 5,
+            cut_digest: "deadbeef".to_string(),
+            binding: None,
+        };
+        for export in [
+            ExportOptions::default().with_valve_scope(super::super::export::ValveScope::Tile),
+            ExportOptions {
+                tile_size_limit: None,
+                compressed_tile_size_limit: None,
+                ..ExportOptions::default()
+            },
+        ] {
+            job.apply_to_convert(&mut convert, &export);
+            assert_eq!(margin(&convert), crate::shard::SHARD_BUFFER_MARGIN_TILES);
+        }
+        assert_eq!(
+            ConvertOptions {
+                shard: Some(range),
+                ..ConvertOptions::default()
+            }
+            .shard_read()
+            .unwrap()
+            .margin_tiles,
+            crate::shard::SHARD_READ_MARGIN_TILES,
+            "a convert on its own cannot see its export: the wide margin"
+        );
 
         // #560: `apply_selection` is the subset a plan-only run applies —
         // the selection without a ceiling it has no pass 2 for.

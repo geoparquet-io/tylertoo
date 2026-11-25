@@ -2,10 +2,14 @@
 
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use super::convert::ConvertError;
 use super::read::{read_in_order, ReadFlow, ReadTuning};
-use crate::input_set::{ConvertSource, RowGroupSelection};
-use arrow_array::RecordBatch;
+use super::writer::{INPUT_ROW_COLUMN, INPUT_ROW_MARKER};
+use crate::input_set::{ConvertSource, RowGroupSelection, StreamRowLocator};
+use arrow_array::{RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 
 /// The stages read their input through this trait. Production reads
 /// [`ConvertSource`] on demand; tests can swap in [`MemorySource`].
@@ -17,6 +21,46 @@ pub(super) trait BatchSource: Sync {
         tuning: ReadTuning,
         on_batch: &mut dyn FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
     ) -> Result<(), ConvertError>;
+
+    /// Where each row of the stream [`Self::read`] reads under `row_groups`
+    /// sits in the input: its part and file row, from the footers alone.
+    fn input_rows(
+        &self,
+        row_groups: Option<&RowGroupSelection>,
+    ) -> Result<StreamRowLocator, ConvertError>;
+
+    /// Pass 2's read: every column of `row_groups`, and each row's input
+    /// row appended as the overview's `input_row` column (#768,
+    /// [`input_row_field`]). Both engines read their output rows here, so
+    /// every overview row carries the input row it came from.
+    fn read_with_input_rows(
+        &self,
+        row_groups: Option<&RowGroupSelection>,
+        tuning: ReadTuning,
+        on_batch: &mut dyn FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
+    ) -> Result<(), ConvertError> {
+        let locator = self.input_rows(row_groups)?;
+        self.read(row_groups, None, tuning, &mut |batch, offset, read_dur| {
+            let rows = locator.global_rows(offset, batch.num_rows()).ok_or(
+                crate::Error::GeoParquetRead(crate::GeoParquetReadError::RowDomainExceeded),
+            )?;
+            let mut fields = batch.schema().fields().to_vec();
+            fields.push(input_row_field());
+            let mut columns = batch.columns().to_vec();
+            columns.push(Arc::new(UInt64Array::from(rows)));
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+            on_batch(batch, offset, read_dur)
+        })
+    }
+}
+
+/// The overview's `input_row` field: each row's input row, last after the
+/// input's own columns, marked as the convert's ([`INPUT_ROW_MARKER`]).
+pub(super) fn input_row_field() -> Arc<Field> {
+    Arc::new(
+        Field::new(INPUT_ROW_COLUMN, DataType::UInt64, false)
+            .with_metadata([(INPUT_ROW_MARKER.to_string(), "1".to_string())].into()),
+    )
 }
 
 impl BatchSource for ConvertSource {
@@ -28,6 +72,13 @@ impl BatchSource for ConvertSource {
         on_batch: &mut dyn FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
     ) -> Result<(), ConvertError> {
         read_in_order(self, row_groups, projection, tuning, on_batch)
+    }
+
+    fn input_rows(
+        &self,
+        row_groups: Option<&RowGroupSelection>,
+    ) -> Result<StreamRowLocator, ConvertError> {
+        Ok(self.stream_row_locator(row_groups)?)
     }
 }
 
@@ -64,6 +115,7 @@ pub(super) fn eager_input() -> bool {
 #[cfg(test)]
 pub(super) struct MemorySource {
     batches: Vec<RecordBatch>,
+    locator: StreamRowLocator,
 }
 
 #[cfg(test)]
@@ -87,7 +139,10 @@ impl MemorySource {
             batches.push(batch);
             Ok(ReadFlow::Continue)
         })?;
-        Ok(Self { batches })
+        Ok(Self {
+            batches,
+            locator: source.stream_row_locator(row_groups)?,
+        })
     }
 }
 
@@ -116,5 +171,12 @@ impl BatchSource for MemorySource {
             offset += batch.num_rows();
         }
         Ok(())
+    }
+
+    fn input_rows(
+        &self,
+        _row_groups: Option<&RowGroupSelection>,
+    ) -> Result<StreamRowLocator, ConvertError> {
+        Ok(self.locator.clone())
     }
 }

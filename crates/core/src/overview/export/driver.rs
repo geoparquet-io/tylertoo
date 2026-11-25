@@ -497,6 +497,8 @@ pub(super) struct ExportLevelCtx<'a> {
     pub(super) member_bytes: Option<u64>,
     /// #802: the finest level's junction pins ([`finest_level_pins`]).
     pub(super) pins: Option<&'a JunctionNodes>,
+    /// #768: the valve floors, with `--valve-scope smooth|zoom`.
+    pub(super) floors: Option<&'a valve_predict::ValveFloors>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     pub(super) work: &'a Mutex<ExportWorkTally>,
@@ -522,6 +524,7 @@ impl<'a> ExportLevelCtx<'a> {
                 .variable_depth
                 .then_some(&self.scan.tile_counts),
             pins: self.pins,
+            floors: self.floors,
             #[cfg(test)]
             work: self.work,
         }
@@ -933,7 +936,7 @@ pub(super) fn export_level_group(
                             level.gzip_cache,
                             (buckets, Some(&held)),
                             level.plan.zoom,
-                            &TileEncoding::single(level.options),
+                            &TileEncoding::single(level.options).with_floors(level.floors),
                             level.fills,
                             timers,
                             diagnostics,

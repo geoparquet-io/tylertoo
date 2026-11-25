@@ -1152,8 +1152,8 @@ fn build_writer_options_with_ceiling(
 
 /// A shard's read window as a query in the input's CRS: its tile range plus
 /// the read margin, with the wrapped copies.
-fn shard_read_query(range: &crate::shard::TileRange, crs: Crs) -> BboxQuery {
-    let b = range.read_bounds();
+fn shard_read_query(read: &crate::shard::ShardRead, crs: Crs) -> BboxQuery {
+    let b = read.range.read_bounds_within(read.margin_tiles);
     BboxQuery::new(&[b.lng_min, b.lat_min, b.lng_max, b.lat_max], crs)
 }
 
@@ -1170,9 +1170,10 @@ fn shard_read_query(range: &crate::shard::TileRange, crs: Crs) -> BboxQuery {
 /// gaps depend on.
 fn shard_chain_reps(
     plan: &mut super::plan_state::ConvertPlan,
-    range: &crate::shard::TileRange,
+    read: &crate::shard::ShardRead,
     crs: Crs,
 ) -> Result<std::collections::BTreeSet<usize>, ConvertError> {
+    let range = &read.range;
     let Some(chains) = &mut plan.chains else {
         return Ok(std::collections::BTreeSet::new());
     };
@@ -1183,7 +1184,7 @@ fn shard_chain_reps(
             .and_then(|&(_, zoom)| zoom)
             .is_none_or(|z| z >= range.pivot_zoom())
     });
-    let window = shard_read_query(range, crs);
+    let window = shard_read_query(read, crs);
     let chains = &*chains;
     chains
         .entries
@@ -1214,7 +1215,7 @@ pub(super) fn select_row_groups_streaming(
     bbox_query: Option<&BboxQuery>,
     mask_query: Option<&BboxQuery>,
     filter: Option<&super::filter::BoundFilter>,
-    shard: Option<&crate::shard::TileRange>,
+    shard: Option<crate::shard::ShardRead>,
     crs: Crs,
 ) -> Result<Option<RowGroupSelection>, ConvertError> {
     let bbox_selection: Option<RowGroupSelection> = match bbox_query {
@@ -1232,7 +1233,7 @@ pub(super) fn select_row_groups_streaming(
     // at lng 200 belongs to the shard covering -160: test the wrapped copies
     // too, as `--bbox` does (#643).
     let shard_selection: Option<RowGroupSelection> = match shard {
-        Some(range) => Some(source.select_row_groups_any(shard_read_query(range, crs).boxes())?),
+        Some(read) => Some(source.select_row_groups_any(shard_read_query(&read, crs).boxes())?),
         None => None,
     };
     let spatial = [bbox_selection, mask_selection, shard_selection]
@@ -2217,7 +2218,8 @@ fn create_level_writer(
 
     let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
-    let non_geom_cols: Vec<usize> = (0..input_schema.fields().len())
+    // Over pass 2's batches: the input's columns and its `input_row`.
+    let non_geom_cols: Vec<usize> = (0..source_schema.fields().len())
         .filter(|&c| c != geom_idx)
         .collect();
 
@@ -2926,7 +2928,7 @@ fn preflight_with_memory_limit(
         bbox_query.as_ref(),
         mask_query.as_ref(),
         bound_filter.as_ref(),
-        options.shard.as_ref(),
+        options.shard_read(),
         crs,
     )?;
     if let Some(selection) = &selected_row_groups {
@@ -3400,6 +3402,7 @@ fn run_pass1_and_assign(
         None => (None, i),
     })?;
     tallies.record(num_features, inputs.crs, diagnostics);
+    super::convert::warn_if_unsorted(inputs.source, tallies.row_order, diagnostics);
 
     // Stage markers (#242): everything between pass 1 and the writer used to
     // run in total info-level silence — on planet-scale inputs that was tens
@@ -3547,8 +3550,9 @@ fn load_plan_state(
     // the equality below is what proves the re-addressing landed — the
     // compacted table must be exactly as long as what the shard will read.
     let mut read_selection = None;
-    if let Some(range) = &options.shard {
-        let reps = shard_chain_reps(&mut plan, range, crs)?;
+    if let Some(read) = options.shard_read() {
+        let range = read.range;
+        let reps = shard_chain_reps(&mut plan, &read, crs)?;
         read_selection = super::plan_state::rebase_plan_for_shard(
             &mut plan,
             source,
@@ -3659,6 +3663,8 @@ fn load_plan_state(
             }),
             // Same as the out-of-range exemplars: the count only (#644).
             wrapped_exemplars: Vec::new(),
+            // The plan's saved diagnostics replay the #768 warning.
+            row_order: None,
         },
         pass1_stage_secs: Pass1StageSecs::default(),
         // The load stands in for the scan; the assignment did not run at all.
@@ -7089,9 +7095,8 @@ fn write_level_streaming(
                         // several merged back into the identical batch sequence
                         // (#494) — `read_tuning` decides, and the decision never
                         // reaches the output.
-                        source.read(
+                        source.read_with_input_rows(
                             row_groups,
-                            None,
                             read_tuning,
                             &mut |batch, offset, read_dur| {
                                 if last_progress.elapsed().as_secs() >= 10 {
@@ -10426,7 +10431,6 @@ mod tests {
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
-        let input_schema = source.schema().unwrap();
         let geom_idx = source
             .resolved_schema()
             .unwrap()
@@ -10456,7 +10460,7 @@ mod tests {
 
         // Every row is a member of the single (verbatim, canonical) level.
         let min_levels = vec![0u8; ROWS];
-        let non_geom_cols: Vec<usize> = (0..input_schema.fields().len())
+        let non_geom_cols: Vec<usize> = (0..source_schema.fields().len())
             .filter(|&c| c != geom_idx)
             .collect();
         let diagnostics = crate::diagnostics::Diagnostics::default();
@@ -10825,13 +10829,20 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_multi_rg_input(tin.path(), &coords, true);
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
-        // z4 tile x=0 spans lng -180..-157.5.
-        let id = crate::pmtiles_writer::tile_id(4, 0, 7);
-        let range = crate::shard::TileRange::new(4, id, id).unwrap();
-        let sel =
-            select_row_groups_streaming(&source, None, None, None, Some(&range), Crs::Epsg4326)
-                .unwrap()
-                .expect("a shard always yields a selection");
+        // z8 tile x=0 spans lng -180..-178.6; its nine-tile read margin
+        // (#768) reaches -192.7 in the west and -166 in the east.
+        let id = crate::pmtiles_writer::tile_id(8, 0, 120);
+        let range = crate::shard::TileRange::new(8, id, id).unwrap();
+        let sel = select_row_groups_streaming(
+            &source,
+            None,
+            None,
+            None,
+            Some(crate::shard::ShardRead::wide(range)),
+            Crs::Epsg4326,
+        )
+        .unwrap()
+        .expect("a shard always yields a selection");
         assert_eq!(sel.parts(), &[vec![1usize]]);
     }
 
@@ -10849,16 +10860,24 @@ mod tests {
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
         let crs = Crs::Epsg4326;
 
-        // z4 tile x=1 spans lng -157.5..-135; with its read margin the
-        // bounds stay west of -90, so only the wrapped group reaches it.
-        let id = crate::pmtiles_writer::tile_id(4, 1, 7);
-        let range = crate::shard::TileRange::new(4, id, id).unwrap();
+        // z8 tile x=14 spans lng -160.3..-158.9; with its nine-tile read
+        // margin (#768) the bounds stay west of -140, so only the wrapped
+        // group reaches it.
+        let id = crate::pmtiles_writer::tile_id(8, 14, 120);
+        let range = crate::shard::TileRange::new(8, id, id).unwrap();
         let read = range.read_bounds();
         assert!(read.lng_min <= -160.0 && read.lng_max < -10.0, "{read:?}");
 
-        let sel = select_row_groups_streaming(&source, None, None, None, Some(&range), crs)
-            .unwrap()
-            .expect("a shard always yields a selection");
+        let sel = select_row_groups_streaming(
+            &source,
+            None,
+            None,
+            None,
+            Some(crate::shard::ShardRead::wide(range)),
+            crs,
+        )
+        .unwrap()
+        .expect("a shard always yields a selection");
         assert_eq!(
             sel.parts(),
             &[vec![1usize]],

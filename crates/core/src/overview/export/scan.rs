@@ -1,4 +1,5 @@
 use super::*;
+use valve_predict::FLUSH_ROWS;
 
 /// Scan **every** level in a single streaming read of the file (issue #233).
 ///
@@ -28,6 +29,10 @@ use super::*;
 /// a non-finite bound) abandons that pass and rescans from the geometry, so
 /// such a file scans exactly as before; a file with no usable covering scans
 /// from the geometry from the start.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "#768: the valve predictor rides along like variable depth"
+)]
 pub(super) fn scan_all_levels(
     reader: &OverviewReader,
     band: BandRead<'_>,
@@ -35,6 +40,7 @@ pub(super) fn scan_all_levels(
     opts: &ExportOptions,
     timers: &ExportTimers,
     mut vd: Option<&mut variable_depth::VdScan>,
+    mut predict: Option<&mut valve_predict::Scan>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<LevelScan>, ExportError> {
     let t_scan = Instant::now();
@@ -55,6 +61,7 @@ pub(super) fn scan_all_levels(
             timers,
             &source,
             vd.as_deref_mut(),
+            predict.as_deref_mut(),
             diagnostics,
         )? {
             return Ok(done(scans, "bbox covering"));
@@ -66,6 +73,9 @@ pub(super) fn scan_all_levels(
         if let Some(vd) = vd.as_deref_mut() {
             vd.reset();
         }
+        if let Some(p) = predict.as_deref_mut() {
+            p.reset();
+        }
     }
     let scans = scan_all_levels_from(
         (reader, band),
@@ -74,6 +84,7 @@ pub(super) fn scan_all_levels(
         timers,
         &ScanBboxSource::Geometry,
         vd,
+        predict,
         diagnostics,
     )?
     .expect("a geometry scan never abandons its pass");
@@ -118,6 +129,10 @@ impl ScanBboxSource {
 /// [`scan_all_levels`] from one bbox source. `Ok(None)` only from
 /// [`ScanBboxSource::Covering`], when a covering row has no exact bbox
 /// ([`covering_batch_bboxes`]) and the pass is abandoned.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "#768: the valve predictor rides along like variable depth"
+)]
 pub(super) fn scan_all_levels_from(
     (reader, band): (&OverviewReader, BandRead<'_>),
     crs: Crs,
@@ -125,6 +140,7 @@ pub(super) fn scan_all_levels_from(
     timers: &ExportTimers,
     source: &ScanBboxSource,
     mut vd: Option<&mut variable_depth::VdScan>,
+    mut predict: Option<&mut valve_predict::Scan>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<Vec<LevelScan>>, ExportError> {
     let num_levels = reader.num_levels();
@@ -190,10 +206,24 @@ pub(super) fn scan_all_levels_from(
     let mut readers = 0;
     #[cfg(test)]
     let readers_ref = &mut readers;
+    // #768 predict: the gap walk rides in the consumer, fed each batch's
+    // row-aligned bboxes in order. Not on a thread of its own: its Rayon
+    // work could then wait on the only pool worker, held by this scan.
+    // PERF (#768): the predictor counts every tile's members already, so the
+    // sizing below keeps only the bounds and takes its counts at the end.
+    let count_tiles = predict.is_none();
+    // PERF (#768): the predictor's flush holds the consumer; a pipe one
+    // flush deep keeps the band read going meanwhile. Covering batches are
+    // four f64 per row, so it holds a few MiB.
+    let depth = match source {
+        ScanBboxSource::Covering { .. } if predict.is_some() => FLUSH_ROWS / EXPORT_BATCH_SIZE,
+        _ => WAVE_READ_IN_FLIGHT,
+    };
+    let predict_ref = &mut predict;
     // PERF (#817): each band is read by the ordered parallel reader, in
     // the same batches one reader makes; `bounded` keeps the one reader.
-    scoped_pipe(
-        WAVE_READ_IN_FLIGHT,
+    let piped = scoped_pipe(
+        depth,
         |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
             send_bands(
                 (reader, band),
@@ -237,7 +267,7 @@ pub(super) fn scan_all_levels_from(
                         .zip(&zooms_ref[j..=last])
                         .for_each(|(scan, &zoom)| {
                             scan.feature_count += pending.len();
-                            let (bounds, counts) = size_bboxes(pending, zoom, opts);
+                            let (bounds, counts) = size_bboxes(pending, zoom, opts, count_tiles);
                             if let Some(b) = bounds {
                                 match &mut scan.bounds {
                                     Some(acc) => acc.expand(&b),
@@ -256,12 +286,17 @@ pub(super) fn scan_all_levels_from(
                 // band; sizing the same bbox into every target level below is
                 // bit-identical to reprojecting it once per level, since
                 // reprojection is a pure fn.
+                // A geometry batch with a null row: its rows row-aligned too.
+                let mut aligned: Option<Bboxes> = None;
                 let bboxes = ExportTimers::time(&timers.scan_decode, || match source {
                     ScanBboxSource::Covering { column, names } => {
                         covering_batch_bboxes(&batch, column, names, crs)
                     }
                     ScanBboxSource::Geometry => {
-                        decode_batch_bboxes(&batch, geometry, crs, diagnostics).map(Some)
+                        let (sized, rows) =
+                            decode_batch_bboxes(&batch, geometry, crs, diagnostics)?;
+                        aligned = rows;
+                        Ok(Some(sized))
                     }
                 })?;
                 let Some(bboxes) = bboxes else {
@@ -323,6 +358,25 @@ pub(super) fn scan_all_levels_from(
                         )
                     })?;
                 }
+                if let Some(p) = predict_ref.as_deref_mut() {
+                    // #768 predict: row-aligned, so a tile's sample rows are its band rows.
+                    // A covering batch with a null row, all checked above, is read again.
+                    let last = if partitioning { num_levels - 1 } else { j };
+                    let kept;
+                    let rows = match source {
+                        ScanBboxSource::Covering { column, names }
+                            if bboxes.len() != batch.num_rows() =>
+                        {
+                            kept = covering_rows(&batch, column, names, crs)?
+                                .map(Option::flatten)
+                                .collect::<Vec<_>>();
+                            &kept[..]
+                        }
+                        _ => aligned.as_deref().unwrap_or(&bboxes),
+                    };
+                    p.batch(j, rows, j..=last, zooms_ref, opts);
+                    shed_over_budget(p, (&band.budget, band.profile), opts, diagnostics);
+                }
                 if j != pending_band {
                     size_pending(pending_band, &mut pending);
                     pending_band = j;
@@ -335,7 +389,14 @@ pub(super) fn scan_all_levels_from(
             size_pending(pending_band, &mut pending);
             Ok(())
         },
-    )?;
+    );
+    piped?;
+    // The tile counts stay in the predictor until its floors are built
+    // ([`scan_with_floors`]).
+    if let Some(p) = predict {
+        p.flush(zooms_ref, opts);
+        shed_over_budget(p, (&band.budget, band.profile), opts, diagnostics);
+    }
     #[cfg(test)]
     BAND_READ_WORKERS.with(|w| w.set(readers));
     Ok((!abandoned).then_some(scans))
@@ -452,30 +513,49 @@ pub(in crate::overview) fn geometry_lnglat_bbox(
         .map(|r| lnglat_bbox(r.min().x, r.min().y, r.max().x, r.max().y, crs))
 }
 
+/// Per-row bboxes, `None` for a row without one.
+type Bboxes = Vec<Option<TileBounds>>;
+
 /// Decode one record batch's geometries into per-feature bounding boxes,
 /// already reprojected to lon/lat (EPSG:4326) when the file is EPSG:3857 —
 /// element `i` is `None` when feature `i` has no bounding rectangle
 /// (empty/degenerate). Reprojecting the two bbox corners is monotone per axis,
 /// hence bit-identical to the bbox of the reprojected geometry.
+///
+/// With them, when a null geometry (which they drop) makes the two differ,
+/// the same rows row-aligned, `None` for a null row (#768: the valve
+/// predictor addresses a tile's sample rows by their place in the file).
 pub(super) fn decode_batch_bboxes(
     batch: &RecordBatch,
     geometry: Option<&str>,
     crs: Crs,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<Vec<Option<TileBounds>>, ExportError> {
+) -> Result<(Bboxes, Option<Bboxes>), ExportError> {
     let schema = batch.schema();
     let geom_idx = batch_geometry_index(batch, geometry)?;
     let geom_field = schema.field(geom_idx).clone();
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
             .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
-    let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
-    extract_geometries_from_array(garr.as_ref(), &mut geoms, diagnostics)?;
-    let bboxes = geoms
+    let mut geoms: Vec<Option<Geometry<f64>>> = Vec::with_capacity(batch.num_rows());
+    crate::batch_processor::extract_geometries_opt_from_array(
+        garr.as_ref(),
+        &mut geoms,
+        diagnostics,
+    )?;
+    let rows: Bboxes = geoms
         .par_iter()
-        .map(|geom| geometry_lnglat_bbox(geom, crs))
+        .map(|geom| geom.as_ref().and_then(|g| geometry_lnglat_bbox(g, crs)))
         .collect();
-    Ok(bboxes)
+    if geoms.iter().all(Option::is_some) {
+        return Ok((rows, None));
+    }
+    let sized = rows
+        .iter()
+        .zip(&geoms)
+        .filter_map(|(b, g)| g.as_ref().map(|_| *b))
+        .collect();
+    Ok((sized, Some(rows)))
 }
 
 /// Every tile key one feature with `bbox` is a member of at `zoom`, once each.
@@ -510,6 +590,37 @@ pub(super) fn for_each_member_key(
     }
 }
 
+/// Whether [`for_each_member_key`] would call back with `key`: one range
+/// test per copy, not one callback per tile the row reaches.
+pub(super) fn is_member_key(bbox: &TileBounds, zoom: u8, opts: &ExportOptions, key: u64) -> bool {
+    let (x, y) = key_to_xy(key, zoom);
+    let tc = TileCoord::new(x, y, zoom);
+    let buffer = buffer_deg_at_zoom(zoom, opts);
+    if !near_world_edge(bbox, buffer) {
+        return ranges_contain(&member_ranges(bbox, zoom, opts), tc);
+    }
+    wrap_shifts(bbox, buffer)
+        .any(|shift| ranges_contain(&member_ranges(&shift_bbox(bbox, shift), zoom, opts), tc))
+}
+
+/// At least as many tiles as [`for_each_member_key`] calls back for: the
+/// same copies, a tile two copies share counted twice. Cheap, so a caller
+/// can bound what it holds per member before it enumerates them.
+pub(super) fn member_tiles_bound(bbox: &TileBounds, zoom: u8, opts: &ExportOptions) -> u64 {
+    let tiles = |b: &TileBounds| {
+        let r = member_ranges(b, zoom, opts);
+        let width = |(lo, hi): (u32, u32)| u64::from(hi - lo) + 1;
+        (width(r.x) + r.x2.map_or(0, width)) * width(r.y)
+    };
+    let buffer = buffer_deg_at_zoom(zoom, opts);
+    if !near_world_edge(bbox, buffer) {
+        return tiles(bbox);
+    }
+    wrap_shifts(bbox, buffer)
+        .map(|shift| tiles(&shift_bbox(bbox, shift)))
+        .sum()
+}
+
 /// Fewest bboxes one [`size_bboxes`] task sizes. Sizing a bbox costs well
 /// under a microsecond, so finer splits only buy accumulator maps to merge
 /// and a pool to wake: splitting a batch to the thread count leaves a large
@@ -528,10 +639,12 @@ thread_local! {
 /// accumulators, then reduce. Both reductions (bbox union, per-tile count sum)
 /// are commutative and associative, so the merged result is identical
 /// regardless of thread scheduling or how features were grouped into batches.
+/// Without `count`, only the bounds.
 pub(super) fn size_bboxes(
     bboxes: &[Option<TileBounds>],
     zoom: u8,
     opts: &ExportOptions,
+    count: bool,
 ) -> (Option<TileBounds>, HashMap<u64, usize>) {
     bboxes
         .par_iter()
@@ -552,9 +665,12 @@ pub(super) fn size_bboxes(
                     }
                     // The accumulated `bounds` above stay the true (wrapped)
                     // extent, since they become the archive's advertised bbox.
-                    for_each_member_key(bbox, zoom, opts, |key| {
-                        *counts.entry(key).or_insert(0) += 1;
-                    });
+                    // PERF (#768): the predictor counts the tiles itself.
+                    if count {
+                        for_each_member_key(bbox, zoom, opts, |key| {
+                            *counts.entry(key).or_insert(0) += 1;
+                        });
+                    }
                 }
                 (bounds, counts)
             },
@@ -627,14 +743,14 @@ pub(super) fn scan_level(
         tile_counts: BTreeMap::new(),
     };
     for batch in batch_reader {
-        let bboxes = decode_batch_bboxes(
+        let (bboxes, _) = decode_batch_bboxes(
             &batch.map_err(|e| read_error(e.into()))?,
             geometry_name(reader),
             crs,
             &crate::diagnostics::Diagnostics::default(),
         )?;
         scan.feature_count += bboxes.len();
-        let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zoom, opts);
+        let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zoom, opts, true);
         if let Some(b) = batch_bounds {
             match &mut scan.bounds {
                 Some(acc) => acc.expand(&b),
@@ -697,3 +813,500 @@ pub(super) fn plan_partitions(
     }
     out
 }
+
+/// The export scan ([`scan_all_levels`]), with the #768 valve predictor
+/// riding along under `--valve-scope smooth|zoom`, and the floors it
+/// predicts. The predictor's state is charged to `budget` while the floors
+/// are priced and returned once they are built; the scan's tile counts,
+/// which the predictor holds, are copied out after.
+pub(super) fn scan_with_floors(
+    reader: &OverviewReader,
+    crs: Crs,
+    cols: (&PublishedNames, Option<&ResolvedFeatureId>),
+    (options, level_zooms): (&ExportOptions, &[u8]),
+    budget: &mut MemoryBudget,
+    (timers, vd): (&ExportTimers, Option<&mut variable_depth::VdScan>),
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<(Vec<LevelScan>, valve_predict::ValveFloors), ExportError> {
+    let mut predict = valve_predicts(options).then(|| {
+        let mut p = valve_predict::Scan::new(reader.num_levels());
+        p.set_room(budget.room(options.profile));
+        p
+    });
+    let band = BandRead {
+        source: reader.source(),
+        budget: *budget,
+        profile: options.profile,
+    };
+    let mut scans = scan_all_levels(
+        reader,
+        band,
+        crs,
+        options,
+        timers,
+        vd,
+        predict.as_mut(),
+        diagnostics,
+    )?;
+    let Some(p) = predict else {
+        return Ok((scans, valve_predict::ValveFloors::default()));
+    };
+    log::info!(
+        "[export] valve predictor state: {:.1} MiB",
+        p.resident_bytes() as f64 / f64::from(1 << 20)
+    );
+    let held = budget.reserve_up_to(MemoryPhase::Scan, p.resident_bytes());
+    let floors = if p.is_shed() {
+        Ok(valve_predict::ValveFloors::default())
+    } else {
+        predict_floors(reader, cols, crs, (options, level_zooms), &p, budget).map(|f| {
+            f.unwrap_or_else(|| {
+                warn_floors_shed(false, options, diagnostics);
+                valve_predict::ValveFloors::default()
+            })
+        })
+    };
+    budget.unreserve(MemoryPhase::Scan, held);
+    for (scan, counts) in scans.iter_mut().zip(p.into_tile_counts()) {
+        scan.tile_counts = counts;
+    }
+    let floors = floors?;
+    // Held through pass 2: every tile reads its floor there.
+    budget.reserve_up_to(MemoryPhase::Scan, floors.resident_bytes());
+    Ok((scans, floors))
+}
+
+/// #768: say loudly (the diagnostic logs itself) that the `--valve-scope`
+/// predictor's scan state, or the floors it predicted, did not fit the
+/// export's memory budget, and that the export runs as `tile`.
+fn warn_floors_shed(
+    predictor: bool,
+    opts: &ExportOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
+    diagnostics.record(crate::diagnostics::Diagnostic::ValveFloorsShed {
+        count: 1,
+        scope: opts.valve_scope.to_string(),
+        predictor,
+    });
+}
+
+/// #768: drop the predictor's dense state when it outgrows what the scan
+/// may hold under `band`'s budget, and say so: the export goes on with the
+/// tile counts alone, as under `--valve-scope tile`.
+pub(super) fn shed_over_budget(
+    p: &mut valve_predict::Scan,
+    (budget, profile): (&MemoryBudget, MemoryProfile),
+    opts: &ExportOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
+    if p.is_shed() {
+        return;
+    }
+    let held = p.resident_bytes();
+    let over = p.outgrew()
+        || budget
+            .require_allowance(profile, MemoryPhase::Scan, held)
+            .is_err();
+    // The next batch's flushes stop adding dense state past this.
+    p.set_room(budget.room(profile));
+    if over {
+        p.shed();
+        log::info!("[export] valve predictor state: {held} bytes, over the scan's budget");
+        warn_floors_shed(true, opts, diagnostics);
+    }
+}
+
+/// #768 `--valve-scope smooth|zoom`: each tile's predicted need, priced by
+/// real encodes of samples of its own members, and the floors they put on
+/// the tiles ([`valve_predict::Scan::floors`]).
+fn predict_floors(
+    reader: &OverviewReader,
+    cols: (&PublishedNames, Option<&ResolvedFeatureId>),
+    crs: Crs,
+    (options, level_zooms): (&ExportOptions, &[u8]),
+    p: &valve_predict::Scan,
+    budget: &MemoryBudget,
+) -> Result<Option<valve_predict::ValveFloors>, ExportError> {
+    let t = Instant::now();
+    // A sampled member's resident bytes, as pass 2 prices one.
+    let member = export_member_bytes(reader, cols.0, reader.finest_level_mean_row_bytes())
+        .unwrap_or_else(|| budget.estimate(MemoryPhase::ExportCollect, 1, None));
+    // Every tile that can be over is priced by a small sample of its own
+    // members; those it puts near a cap, by a larger one. Tiles are sampled
+    // a chunk at a time, in `(level, key)` order, each chunk's members freed
+    // once encoded: as many tiles as the export's share of the budget holds.
+    let sample =
+        |tiles: &[valve_predict::SampleAt],
+         members: usize,
+         rows: &dyn Fn(&[valve_predict::SampleAt]) -> Result<SampleRows, ExportError>| {
+            let price = Price::model(member.saturating_mul(members as u64));
+            let chunk = budget.affordable(options.profile, MemoryPhase::ExportCollect, price);
+            let mut bytes = HashMap::new();
+            for tiles in tiles.chunks(chunk) {
+                #[cfg(test)]
+                SAMPLE_CHUNKS.with(|n| n.set(n.get() + 1));
+                let b = valve_sample_bytes(
+                    reader,
+                    cols,
+                    crs,
+                    (options, level_zooms),
+                    tiles,
+                    rows(tiles)?,
+                )?;
+                bytes.extend(
+                    tiles
+                        .iter()
+                        .zip(b)
+                        .filter_map(|(t, b)| Some(((t.level, t.key), b?))),
+                );
+            }
+            Ok::<_, ExportError>(bytes)
+        };
+    let priced = p.priced();
+    let mut bytes = sample(&priced, valve_predict::PRICE_MEMBERS, &|tiles| {
+        stored_sample_rows(reader, p, tiles)
+    })?;
+    let t_first = t.elapsed();
+    let candidates = p.candidates(&bytes, options);
+    bytes.extend(sample(&candidates, SAMPLE_MEMBERS, &|tiles| {
+        valve_sample_rows(
+            reader,
+            cols.0,
+            crs,
+            (options, level_zooms),
+            tiles,
+            SAMPLE_MEMBERS,
+        )
+    })?);
+    let need = p.predict(level_zooms, &bytes, options);
+    // The floors stay resident through the export, so they get what the
+    // budget has left beside the predictor's own state.
+    let max_floors =
+        usize::try_from(budget.room(options.profile) / valve_predict::FLOOR_ENTRY_BYTES)
+            .unwrap_or(usize::MAX);
+    let floors = valve_predict::valve_floors(&need, options, max_floors);
+    log::info!(
+        "[export] valve floors: {} tiles priced ({} by a larger sample, {} by neither: their rows clip empty), {} predicted over a cap, {} floors, {:.2}s (first sample {:.2}s; scan share {:.2}s)",
+        bytes.len(),
+        candidates.len(),
+        need.unpriced,
+        need.len(),
+        floors.as_ref().map_or(0, valve_predict::ValveFloors::len),
+        t.elapsed().as_secs_f64(),
+        t_first.as_secs_f64(),
+        p.spent.as_secs_f64(),
+    );
+    Ok(floors)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Chunks this thread's [`predict_floors`] sampled tiles in (test
+    /// counter, #768).
+    pub(super) static SAMPLE_CHUNKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// #768 predict: members in the larger price sample of a tile its first
+/// one ([`valve_predict::PRICE_MEMBERS`]) puts near a cap. A sample that
+/// clips to fewer than `MIN_SAMPLE_MEMBERS` pieces prices nothing: below
+/// the first sample's rows, so a row whose bbox reaches the tile but whose
+/// clip there is empty does not leave the tile unpriced.
+const SAMPLE_MEMBERS: usize = 4096;
+const MIN_SAMPLE_MEMBERS: usize = valve_predict::PRICE_MEMBERS * 3 / 4;
+
+/// Per row group: each tile (its index) and its rows to sample there.
+type SampleRows = BTreeMap<usize, Vec<(usize, Vec<u32>)>>;
+
+/// #768: the rows the scan kept to price each of `tiles` by
+/// ([`valve_predict::Scan::price_rows`]), per row group.
+fn stored_sample_rows(
+    reader: &OverviewReader,
+    p: &valve_predict::Scan,
+    tiles: &[valve_predict::SampleAt],
+) -> Result<SampleRows, ExportError> {
+    // Each band's row groups and the band row each starts at.
+    let mut starts: HashMap<u16, Vec<(usize, u64)>> = HashMap::new();
+    let mut chosen = SampleRows::new();
+    for (i, t) in tiles.iter().enumerate() {
+        for (band, row) in p.price_rows(t) {
+            let groups = match starts.entry(band) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let mut at = 0u64;
+                    let rows_of = |rg| reader.parquet_metadata().row_group(rg).num_rows().max(0);
+                    let groups = reader.band(usize::from(band))?.into_iter().map(|rg| {
+                        let start = at;
+                        at += rows_of(rg) as u64;
+                        (rg, start)
+                    });
+                    e.insert(groups.collect())
+                }
+            };
+            let (rg, start) = groups[groups.partition_point(|&(_, s)| s <= row) - 1];
+            let entry = chosen.entry(rg).or_default();
+            let offset = (row - start) as u32;
+            match entry.last_mut() {
+                Some((j, rows)) if *j == i => rows.push(offset),
+                _ => entry.push((i, vec![offset])),
+            }
+        }
+    }
+    Ok(chosen)
+}
+
+/// #768: the rows [`valve_sample_bytes`] samples, per row group: each
+/// tile's first `sample_members` member rows in its span, read from the
+/// bbox covering alone (the geometry when there is none).
+///
+/// PERF: tiles in parallel, each walking its span's row groups in order and
+/// stopping at its sample. Walking every row group of every span in
+/// parallel read and scanned a coarse tile's whole band for a sample its
+/// first row group already held (France points: 6 of 15 s of CPU).
+fn valve_sample_rows(
+    reader: &OverviewReader,
+    published: &PublishedNames,
+    crs: Crs,
+    (opts, zooms): (&ExportOptions, &[u8]),
+    tiles: &[valve_predict::SampleAt],
+    sample_members: usize,
+) -> Result<SampleRows, ExportError> {
+    let rows_of = |rg: usize| reader.parquet_metadata().row_group(rg).num_rows().max(0) as u64;
+    let source = ScanBboxSource::for_reader(reader);
+    let projection: Option<Vec<usize>> = match &source {
+        ScanBboxSource::Covering { .. } => reader
+            .resolved_schema()
+            .f64_covering()
+            .map(|(idx, _)| vec![idx]),
+        ScanBboxSource::Geometry => reader.resolved_schema().geometry_index().map(|i| vec![i]),
+    };
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    // One tile's first `sample_members` member rows, per row group of its
+    // span, in band order.
+    let sample_tile = |t: &valve_predict::SampleAt| -> Result<Vec<(usize, Vec<u32>)>, ExportError> {
+        let mut found: Vec<(usize, Vec<u32>)> = Vec::new();
+        let mut left = sample_members;
+        let mut start = 0u64;
+        for rg in reader.band(usize::from(t.band))? {
+            let n = rows_of(rg);
+            // The span inside this row group, rows from its start.
+            let (lo, hi) = (t.row.max(start), t.last.min((start + n).saturating_sub(1)));
+            start += n;
+            if n == 0 || lo > hi {
+                if start > t.last {
+                    break;
+                }
+                continue;
+            }
+            let (lo, hi) = (lo - (start - n), hi - (start - n));
+            let mut rows = Vec::new();
+            let mut base = 0u64;
+            for batch in read_row_group(reader, rg, projection.as_deref())? {
+                let batch = batch.map_err(|e| read_error(e.into()))?;
+                let m = batch.num_rows() as u64;
+                if lo < base + m && hi >= base {
+                    let bboxes: Vec<Option<TileBounds>> = match &source {
+                        // A malformed covering row (the scan then fell back
+                        // to geometry) is sampled as no member.
+                        ScanBboxSource::Covering { column, names } => {
+                            covering_rows(&batch, column, names, crs)?
+                                .map(Option::flatten)
+                                .collect()
+                        }
+                        ScanBboxSource::Geometry => {
+                            let (sized, rows) = decode_batch_bboxes(
+                                &batch,
+                                published.geometry.as_deref(),
+                                crs,
+                                &diagnostics,
+                            )?;
+                            rows.unwrap_or(sized)
+                        }
+                    };
+                    for row in lo.max(base) - base..=hi.min(base + m - 1) - base {
+                        let Some(Some(b)) = bboxes.get(row as usize) else {
+                            continue;
+                        };
+                        if is_member_key(b, zooms[t.level], opts, t.key) {
+                            rows.push((base + row) as u32);
+                            if rows.len() == left {
+                                break;
+                            }
+                        }
+                    }
+                }
+                base += m;
+                if base > hi || rows.len() == left {
+                    break;
+                }
+            }
+            left -= rows.len();
+            if !rows.is_empty() {
+                found.push((rg, rows));
+            }
+            if left == 0 || start > t.last {
+                break;
+            }
+        }
+        Ok(found)
+    };
+    let per_tile = tiles
+        .par_iter()
+        .map(sample_tile)
+        .collect::<Result<Vec<_>, ExportError>>()?;
+    let mut chosen = SampleRows::new();
+    for (i, groups) in per_tile.into_iter().enumerate() {
+        for (rg, rows) in groups {
+            chosen.entry(rg).or_default().push((i, rows));
+        }
+    }
+    Ok(chosen)
+}
+
+/// One row group of the overview, as batches, with `projection`.
+fn read_row_group<'a>(
+    reader: &'a OverviewReader,
+    rg: usize,
+    projection: Option<&[usize]>,
+) -> Result<crate::input_set::SourceStream<'a>, ExportError> {
+    let selection = RowGroupSelection::from_parts(vec![vec![rg]]);
+    reader
+        .source()
+        .open_stream(&crate::input_set::ReadPlan {
+            batch_size: tylertoo_io::DEFAULT_BATCH_ROWS,
+            projection,
+            row_groups: Some(&selection),
+        })
+        .map_err(|e| read_error(e.into()))
+}
+
+/// #768: the raw and gzipped MVT bytes one member of each of `tiles`
+/// costs, from a real first encode of a sample of its members (`chosen`,
+/// per row group): the export's own clip, attributes and encoder. `None`
+/// for a tile whose sample is too small to price.
+///
+/// Which rows are sampled depends only on the tile's own members, never on
+/// row positions, so a shard samples what the full build does. Row groups
+/// read in parallel, each once, decoding only the chosen rows.
+fn valve_sample_bytes(
+    reader: &OverviewReader,
+    (published, feature_id): (&PublishedNames, Option<&ResolvedFeatureId>),
+    crs: Crs,
+    (opts, zooms): (&ExportOptions, &[u8]),
+    tiles: &[valve_predict::SampleAt],
+    chosen: SampleRows,
+) -> Result<Vec<Option<MemberBytes>>, ExportError> {
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    // Read 2: whole rows, only the chosen ones decoded.
+    let timers = ExportTimers::default();
+    let per_rg = chosen
+        .into_par_iter()
+        .map(
+            |(rg, wanted)| -> Result<Vec<(usize, Vec<Member>)>, ExportError> {
+                let band = reader.row_group_bands(&[rg])[0].0;
+                let mut members: Vec<Vec<Member>> = wanted.iter().map(|_| Vec::new()).collect();
+                let mut base = 0u64;
+                let last = wanted
+                    .iter()
+                    .filter_map(|(_, r)| r.last())
+                    .max()
+                    .copied()
+                    .unwrap_or(0);
+                for batch in read_row_group(reader, rg, None)? {
+                    let batch = batch.map_err(|e| read_error(e.into()))?;
+                    let n = batch.num_rows() as u64;
+                    let in_batch = |r: &&u32| u64::from(**r) >= base && u64::from(**r) < base + n;
+                    let mut rows: Vec<u32> = wanted
+                        .iter()
+                        .flat_map(|(_, r)| r.iter().filter(in_batch))
+                        .map(|&r| (u64::from(r) - base) as u32)
+                        .collect();
+                    rows.sort_unstable();
+                    rows.dedup();
+                    if !rows.is_empty() {
+                        let taken = arrow_select::take::take_record_batch(
+                            &batch,
+                            &arrow_array::UInt32Array::from(rows.clone()),
+                        )?;
+                        let schema = taken.schema();
+                        let gi = batch_geometry_index(&taken, published.geometry.as_deref())?;
+                        let geoms = decode_batch_geometries(
+                            &taken,
+                            &schema,
+                            gi,
+                            crs,
+                            &timers,
+                            &diagnostics,
+                        )?;
+                        let mut attrs =
+                            AttrColumns::new(&schema, gi, published, feature_id).extract(&taken)?;
+                        // Built once per row: two tiles can sample the same row.
+                        let props: Vec<SharedProps> =
+                            (0..rows.len()).map(|k| attrs.props(k)).collect();
+                        for (w, (i, wanted_rows)) in wanted.iter().enumerate() {
+                            let t = tiles[*i];
+                            for r in wanted_rows.iter().filter(in_batch) {
+                                let at = (u64::from(*r) - base) as u32;
+                                let k = rows.binary_search(&at).expect("taken above");
+                                let pieces = feature_tile_members(
+                                    &geoms[k],
+                                    zooms[t.level],
+                                    opts,
+                                    t.key,
+                                    t.key,
+                                    &diagnostics,
+                                );
+                                let props = &props[k];
+                                let id = attrs.id(k)?;
+                                members[w].extend(pieces.into_iter().map(|(key, g)| Member {
+                                    key,
+                                    seq: u64::from(*r),
+                                    rank: attrs.rank(k, u64::from(*r)),
+                                    geom: g.into(),
+                                    props: props.clone(),
+                                    id,
+                                    gap: coalesce_valve::GAP_NONE,
+                                    band,
+                                }));
+                            }
+                        }
+                    }
+                    base += n;
+                    if base > u64::from(last) {
+                        break;
+                    }
+                }
+                Ok(wanted.iter().map(|(i, _)| *i).zip(members).collect())
+            },
+        )
+        .collect::<Result<Vec<_>, ExportError>>()?;
+    let mut samples: Vec<Vec<Member>> = tiles.iter().map(|_| Vec::new()).collect();
+    for (i, m) in per_rg.into_iter().flatten() {
+        samples[i].extend(m);
+    }
+    let cache = Arc::new(TileGzipCache::new(0));
+    samples
+        .into_par_iter()
+        .zip(tiles)
+        .map(|(mut sample, t)| {
+            if sample.len() < MIN_SAMPLE_MEMBERS {
+                return Ok(None);
+            }
+            let (x, y) = key_to_xy(t.key, zooms[t.level]);
+            let tb = TileCoord::new(x, y, zooms[t.level]).bounds();
+            // `--feature-order` ties go by the tile's own file order: a
+            // row's place in its row group moves with a shard's row groups.
+            for (k, m) in sample.iter_mut().enumerate() {
+                m.seq = k as u64;
+            }
+            sort_tile_for_encode(&mut sample, &opts.feature_order);
+            let mut mvt = build_tile_layers(&cache, &[], &sample, &tb, opts, &[], &diagnostics);
+            let n = sample.len() as f64;
+            let raw = mvt.data.len() as f64;
+            let gz = mvt.data.gzipped(&cache)?.len() as f64;
+            Ok(Some((raw / n, gz / n)))
+        })
+        .collect()
+}
+
+pub(super) use valve_predict::MemberBytes;

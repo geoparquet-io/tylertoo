@@ -245,7 +245,7 @@ impl DiskFootprint {
                     bbox.as_ref(),
                     mask.as_ref(),
                     None,
-                    options.shard.as_ref(),
+                    options.shard_read(),
                     crs,
                 )
                 .ok()

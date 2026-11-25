@@ -117,6 +117,12 @@ pub(super) fn with_fill(
     no_fill(tally, fitted)
 }
 
+/// #768: whether the export scan predicts valve floors: under
+/// `--valve-scope smooth` or `zoom`, with a cap in force.
+pub(crate) fn valve_predicts(opts: &ExportOptions) -> bool {
+    opts.valve_scope != ValveScope::Tile && opts.has_tile_size_cap()
+}
+
 /// Whether the size valve can merge anything: [`SizeValve::Merge`] with a
 /// size limit in force. Otherwise no gap is ever compared, and the read
 /// skips measuring them (#745).
@@ -125,9 +131,32 @@ pub(super) fn valve_merges(opts: &ExportOptions) -> bool {
 }
 
 /// Whether every member has at most one coordinate: a tile of points (or of
-/// polygons collapsed to centroid points, the #259 dot-fill recipe).
+/// polygons collapsed to centroid points, the #259 dot-fill recipe), where
+/// the two date-line copies of one point count as one ([`draws_one_point`]).
 pub(super) fn is_point_like<M: TileFeature>(members: &[M]) -> bool {
-    members.iter().all(|m| m.geometry().coords_count() <= 1)
+    members.iter().all(|m| match m.geometry() {
+        Geometry::MultiPoint(mp) => draws_one_point(mp.0.iter().map(|p| (p.x(), p.y())), 360.0),
+        g => g.coords_count() <= 1,
+    })
+}
+
+/// Whether a member's points, as `(x, y)` (degrees, or MVT units), draw one
+/// point: none or one, or the pair [`join_wrapped_pieces`] makes when a
+/// point within the buffer of the date line reaches a z0 tile twice (#342).
+/// The two copies share a latitude and lie one `world` width apart, the
+/// shift [`wrap_shifts`] gave the copy.
+pub(crate) fn draws_one_point<T>(mut points: impl Iterator<Item = (T, T)>, world: T) -> bool
+where
+    T: Copy + PartialEq + std::ops::Add<Output = T> + std::ops::Sub<Output = T>,
+{
+    match (points.next(), points.next(), points.next()) {
+        (_, None, _) => true,
+        (Some((ax, ay)), Some((bx, by)), None) => {
+            ay == by
+                && (bx == ax - world || bx == ax + world || ax == bx - world || ax == bx + world)
+        }
+        _ => false,
+    }
 }
 
 /// The share of a tile that fits its size limits: the smallest
@@ -178,6 +207,60 @@ pub(super) fn drop_keep(keep: usize, fit: f64, cut: u32) -> usize {
 /// One grid unit per pixel on a 512-pixel tile before losing whole features.
 pub(super) const MIN_VALVE_EXTENT: u32 = 512;
 
+/// The drop valve. A point tile with a #768 drop floor, under either
+/// `--size-valve`, first keeps the share of its members the floor sets
+/// ([`kept_at_floor`]), before its first encode and whether or not it
+/// would fit without it: the floor is how the tiles around a dense one
+/// fade toward it. Then [`drop_members_to_fit`] holds the cap. The tile
+/// counts as oversized when it was predicted over its cap on its own or the
+/// cap made it shed more; a fit tile its neighbours' floor thinned does not.
+pub(super) fn drop_to_fit(
+    gzip_cache: &Arc<TileGzipCache>,
+    members: &[Member],
+    tb: &TileBounds,
+    opts: &TileEncoding<'_>,
+    fill: &[FillFeature],
+    fill_tally: &mut FillTally,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> TileMvt {
+    if opts.floor.drop == 0 || !is_point_like(members) {
+        return drop_members_to_fit(gzip_cache, members, tb, opts, fill, fill_tally, diagnostics);
+    }
+    let kept = kept_at_floor(members, opts.floor.drop);
+    let mut mvt = drop_members_to_fit(gzip_cache, &kept, tb, opts, fill, fill_tally, diagnostics);
+    let shed = members.len() - kept.len();
+    mvt.valve.dropped += shed;
+    mvt.oversized |= shed > 0 && opts.floor.own;
+    mvt
+}
+
+/// #768: the members a point tile keeps at drop floor `floor`: the share
+/// `KEEP_ALL / floor` of them (all at or under [`valve_predict::KEEP_ALL`];
+/// at least one) with the best [`point_rank`]. The rank is the point's own,
+/// so a larger share keeps a superset of a smaller one, and a tile and its
+/// child, or two neighbours, at one share keep nearly the same points: on
+/// Hilbert-sorted input each holds long runs of rows, whose bit-reversed
+/// ranks spread evenly. A count, not a threshold on the rank itself: rows a
+/// filter or the convert's thinning left with gaps (every odd row, say)
+/// rank all above any fixed threshold, and a threshold would keep one
+/// point. The size ladder after it still holds the cap when the floor kept
+/// too many.
+///
+/// DIVERGENCE FROM TIPPECANOE: `--drop-densest-as-needed` drops below one
+/// gap threshold per zoom and raises it until every tile fits, which thins
+/// clusters first. Here the floor is a share per tile, predicted before any
+/// encode and faded over the tiles around it ([`valve_predict::floors`]);
+/// a tile still over after it is thinned by rank. `--valve-scope zoom`
+/// keeps every point tile at its zoom's smallest predicted share, as
+/// `--drop-fraction-as-needed` keeps one fraction a zoom.
+pub(super) fn kept_at_floor(members: &[Member], floor: u64) -> Vec<&Member> {
+    if floor <= valve_predict::KEEP_ALL {
+        return members.iter().collect();
+    }
+    let keep = members.len() as u128 * u128::from(valve_predict::KEEP_ALL) / u128::from(floor);
+    select_kept_by_rank(members, keep as usize, |m| m.rank)
+}
+
 /// The drop valve: while the tile is over its limit, keep a proportional
 /// count of members and re-encode. `select_kept_members` decides which
 /// survive.
@@ -186,9 +269,9 @@ pub(super) const MIN_VALVE_EXTENT: u32 = 512;
 /// whose survivors still encoded too big was written over its limit (45 of
 /// 1,286 tiles on the FTW Moldova benchmark). The first pass is unchanged,
 /// so a tile that fit after one pass is byte-identical to before.
-pub(super) fn drop_to_fit(
+pub(super) fn drop_members_to_fit<M: TileFeature + std::borrow::Borrow<Member>>(
     gzip_cache: &Arc<TileGzipCache>,
-    members: &[Member],
+    members: &[M],
     tb: &TileBounds,
     opts: &TileEncoding<'_>,
     fill: &[FillFeature],
@@ -345,7 +428,8 @@ pub(super) fn merge_to_fit(
     let mut build = |feats: &[&coalesce_valve::Merged<'_>], pass: u32, fill: &[&FillFeature]| {
         // Pass 1 merges nothing, and a pass that still merges nothing (a
         // tile with no mergeable gaps, on its way to the drop fallback) has
-        // nothing to reuse.
+        // nothing to reuse. A #768 floored pass 1 does merge, but encodes
+        // faster without the cache (NZ: 271 against 289 encode core-s).
         if pass == 1 || feats.iter().all(|m| m.members.len() < 2) {
             return build_tile_layers(gzip_cache, layers, feats, tb, opts, fill, diagnostics);
         }
@@ -368,7 +452,8 @@ pub(super) fn merge_to_fit(
         })
     };
     let mut gaps: Option<Vec<u64>> = None;
-    let mut mingap = 0u64;
+    // #768: `--valve-scope smooth` starts the ladder at the tile's floor.
+    let mut mingap = opts.floor.merge;
     let mut keep_fraction = 1.0_f64;
     let mut prev_fit: Option<f64> = None;
     let mut stalls = 0u32;
@@ -391,7 +476,10 @@ pub(super) fn merge_to_fit(
         };
         if fit >= 1.0 {
             let fitted = TileMvt {
-                oversized: passes > 1,
+                // #768: a floored first pass that merged acted as the valve
+                // when the tile was predicted over on its own; a fit tile
+                // its neighbours' floor merged is not oversized.
+                oversized: passes > 1 || (absorbed > 0 && opts.floor.own),
                 valve: tally,
                 ..mvt
             };
@@ -401,6 +489,14 @@ pub(super) fn merge_to_fit(
                 account_merged_sources(&merged, &feats, &ordered, &mut fitted);
             }
             return fitted;
+        }
+        let g = gaps.get_or_insert_with(|| coalesce_valve::mergeable_gaps(&ordered));
+        if passes == 1 && mingap > 0 {
+            // #768: a tile that started from a floor already keeps only the
+            // gaps at or above it; the ladder goes on from that share, or it
+            // creeps up from the floor, looks stalled and merges everything.
+            keep_fraction =
+                g.iter().filter(|&&x| x >= mingap).count() as f64 / g.len().max(1) as f64;
         }
         // tippecanoe's `mingap_fraction`: aim for the share of features
         // that would fit, with a 20% margin, never keeping more than 80%.
@@ -421,7 +517,6 @@ pub(super) fn merge_to_fit(
             keep_fraction = 0.0;
         }
         prev_fit = Some(fit);
-        let g = gaps.get_or_insert_with(|| coalesce_valve::mergeable_gaps(&ordered));
         if let Some(next) = coalesce_valve::next_mingap(g, keep_fraction, mingap) {
             mingap = next;
             continue;
@@ -625,64 +720,93 @@ pub(super) fn account_merged_sources(
 /// ones a caller pins an order for. The default [`FeatureOrder::Input`] keeps
 /// the vertex-count order, which is the pre-#280 behaviour and byte-identical
 /// to it.
-pub(super) fn shed_to_fit<'a>(
-    members: &'a [Member],
+pub(super) fn shed_to_fit<'a, M: TileFeature + std::borrow::Borrow<Member>>(
+    members: &'a [M],
     keep: usize,
     opts: &ExportOptions,
-) -> Vec<&'a Member> {
+) -> Vec<&'a M> {
     let mut kept = select_kept_members(members, keep);
     if let FeatureOrder::Column { name, descending } = &opts.feature_order {
-        kept.sort_by(|a, b| compare_by_feature_order(a, b, name, *descending));
+        kept.sort_by(|a, b| {
+            compare_by_feature_order((*a).borrow(), (*b).borrow(), name, *descending)
+        });
     }
     kept
 }
 
 /// Choose which `keep` of `members` survive the oversized-tile drop pass.
 ///
-/// The single-pass valve has exactly one per-feature ranking signal — geometry
-/// vertex count — and that signal is degenerate for point tiles, so there are
-/// two regimes:
-///
 /// * **Sized geometries** (lines / polygons): keep the `keep` largest by
-///   coordinate count. The biggest features carry the tile's visual signal;
-///   this is the pre-#280 behaviour and is byte-identical to it.
+///   coordinate count ([`select_kept_by_size`]). The biggest features carry
+///   the tile's visual signal; this is the pre-#280 behaviour and is
+///   byte-identical to it.
 /// * **Point-dominated tiles** (every member ≤ 1 coordinate — the #259 dot-fill
 ///   recipe collapses dense polygons to centroid points): vertex count carries
-///   no signal, so a size-ranked prefix would just keep whichever points happen
-///   to sort first and clump them in one corner. Instead keep a uniform stride
-///   across member order. Overview rows are in the source file's order, which
-///   for gpio-optimized input is Hilbert order, so a tile's members arrive in
-///   space-filling-curve order; an even stride then spreads the survivors
-///   across the tile — the same spatially uniform thinning tippecanoe
-///   achieves by dropping every Nth feature in sequence.
+///   no signal, so keep the `keep` best-ranked points ([`select_kept_by_rank`],
+///   [`point_rank`]). The rank belongs to the point, not the tile, so a point
+///   a tile keeps is kept by its child tiles too when they keep as large a
+///   share, and neighbouring tiles agree across their edge (#768). A stride
+///   counted from each tile's own first member replaced ~95% of the visible
+///   points from z3 to z4 on France points; tippecanoe replaces none.
 ///
 /// `keep` is clamped to `1..=members.len()`.
 pub(super) fn select_kept_members<M: TileFeature>(members: &[M], keep: usize) -> Vec<&M> {
-    select_kept_by_size(members, keep, is_point_like(members), |m| {
-        m.geometry().coords_count()
-    })
+    if is_point_like(members) {
+        select_kept_by_rank(members, keep, TileFeature::rank)
+    } else {
+        select_kept_by_size(members, keep, |m| m.geometry().coords_count())
+    }
 }
 
-/// Shared drop ranking for overview members and decoded joined-tile features.
-/// The latter have geometry commands rather than source coordinates.
+/// A point's fixed thinning rank (#768): its input row, bit-reversed. Keeping
+/// the points ranked below a share of `2^64` keeps a van der Corput
+/// subsequence of the input: every 2nd row, then every 4th, and so on, with
+/// one phase for the whole dataset. Hilbert-sorted input (the input
+/// contract, `gpio sort hilbert`) puts each tile's points in long runs of
+/// rows, so the survivors spread evenly over the tile, a larger share keeps
+/// a superset of a smaller one, and two tiles at one share keep the same
+/// points along their shared edge. The input row, unlike the overview row,
+/// is the same in every shard.
+pub(crate) fn point_rank(input_row: u64) -> u64 {
+    input_row.reverse_bits()
+}
+
+/// The `keep` members of lowest `rank`, in member order (ties by position).
+/// `keep` is clamped to `1..=members.len()`.
+pub(crate) fn select_kept_by_rank<M>(
+    members: &[M],
+    keep: usize,
+    rank: impl Fn(&M) -> u64,
+) -> Vec<&M> {
+    let keep = keep.clamp(1, members.len().max(1));
+    let mut order: Vec<(u64, usize)> = members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (rank(m), i))
+        .collect();
+    if keep < order.len() {
+        order.select_nth_unstable(keep - 1);
+        order.truncate(keep);
+    }
+    let mut kept: Vec<usize> = order.into_iter().map(|(_, i)| i).collect();
+    kept.sort_unstable();
+    kept.into_iter().map(|i| &members[i]).collect()
+}
+
+/// The `keep` largest members by `size`, largest first (a stable sort, so
+/// equal sizes keep member order). `keep` is clamped to `1..=members.len()`.
+/// Shared by overview members and decoded joined-tile features, which have
+/// geometry commands rather than source coordinates.
 pub(crate) fn select_kept_by_size<M>(
     members: &[M],
     keep: usize,
-    point_like: bool,
     size: impl Fn(&M) -> usize,
 ) -> Vec<&M> {
-    let n = members.len();
-    let keep = keep.clamp(1, n);
-    if point_like {
-        // Evenly spaced indices 0, n/keep, 2n/keep, … — strictly increasing and
-        // in-bounds because keep ≤ n.
-        (0..keep).map(|i| &members[i * n / keep]).collect()
-    } else {
-        let mut ranked: Vec<&M> = members.iter().collect();
-        ranked.sort_by_key(|m| std::cmp::Reverse(size(m)));
-        ranked.truncate(keep);
-        ranked
-    }
+    let keep = keep.clamp(1, members.len());
+    let mut ranked: Vec<&M> = members.iter().collect();
+    ranked.sort_by_key(|m| std::cmp::Reverse(size(m)));
+    ranked.truncate(keep);
+    ranked
 }
 
 #[cfg(test)]
@@ -706,6 +830,7 @@ mod diagnostic_row_alignment {
         .map(|(row, geom)| Member {
             key: 0,
             seq: row as u64,
+            rank: point_rank(row as u64),
             geom: geom.into(),
             props: SharedProps::new(vec![]),
             id: Some(100 + row as u64),
@@ -836,6 +961,7 @@ mod diagnostic_row_alignment {
                 .map(|(row, geom)| Member {
                     key: 0,
                     seq: row as u64,
+                    rank: point_rank(row as u64),
                     geom: geom.into(),
                     props: SharedProps::new(vec![]),
                     id: Some(100 + row as u64),
@@ -925,6 +1051,7 @@ mod diagnostic_row_alignment {
                 Member {
                     key: 0,
                     seq: row as u64,
+                    rank: point_rank(row as u64),
                     geom: geom.into(),
                     id: Some(7),
                     props: SharedProps::new(vec![]),
@@ -982,6 +1109,7 @@ mod diagnostic_row_alignment {
         let members = vec![Member {
             key: 0,
             seq: 0,
+            rank: point_rank(0),
             geom: triangle.into(),
             props: SharedProps::new(vec![]),
             id: Some(7),

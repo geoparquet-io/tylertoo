@@ -393,7 +393,7 @@ pub(super) fn encode_layer_members(
             gzip_cache,
             g,
             &tb,
-            opts,
+            &opts.for_tile(zoom, x, y),
             &fill,
             &mut fill_tally,
             diagnostics,
@@ -638,6 +638,8 @@ pub(super) trait TileFeature: Sync {
     fn properties(&self) -> &SharedProps;
     fn feature_id(&self) -> Option<u64>;
     fn source_row(&self) -> u64;
+    /// The point-thinning rank ([`point_rank`]).
+    fn rank(&self) -> u64;
     fn band(&self) -> u16;
 }
 
@@ -658,6 +660,9 @@ impl TileFeature for Member {
     }
     fn source_row(&self) -> u64 {
         self.seq
+    }
+    fn rank(&self) -> u64 {
+        self.rank
     }
 }
 
@@ -685,6 +690,9 @@ impl TileFeature for coalesce_valve::Merged<'_> {
     fn source_row(&self) -> u64 {
         self.target.seq
     }
+    fn rank(&self) -> u64 {
+        self.target.rank
+    }
 }
 
 impl<T: TileFeature + ?Sized> TileFeature for &T {
@@ -706,13 +714,21 @@ impl<T: TileFeature + ?Sized> TileFeature for &T {
     fn source_row(&self) -> u64 {
         (**self).source_row()
     }
+    fn rank(&self) -> u64 {
+        (**self).rank()
+    }
 }
 
 /// The valve's export options and optional joint layer mapping. A normal
 /// export uses an empty mapping and the original single-layer build path.
+#[derive(Clone, Copy)]
 pub(super) struct TileEncoding<'a> {
     pub(super) options: &'a ExportOptions,
     pub(super) layers: &'a [(u16, String)],
+    /// #768: every tile's valve floors (`--valve-scope smooth|zoom`).
+    floors: Option<&'a valve_predict::ValveFloors>,
+    /// The valve floors of the tile being encoded.
+    pub(super) floor: valve_predict::TileFloor,
 }
 
 impl<'a> TileEncoding<'a> {
@@ -721,7 +737,25 @@ impl<'a> TileEncoding<'a> {
         Self {
             options,
             layers: &[],
+            floors: None,
+            floor: valve_predict::TileFloor::default(),
         }
+    }
+
+    /// With the export's valve floors.
+    pub(super) fn with_floors(self, floors: Option<&'a valve_predict::ValveFloors>) -> Self {
+        Self {
+            floors: floors.filter(|f| !f.is_empty()),
+            ..self
+        }
+    }
+
+    /// For tile `(zoom, x, y)`: its own floors.
+    pub(super) fn for_tile(self, zoom: u8, x: u32, y: u32) -> Self {
+        let floor = self
+            .floors
+            .map_or_else(Default::default, |f| f.for_tile((zoom, x, y)));
+        Self { floor, ..self }
     }
 }
 
@@ -975,6 +1009,8 @@ impl<'a> JoinedTileFitter<'a> {
                     fills: None,
                     tiles: Some(&tile_counts),
                     pins: pins.as_ref(),
+                    // A joined tile is fitted alone (merge's joint valve).
+                    floors: None,
                     #[cfg(test)]
                     work: &Mutex::new(ExportWorkTally::default()),
                 };
@@ -1006,8 +1042,8 @@ impl<'a> JoinedTileFitter<'a> {
                 (buckets, None),
                 zoom,
                 &TileEncoding {
-                    options: opts,
                     layers: &layers,
+                    ..TileEncoding::single(opts)
                 },
                 None,
                 &timers,
@@ -1431,6 +1467,7 @@ mod tests {
         Member {
             key: 0,
             seq,
+            rank: point_rank(seq),
             geom: Geometry::Point(Point::new(seq as f64 * 0.001, 0.0)).into(),
             props: SharedProps::new(vec![("level".into(), PropertyValue::Double(level))]),
             id: None,
@@ -1589,6 +1626,7 @@ mod tests {
         let mk = |key: u64, seq: u64, level: f64| Member {
             key,
             seq,
+            rank: point_rank(seq),
             geom: Geometry::Point(Point::new(0.0, 0.0)).into(),
             props: SharedProps::new(vec![("level".into(), PropertyValue::Double(level))]),
             id: None,
@@ -1621,6 +1659,7 @@ mod tests {
         let mk = |seq: u64, v: PropertyValue| Member {
             key: 0,
             seq,
+            rank: point_rank(seq),
             geom: Geometry::Point(Point::new(0.0, 0.0)).into(),
             props: SharedProps::new(vec![("n".into(), v)]),
             id: None,
@@ -1672,13 +1711,15 @@ mod tests {
         assert!(":asc".parse::<FeatureOrder>().is_err());
     }
 
-    /// #280 spatial fairness: on a point-dominated tile, vertex count carries no
-    /// ranking signal, so the valve must keep a uniform stride across member
-    /// (≈ Hilbert) order — not a first-N prefix that would clump survivors.
+    /// #280 spatial fairness: on a point-dominated tile, vertex count carries
+    /// no ranking signal, so the valve keeps the best-ranked points (#768:
+    /// the input row bit-reversed), spread across member (≈ Hilbert) order,
+    /// not a first-N prefix that would clump survivors, nor a stride from the
+    /// tile's first member, which other tiles would not share.
     #[test]
-    fn drop_valve_point_tile_keeps_uniform_stride() {
+    fn drop_valve_point_tile_keeps_its_best_ranked_points() {
         let members: Vec<Member> = (0..10).map(|i| point_member(i as f64, 0.0, i)).collect();
-        let kept = select_kept_members(&members, 5);
+        let kept = select_kept_members(&members, 3);
         let xs: Vec<f64> = kept
             .iter()
             .map(|m| match &*m.geom {
@@ -1686,8 +1727,9 @@ mod tests {
                 _ => unreachable!("built points"),
             })
             .collect();
-        // Even stride 0,2,4,6,8 — spread across the tile — not the prefix 0..5.
-        assert_eq!(xs, vec![0.0, 2.0, 4.0, 6.0, 8.0]);
+        // Rows 0, 8 and 4 rank best: spread across the tile, not the prefix
+        // 0..3, nor a stride 0, 3, 6.
+        assert_eq!(xs, vec![0.0, 4.0, 8.0]);
     }
 
     /// Sized geometries keep the largest-by-vertex-count survivors (pre-#280
@@ -1701,6 +1743,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: n as u64,
+                    rank: point_rank(n as u64),
                     geom: Geometry::LineString(LineString::from(coords)).into(),
                     props: SharedProps::new(Vec::new()),
                     id: None,
@@ -1712,6 +1755,60 @@ mod tests {
         let kept = select_kept_members(&members, 2);
         let counts: Vec<usize> = kept.iter().map(|m| m.geom.coords_count()).collect();
         assert_eq!(counts, vec![5, 4]);
+    }
+
+    /// At z0 a point within the buffer of the date line reaches the tile
+    /// twice, and the two copies join into one 2-point MultiPoint (#342). A
+    /// tile holding such members is still a tile of points: it thins by
+    /// rank across the whole tile, not by size (which kept every
+    /// wrapped pair and then a prefix of the rest: no Europe at z0).
+    #[test]
+    fn drop_valve_point_tile_with_date_line_pairs_keeps_its_best_ranked_points() {
+        let mut members: Vec<Member> = (0..90)
+            .map(|i| point_member(-170.0 + 3.7 * i as f64, 10.0, i))
+            .collect();
+        members.extend((90..100).map(|i| {
+            Member {
+                geom: Geometry::MultiPoint(geo::MultiPoint(vec![
+                    Point::new(179.5, i as f64 / 10.0),
+                    Point::new(-180.5, i as f64 / 10.0),
+                ]))
+                .into(),
+                ..point_member(0.0, 0.0, i)
+            }
+        }));
+        let kept: Vec<u64> = select_kept_members(&members, 10)
+            .iter()
+            .map(|m| m.seq)
+            .collect();
+        // The ten lowest bit-reversed rows of 0..100: the date-line pairs
+        // (90..100) rank as the points they draw.
+        assert_eq!(kept, [0, 8, 16, 32, 40, 48, 64, 72, 80, 96]);
+    }
+
+    /// #768: only a pair one world apart at one latitude is a date-line
+    /// pair; a real two-point member on one parallel is two points, so its
+    /// tile is no point tile and the merge valve still takes it.
+    #[test]
+    fn only_a_pair_one_world_apart_draws_one_point() {
+        let pair = |a: (f64, f64), b: (f64, f64)| Member {
+            geom: Geometry::MultiPoint(geo::MultiPoint(vec![a.into(), b.into()])).into(),
+            ..point_member(0.0, 0.0, 0)
+        };
+        let east = 179.3;
+        for wrapped in [
+            pair((east, 4.0), (east - 360.0, 4.0)),
+            pair((-179.9, 4.0), (-179.9 + 360.0, 4.0)),
+        ] {
+            assert!(is_point_like(&[wrapped]));
+        }
+        for real in [
+            pair((10.0, 4.0), (20.0, 4.0)),
+            pair((179.5, 4.0), (-179.5, 4.0)),
+            pair((east, 4.0), (east - 360.0, 4.5)),
+        ] {
+            assert!(!is_point_like(&[real]));
+        }
     }
 
     /// A `--feature-order` column the layer does not publish is a silent
@@ -1810,6 +1907,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: i,
+                    rank: point_rank(i),
                     geom: Geometry::LineString(coords.into_iter().collect()).into(),
                     props: SharedProps::new(vec![(
                         "level".into(),

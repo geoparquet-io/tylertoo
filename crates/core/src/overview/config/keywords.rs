@@ -554,7 +554,7 @@ pub struct ConvertSyntax {
     /// Start from another tool's defaults instead of tylertoo's; options you
     /// pass still override them. `tippecanoe` sets its drop rate, gamma and
     /// simplification, and with `tiles` its tile buffer, size caps, size
-    /// valve and max-zoom simplification:
+    /// valve, one valve threshold per zoom and max-zoom simplification:
     /// <https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset>.
     #[cfg_attr(
         feature = "cli",

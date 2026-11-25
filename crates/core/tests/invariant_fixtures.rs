@@ -231,3 +231,38 @@ fn banded_parcels_still_thin_by_row_order_768() {
          and delete this test"
     );
 }
+
+/// #768: pass 1 tells the user, naming the fix, when the input's rows are
+/// not in spatial order; the Hilbert-sorted copy of the same rows is quiet.
+#[test]
+fn banded_parcels_warn_that_the_input_is_not_sorted() {
+    let unsorted = |name: &str| {
+        let input = invariant_fixture(name);
+        let dir = tempfile::tempdir().expect("tempdir");
+        convert_to_overviews(
+            &input,
+            dir.path().join("ov.parquet"),
+            &ConvertOptions::default().with_levels(LevelPlan::ZoomRange {
+                min_zoom: 4,
+                max_zoom: 10,
+            }),
+        )
+        .unwrap_or_else(|e| panic!("convert {name}: {e}"))
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, tylertoo_core::Diagnostic::UnsortedInput { .. }))
+        .map(|d| (d.to_string(), input.display().to_string()))
+        .collect::<Vec<_>>()
+    };
+    let banded = unsorted("banded-parcels.parquet");
+    let [(message, input)] = banded.as_slice() else {
+        panic!("one unsorted-input warning expected, got {banded:?}");
+    };
+    assert!(
+        message.contains("not sorted by location")
+            && message.contains("stripes")
+            && message.contains(&format!("`gpio sort hilbert '{input}' ")),
+        "{message}"
+    );
+    assert_eq!(unsorted("banded-parcels-sorted.parquet"), Vec::new());
+}

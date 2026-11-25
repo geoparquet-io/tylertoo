@@ -78,15 +78,26 @@ pub(super) fn gap_to_rect(from: (f64, f64), rect: &Rect<f64>) -> u64 {
     if rayon::current_thread_index().is_none() {
         SERIAL_GAPS.with(|n| n.set(n.get() + 1));
     }
-    let (min, max) = (rect.min(), rect.max());
+    gap_to_world_box(from, &world_box(rect))
+}
+
+/// A lon/lat bbox's corners in world units, as `(x at min lng, y at min
+/// lat, x at max lng, y at max lat)`. [`world_xy`] maps each axis alone, so
+/// these four values give every corner, bit for bit.
+pub(super) fn world_box(rect: &Rect<f64>) -> [f64; 4] {
+    let (min, max) = (
+        world_xy(rect.min().x, rect.min().y),
+        world_xy(rect.max().x, rect.max().y),
+    );
+    [min.0, min.1, max.0, max.1]
+}
+
+/// [`gap_to_rect`] from the bbox's [`world_box`], projected once: the
+/// #768 predictor measures one row against a tile's previous member at
+/// every level it reaches.
+pub(super) fn gap_to_world_box(from: (f64, f64), b: &[f64; 4]) -> u64 {
     let mut d2_max = 0.0_f64;
-    for (lng, lat) in [
-        (min.x, min.y),
-        (min.x, max.y),
-        (max.x, min.y),
-        (max.x, max.y),
-    ] {
-        let (x, y) = world_xy(lng, lat);
+    for (x, y) in [(b[0], b[1]), (b[0], b[3]), (b[2], b[1]), (b[2], b[3])] {
         let (dx, dy) = (x - from.0, y - from.1);
         d2_max = d2_max.max(dx * dx + dy * dy);
     }
@@ -495,6 +506,7 @@ mod tests {
         Member {
             key: 0,
             seq,
+            rank: super::super::point_rank(seq),
             geom: geom.into(),
             props: SharedProps::new(vec![(Arc::from("n"), crate::mvt::PropertyValue::UInt(seq))]),
             id: Some(seq * 10),

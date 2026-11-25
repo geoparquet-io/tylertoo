@@ -41,6 +41,10 @@ impl From<Geometry<f64>> for MemberGeom {
 pub(super) struct Member {
     pub(super) key: u64,
     pub(super) seq: u64,
+    /// The feature's point-thinning rank (#768, [`point_rank`]): the same in
+    /// every tile and zoom that holds the feature, so a drop that keeps the
+    /// best-ranked points nests across zooms and agrees across tile edges.
+    pub(super) rank: u64,
     pub(super) geom: MemberGeom,
     pub(super) props: SharedProps,
     /// `Some` on every member when [`ExportOptions::feature_id`] is set
@@ -211,6 +215,8 @@ pub(super) struct LevelCtx<'a> {
     pub(super) tiles: Option<&'a BTreeMap<u64, usize>>,
     /// #802: the finest level's junction pins ([`finest_level_pins`]).
     pub(super) pins: Option<&'a JunctionNodes>,
+    /// #768: the valve floors, with `--valve-scope smooth|zoom`.
+    pub(super) floors: Option<&'a valve_predict::ValveFloors>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     pub(super) work: &'a Mutex<ExportWorkTally>,
@@ -618,6 +624,7 @@ pub(super) fn encode_geometry(buf: &mut Vec<u8>, g: &Geometry<f64>) {
 pub(super) fn encode_member(buf: &mut Vec<u8>, m: &Member, names: &SpillNames) {
     put_u64(buf, m.key);
     put_u64(buf, m.seq);
+    put_u64(buf, m.rank);
     put_u64(buf, m.gap);
     put_u32(buf, u32::from(m.band));
     match m.id {
@@ -827,6 +834,7 @@ pub(super) fn decode_member(
 ) -> Result<Member, ExportError> {
     let key = cur.u64()?;
     let seq = cur.u64()?;
+    let rank = cur.u64()?;
     let gap = cur.u64()?;
     let band = u16::try_from(cur.u32()?).map_err(|_| spill_corrupt())?;
     let id = match cur.u8()? {
@@ -842,6 +850,7 @@ pub(super) fn decode_member(
     Ok(Member {
         key,
         seq,
+        rank,
         geom: geom.into(),
         props,
         id,
@@ -1356,6 +1365,7 @@ pub(super) fn fanout_batch_members(
                     Member {
                         key,
                         seq: *seq + row as u64,
+                        rank: attrs.rank(row, *seq + row as u64),
                         geom,
                         props: props.clone(),
                         id,
@@ -1404,7 +1414,7 @@ pub(super) fn encode_wave_from_store(
         ctx.gzip_cache,
         (bucket_members(members, wave), None),
         ctx.zoom,
-        &TileEncoding::single(ctx.opts),
+        &TileEncoding::single(ctx.opts).with_floors(ctx.floors),
         ctx.fills,
         ctx.timers,
         diagnostics,

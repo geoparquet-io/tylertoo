@@ -314,6 +314,7 @@ fn square_members(rows: usize, overlapping: bool) -> Vec<Member> {
         .map(|(i, (geom, (gap, band)))| Member {
             key: tile_key(0, 0, 0),
             seq: i as u64,
+            rank: point_rank(i as u64),
             geom: geom.into(),
             props: SharedProps::new(vec![
                 (Arc::clone(&parcel_key), PropertyValue::UInt(i as u64)),

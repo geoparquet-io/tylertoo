@@ -2951,7 +2951,7 @@ fn cap_joined_tile(
         // across layers, copying geometry commands without re-clipping.
         // A join retried by the source valve is left to that valve, whose
         // own fallbacks (#873) decide what still exceeds a cap.
-        let count = drop_joined_tile(raw, &mut gzip, export).map_err(|error| {
+        let count = drop_joined_tile(raw, &mut gzip, export, coord.z).map_err(|error| {
             PyramidError::TileCompress {
                 z: coord.z,
                 x: coord.x,
@@ -3282,6 +3282,20 @@ fn joined_export_error(error: ExportError) -> PyramidError {
     }
 }
 
+/// Whether an MVT feature draws one point: one `MoveTo` of one point, or of a
+/// date-line pair one `world` apart (`draws_one_point`).
+fn draws_one_mvt_point(f: &crate::vector_tile::tile::Feature, world: i64) -> bool {
+    let g = &f.geometry;
+    let at = |i: usize| i64::from(crate::mvt::zigzag_decode(g[i]));
+    f.r#type == Some(crate::vector_tile::tile::GeomType::Point as i32)
+        && (g.len() <= 3
+            || (g.len() == 5 && g[0] == (2 << 3 | 1) && {
+                let (x, y) = (at(1), at(2));
+                let pair = [(x, y), (x + at(3), y + at(4))];
+                crate::overview::export::draws_one_point(pair.into_iter(), world)
+            }))
+}
+
 /// Fit an archive join with no overview to retry: search the ranked prefix
 /// (points in bit-reversed order) for the largest fit, within
 /// `MAX_DROP_PASSES` encodes, with one feature as the floor.
@@ -3289,6 +3303,7 @@ fn drop_joined_tile(
     raw: &mut Vec<u8>,
     gzip: &mut Vec<u8>,
     opts: &ExportOptions,
+    zoom: u8,
 ) -> Result<usize, std::io::Error> {
     let Ok(tile) = crate::vector_tile::Tile::decode(raw.as_slice()) else {
         return Ok(0);
@@ -3320,23 +3335,24 @@ fn drop_joined_tile(
         .flat_map(|l| &l.features)
         .enumerate()
         .collect();
-    let point_like = features.iter().all(|(_, f)| {
-        f.r#type == Some(crate::vector_tile::tile::GeomType::Point as i32) && f.geometry.len() <= 3
+    let point_like = tile.layers.iter().all(|l| {
+        // One world at `zoom`, in this layer's units.
+        let world = i64::from(l.extent.unwrap_or(4096)) << zoom;
+        l.features.iter().all(|f| draws_one_mvt_point(f, world))
     });
-    // Rank once; every keep count below selects from this ranking.
-    let ranked =
-        crate::overview::export::select_kept_by_size(&features, total, point_like, |(_, f)| {
-            f.geometry.len()
-        });
-    // The search needs nested selections, and point strides do not nest:
-    // order points by bit-reversed index, so each prefix spreads evenly.
-    let points = point_like.then(|| {
+    // Rank once; every keep count below keeps a prefix of this ranking, so
+    // the search's selections nest. Points rank by their bit-reversed
+    // position in the tile, the in-tile form of the export's `point_rank`
+    // (#768): a joined tile is decoded from finished band archives, whose
+    // features no longer carry the input row the export ranks by.
+    let ranked: Vec<&(usize, &crate::vector_tile::tile::Feature)> = if point_like {
         let bits = usize::BITS - (total - 1).leading_zeros();
-        let mut order = ranked.clone();
+        let mut order: Vec<_> = features.iter().collect();
         order.sort_by_key(|(index, _)| index.reverse_bits() >> (usize::BITS - bits));
         order
-    });
-    let nested = points.as_deref().unwrap_or(&ranked);
+    } else {
+        crate::overview::export::select_kept_by_size(&features, total, |(_, f)| f.geometry.len())
+    };
     let encode = |kept: &[&(usize, &crate::vector_tile::tile::Feature)],
                   raw: &mut Vec<u8>|
      -> Result<Vec<u8>, std::io::Error> {
@@ -3373,16 +3389,7 @@ fn drop_joined_tile(
     // nothing has fit yet.
     let passes = crate::overview::export::MAX_DROP_PASSES as usize;
     let first = joined_budget_keep(&tile, &ranked, original.len(), fit);
-    let stride;
-    *gzip = encode(
-        if point_like {
-            stride = crate::overview::export::select_kept_by_size(&features, first, true, |_| 0);
-            &stride
-        } else {
-            &ranked[..first]
-        },
-        raw,
-    )?;
+    *gzip = encode(&ranked[..first], raw)?;
     let mut kept = first;
     if joined_over_limit(raw.len(), gzip.len(), opts) {
         // low fits (0: no fit yet, one feature is the floor); high misses.
@@ -3401,7 +3408,7 @@ fn drop_joined_tile(
                 low + (high - low) / 2
             };
             scaled = 0;
-            *gzip = encode(&nested[..keep], raw)?;
+            *gzip = encode(&ranked[..keep], raw)?;
             kept = keep;
             if joined_over_limit(raw.len(), gzip.len(), opts) {
                 high = keep;
@@ -5622,8 +5629,11 @@ mod tests {
         }
     }
 
+    /// A joined point tile ranks its features by bit-reversed position over
+    /// all its layers at once (#768), so keeping half keeps the even
+    /// positions of every layer.
     #[test]
-    fn merge_bands_point_drop_uses_one_stride_across_layers() {
+    fn merge_bands_point_drop_ranks_across_layers() {
         let tile = crate::vector_tile::Tile {
             layers: ["a", "b"]
                 .into_iter()
@@ -6044,6 +6054,7 @@ mod tests {
                 compressed_tile_size_limit: None,
                 ..Default::default()
             },
+            0,
         )
         .unwrap();
         assert_eq!(dropped, n - 1);
@@ -6087,10 +6098,88 @@ mod tests {
                 compressed_tile_size_limit: None,
                 ..Default::default()
             },
+            0,
         )
         .unwrap();
         assert!(raw.len() <= cap, "{} > {cap}", raw.len());
         assert!(dropped <= 45, "kept only {} points", 100 - dropped);
+    }
+
+    /// #768: an MVT pair draws one point only one world apart on one row;
+    /// a real pair on one row is two points.
+    #[test]
+    fn only_an_mvt_pair_one_world_apart_draws_one_point() {
+        let zz = |n: i32| ((n << 1) ^ (n >> 31)) as u32;
+        let pair = |dx: i32, dy: i32| crate::vector_tile::tile::Feature {
+            r#type: Some(crate::vector_tile::tile::GeomType::Point as i32),
+            geometry: vec![17, zz(4_000), zz(2_000), zz(dx), zz(dy)],
+            ..Default::default()
+        };
+        assert!(draws_one_mvt_point(&pair(-4_096, 0), 4_096));
+        assert!(!draws_one_mvt_point(&pair(-100, 0), 4_096), "a real pair");
+        assert!(!draws_one_mvt_point(&pair(-4_096, 1), 4_096));
+        assert!(
+            !draws_one_mvt_point(&pair(-4_096, 0), 4_096 << 1),
+            "z1: half a world"
+        );
+    }
+
+    /// A joined z0 tile holds a date-line point's two copies as one 2-point
+    /// MultiPoint (#342). The tile is still points: the drop spreads its
+    /// survivors over every part of it, rather than keeping every pair and
+    /// a prefix of the plain points.
+    #[test]
+    fn merge_bands_point_drop_spreads_past_date_line_pairs() {
+        let zz = |n: i32| ((n << 1) ^ (n >> 31)) as u32;
+        let mut layer = feature_layer("points", Vec::new());
+        layer.features = (0..100_u32)
+            .map(|i| {
+                let (x, y) = (i as i32 * 40, 2_000 + i as i32);
+                crate::vector_tile::tile::Feature {
+                    id: Some(u64::from(i)),
+                    r#type: Some(crate::vector_tile::tile::GeomType::Point as i32),
+                    geometry: if i >= 90 {
+                        // The east copy and the west copy, one world apart.
+                        vec![17, zz(x), zz(y), zz(-4_096), 0]
+                    } else {
+                        vec![9, zz(x), zz(y)]
+                    },
+                    tags: Vec::new(),
+                }
+            })
+            .collect();
+        let tile = crate::vector_tile::Tile {
+            layers: vec![layer],
+        };
+        let mut raw = tile.encode_to_vec();
+        let cap = raw.len() / 2;
+        let mut gzip = compression::compress(&raw, Compression::Gzip).unwrap();
+        let dropped = drop_joined_tile(
+            &mut raw,
+            &mut gzip,
+            &ExportOptions {
+                tile_size_limit: Some(cap),
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        assert!(
+            dropped > 0 && raw.len() <= cap,
+            "{dropped} dropped, {} bytes",
+            raw.len()
+        );
+        let kept = crate::vector_tile::Tile::decode(raw.as_slice()).unwrap();
+        let plain: Vec<u64> = kept.layers[0]
+            .features
+            .iter()
+            .filter_map(|f| f.id.filter(|&id| id < 90))
+            .collect();
+        assert!(
+            plain.iter().any(|&id| id >= 60),
+            "plain points kept only from the front: {plain:?}"
+        );
     }
 
     thread_local! {
@@ -6161,6 +6250,7 @@ mod tests {
                     compressed_tile_size_limit: None,
                     ..Default::default()
                 },
+                0,
             )
             .unwrap();
             // At most floor(3n/4) survive each pass, even when a cap is

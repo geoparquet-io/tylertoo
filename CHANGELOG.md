@@ -64,10 +64,15 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Pass 1 warns when the input rows are not sorted by location (#768) and
+  names the `gpio sort hilbert` command for the input: on unsorted input,
+  merged features join unrelated geometry and tile edges show more seams.
 - `--preset tippecanoe` (Python `preset="tippecanoe"`) on `tiles`, `overview`
   and `export-pmtiles` starts from tippecanoe's drop rate, gamma,
-  simplification, tile buffer, size caps and size valve (#822). Options you
-  pass still win. `docs/guides/tippecanoe.md` lists every value and what still
+  simplification, tile buffer, size caps, size valve and one valve threshold
+  per zoom (`--valve-scope zoom`, #768) (#822). Options you pass still win.
+  A data shard refuses `zoom` before it reads anything; pass
+  `--valve-scope smooth` there. `docs/guides/tippecanoe.md` lists every value and what still
   differs.
 - `tiles --layer-column COLUMN` and Python `convert(layer_column=...)` put
   each feature in the layer named by its value in COLUMN, and null or blank
@@ -194,6 +199,38 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Tile output: the size valve's threshold reaches past the tile it fits
+  (#768).** `--valve-scope` (Python `valve_scope=`) defaults to `smooth`.
+  The export scan predicts each dense tile's threshold, and every tile
+  around it, one that fits too, starts from that threshold faded by
+  `--valve-max-step` (Python `valve_max_step=`, default 2) a tile, out to
+  where it no longer thins anything (at most 8 tiles). Neighbouring tiles
+  then keep at most twice each other's share of points, or merge at most
+  twice less hard, so density steps down over several tiles instead of
+  jumping at a tile edge. Point tiles fade under either valve. On 1.8
+  million French points the 95th-percentile jump between neighbouring z3–z6
+  tiles falls from 3.5–39× to 2× under `--size-valve drop` (those zooms keep
+  44–81% of the points `tile` keeps), and from 4.3–41× to 2× under the
+  default `merge` (40–80%). The prediction and the
+  floors stay within the export's memory budget; if they cannot, the
+  export warns and runs as `--valve-scope tile`. `--valve-scope tile` thins
+  each tile on its own as before; `zoom` starts every tile from its zoom's
+  largest threshold (not with `--tile-range`). A `tiles` shard whose export
+  fades the valve now reads input up to nine pivot tiles past its range,
+  not two, so it predicts the same floors: on world-wide points cut into 8
+  shards at z6 the fleet reads 27% more rows; on a regional input nothing
+  changes. Under `--valve-scope tile`, or with no size cap, it reads two. The default costs at most
+  1.12× the wall time of `tile` on the benchmark inputs and is 2.8× faster
+  on dense points.
+- **Tile output: point tiles over a cap keep points by a fixed rank (#768).**
+  Under every `--valve-scope`, including `tile`, a point tile thinned by
+  the size valve keeps the points whose input row ranks best (the row
+  number bit-reversed), not an even stride from the tile's first point.
+  The points kept at one zoom are kept at the next wherever it keeps a
+  larger share: on French points 93–96% of the z3 points stay at z4,
+  against 5% before. Overviews record each row's input position in a new
+  `input_row` column; older overviews rank by overview row, and a column of
+  theirs named `input_row` stays a property.
 - The Python wheel uses mimalloc as its global allocator on every platform,
   as the CLI does (#739, #792). On the 792 buildings input (median of 3),
   export takes 10.0 s against 10.9 s and peak RSS is 3.36 GB against 2.84 GB

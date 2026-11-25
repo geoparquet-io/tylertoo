@@ -408,8 +408,13 @@ Set `SPILL` to an existing directory on real disk. To rerun shard 7, submit
   for that input. Clustering, `--accumulate-attribute`, and tiny-polygon
   carriers cost shards nothing extra.
 - **`--tile-buffer` must be at most 256 tile pixels**, the cap for every
-  export. This fits inside the two pivot tiles (512 pixels) read around each
-  shard's range.
+  export. This fits inside the two pivot tiles a shard reads around its
+  range. Under `--valve-scope smooth` (the default) with a size cap, a
+  shard reads nine, wide enough to fade a dense tile's thinning over the
+  tiles around it (#768). On world-wide points cut into 8 shards at z6 the
+  fleet then reads 27% more rows; a regional input that every shard read
+  whole anyway costs nothing more. `--valve-scope tile` keeps the two-tile
+  margin, and a finer `--pivot` keeps either narrower.
 - **CLI only.** The Python bindings do not expose sharding.
 - **Manual ranges.** `export-pmtiles --tile-range LO..HI` takes two tile ids
   at one zoom, and `--zoom-ceiling Z` emits the coarse half.

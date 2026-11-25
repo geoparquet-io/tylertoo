@@ -372,7 +372,7 @@ impl StopPolicy {
 /// Sizes a set of rows at a zoom, as the scan does: one member per tile each
 /// row's buffered bbox reaches.
 fn tile_keys(bboxes: &[Option<TileBounds>], zoom: u8, opts: &ExportOptions) -> HashMap<u64, usize> {
-    size_bboxes(bboxes, zoom, opts).1
+    size_bboxes(bboxes, zoom, opts, true).1
 }
 
 fn add_counts(into: &mut HashMap<u64, usize>, from: HashMap<u64, usize>) {
@@ -1035,6 +1035,10 @@ impl ProbeLevel<'_> {
             fills: None,
             tiles: Some(&self.candidates),
             pins: p.pins,
+            // shortcut: the stop probe fits each tile alone, without the
+            // #768 merge floors the final encode starts from; pass them in
+            // if a smoothed tile is ever found stopped at the wrong depth.
+            floors: None,
             #[cfg(test)]
             work: &self.work,
         };
@@ -1689,6 +1693,7 @@ mod tests {
             &vd(),
             &ExportTimers::default(),
             Some(&mut scan),
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();

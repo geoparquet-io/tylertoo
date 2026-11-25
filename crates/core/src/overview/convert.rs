@@ -873,10 +873,10 @@ pub struct ConvertOptions {
     /// siblings. `--shard` without `--plan` is a hard error.
     ///
     /// Pruning here is what makes a shard cheaper than the whole build, and
-    /// it is safe because a row group is dropped only when its bbox — widened
-    /// by a whole pivot tile, far past the export's edge buffer — does not
-    /// reach the range. A feature inside such a group cannot land in a tile
-    /// this shard owns.
+    /// it is safe because a row group is dropped only when its bbox does not
+    /// reach the range widened by the read margin, past the export's edge
+    /// buffer and, by default, its valve floors' reach. A feature inside such
+    /// a group cannot land in a tile this shard owns.
     ///
     /// This is **not** fingerprinted: the shard tiles the same input with the
     /// same thinning options as the plan and only narrows which row groups it
@@ -919,6 +919,15 @@ pub struct ConvertOptions {
     #[serde(skip)]
     #[cfg_attr(feature = "cli", arg(skip = crate::OverviewCodec::Zstd))]
     pub(crate) overview_codec: crate::OverviewCodec,
+    /// #768: a data shard reads the tile buffer's margin past its range
+    /// ([`crate::shard::SHARD_BUFFER_MARGIN_TILES`]), not the valve floors'
+    /// reach ([`crate::shard::SHARD_READ_MARGIN_TILES`]). The `tiles` facade
+    /// sets it when its export predicts no floors (`--valve-scope tile`, or
+    /// no size cap); a convert run on its own cannot see the export that
+    /// follows, so it keeps the wide margin. Default `false`.
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = false))]
+    pub(crate) shard_buffer_margin_only: bool,
     /// Materialize only the levels at or coarser than this zoom (#541): the
     /// **coarse job**'s half of a sharded build, on the convert side.
     ///
@@ -1008,6 +1017,7 @@ with_setters!(ConvertOptions {
     with_zoom_ceiling => zoom_ceiling: Option<u8>,
 } internal {
     overview_codec,
+    shard_buffer_margin_only,
 });
 
 /// Default rows per read batch for the streaming pipeline (H3).
@@ -1212,6 +1222,19 @@ pub(super) fn resolve_read_workers_with_cores(
 }
 
 impl ConvertOptions {
+    /// A data shard's read window: its range, and the margin past it in
+    /// pivot tiles ([`Self::shard_buffer_margin_only`]).
+    pub(crate) fn shard_read(&self) -> Option<crate::shard::ShardRead> {
+        self.shard.map(|range| crate::shard::ShardRead {
+            range,
+            margin_tiles: if self.shard_buffer_margin_only {
+                crate::shard::SHARD_BUFFER_MARGIN_TILES
+            } else {
+                crate::shard::SHARD_READ_MARGIN_TILES
+            },
+        })
+    }
+
     /// Check every option rule that needs no input file (#779): numeric
     /// ranges, the level plan, mutually exclusive and mode-incompatible
     /// options, the spill and plan paths. Every conversion entry point runs
@@ -1666,6 +1689,7 @@ impl Default for ConvertOptions {
             shard_plan_digest: None,
             cell_bands: None,
             overview_codec: crate::OverviewCodec::Zstd,
+            shard_buffer_margin_only: false,
             zoom_ceiling: None,
         }
     }
@@ -3485,38 +3509,98 @@ pub(crate) fn adjusted_for_ladder_and_mode(options: &ConvertOptions) -> Option<C
 #[cfg(test)]
 mod sortedness_tests {
     use super::*;
-    use crate::covering::RowGroupBounds;
 
-    fn rg(i: usize, xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> RowGroupBounds {
-        RowGroupBounds {
-            row_group_idx: i,
-            xmin,
-            ymin,
-            xmax,
-            ymax,
-            num_rows: 1,
+    /// Hilbert index of cell `(x, y)` on an `n`×`n` grid (`n` a power of 2).
+    fn hilbert(n: usize, mut x: usize, mut y: usize) -> usize {
+        let (mut d, mut s) = (0, n / 2);
+        while s > 0 {
+            let (rx, ry) = (usize::from(x & s > 0), usize::from(y & s > 0));
+            d += s * s * ((3 * rx) ^ ry);
+            if ry == 0 {
+                if rx == 1 {
+                    (x, y) = (n - 1 - x, n - 1 - y);
+                }
+                (x, y) = (y, x);
+            }
+            s /= 2;
         }
+        d
     }
 
-    /// #745: sorted row groups tile the extent; unsorted ones each span it.
+    /// A fixed pseudo-random key, standing in for an id in no spatial order.
+    fn scramble(i: usize) -> u64 {
+        (i as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(29)
+    }
+
+    /// The pass-1 row-order statistic of unit squares visited in this order.
+    fn row_order(cells: &[(usize, usize)]) -> Option<f64> {
+        let mut tally = BboxTally::default();
+        for (i, &(x, y)) in cells.iter().enumerate() {
+            let (x, y) = (x as f64, y as f64);
+            tally.observe(&[x, y, x + 1.0, y + 1.0], Crs::Epsg4326, i);
+        }
+        tally
+            .finish(cells.len(), Crs::Epsg4326, &|i| (None, i))
+            .unwrap()
+            .row_order
+    }
+
+    /// #768: Hilbert order scores low; the same cells in banded id order
+    /// (west-to-east bands, no order inside a band) and shuffled score high.
     #[test]
-    fn row_group_spread_tells_sorted_from_unsorted() {
-        let sorted: Vec<_> = (0..8)
-            .map(|i| Some(rg(i, i as f64, 0.0, i as f64 + 1.0, 1.0)))
+    fn row_order_tells_hilbert_from_banded_and_shuffled() {
+        let n = 64;
+        let mut cells: Vec<(usize, usize)> = (0..n * n).map(|i| (i % n, i / n)).collect();
+        cells.sort_by_key(|&(x, y)| hilbert(n, x, y));
+        let sorted = row_order(&cells).unwrap();
+        assert!(sorted < UNSORTED_ROW_ORDER / 2.0, "hilbert {sorted}");
+
+        cells.sort_by_key(|&(x, y)| (x / 8, scramble(y * n + x)));
+        let banded = row_order(&cells).unwrap();
+        assert!(banded > UNSORTED_ROW_ORDER * 2.0, "banded {banded}");
+
+        cells.sort_by_key(|&(x, y)| scramble(y * n + x));
+        let shuffled = row_order(&cells).unwrap();
+        assert!(shuffled > banded, "shuffled {shuffled} vs banded {banded}");
+    }
+
+    /// Too few rows, or an extent with no area, cannot be judged.
+    #[test]
+    fn row_order_needs_enough_rows_and_an_area() {
+        let few: Vec<_> = (0..10).map(|i| (i, i)).collect();
+        assert_eq!(row_order(&few), None);
+        let line: Vec<_> = (0..5000)
+            .map(|i| (scramble(i) as usize % 1000, 0))
             .collect();
-        let s = row_group_spread(&[sorted]).unwrap();
-        assert!((s - 0.125).abs() < 1e-9, "{s}");
-        let unsorted: Vec<_> = (0..8)
-            .map(|i| Some(rg(i, 0.0, 0.0, 8.0, 0.9 + 0.01 * i as f64)))
-            .collect();
-        let u = row_group_spread(&[unsorted]).unwrap();
-        assert!(u > UNSORTED_ROW_GROUP_SPREAD, "{u}");
-        // Too few row groups to tell, or no statistics.
-        assert_eq!(
-            row_group_spread(&[vec![Some(rg(0, 0.0, 0.0, 1.0, 1.0)); 3]]),
-            None
-        );
-        assert_eq!(row_group_spread(&[vec![None; 10]]), None);
+        let mut tally = BboxTally::default();
+        for (i, &(x, _)) in line.iter().enumerate() {
+            let x = x as f64;
+            tally.observe(&[x, 0.0, x, 0.0], Crs::Epsg4326, i);
+        }
+        let t = tally
+            .finish(line.len(), Crs::Epsg4326, &|i| (None, i))
+            .unwrap();
+        assert_eq!(t.row_order, None);
+    }
+
+    /// Chunks scan in parallel: no gap spans a chunk boundary.
+    #[test]
+    fn row_order_merge_adds_no_gap_across_chunks() {
+        let mut a = BboxTally::default();
+        let mut b = BboxTally::default();
+        for i in 0..2000 {
+            let x = (i % 40) as f64;
+            let y = (i / 40) as f64;
+            a.observe(&[x, y, x + 1.0, y + 1.0], Crs::Epsg4326, i);
+            b.observe(&[x + 100.0, y, x + 101.0, y + 1.0], Crs::Epsg4326, i);
+        }
+        let mut merged = BboxTally::default();
+        merged.merge(&a, 0);
+        merged.merge(&b, 2000);
+        assert_eq!(merged.order.gaps, a.order.gaps + b.order.gaps);
+        assert_eq!(merged.order.gap_sum, a.order.gap_sum + b.order.gap_sum);
     }
 }
 
@@ -4226,7 +4310,6 @@ fn convert_to_overviews_validated(
 ) -> Result<ConvertReport, ConvertError> {
     source.record_diagnostics(diagnostics);
     crate::atomic_output::check_writable(output_path)?;
-    warn_if_unsorted(source, diagnostics);
     super::stream::run_stages(source, output_path, config, strategy, diagnostics, archive)
 }
 
@@ -4525,69 +4608,34 @@ pub(crate) fn select_input_row_groups(
     select_input_row_groups_any(metadata, std::slice::from_ref(bbox_units))
 }
 
-/// The mean share of the input's extent that one row group's bbox covers
-/// (#745): near `1/k` for spatially sorted input with `k` row groups, near 1
-/// when rows are in no spatial order. `None` with fewer than four usable
-/// bboxes, or a degenerate extent, where order cannot be told.
-pub(crate) fn row_group_spread(
-    parts: &[Vec<Option<crate::covering::RowGroupBounds>>],
-) -> Option<f64> {
-    let boxes: Vec<&crate::covering::RowGroupBounds> = parts
-        .iter()
-        .flatten()
-        .flatten()
-        .filter(|b| {
-            [b.xmin, b.ymin, b.xmax, b.ymax]
-                .iter()
-                .all(|v| v.is_finite())
-                && b.xmin <= b.xmax
-                && b.ymin <= b.ymax
-        })
-        .collect();
-    if boxes.len() < 4 {
-        return None;
-    }
-    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    for b in &boxes {
-        x0 = x0.min(b.xmin);
-        y0 = y0.min(b.ymin);
-        x1 = x1.max(b.xmax);
-        y1 = y1.max(b.ymax);
-    }
-    let extent = (x1 - x0) * (y1 - y0);
-    if extent <= 0.0 {
-        return None;
-    }
-    let mean = boxes
-        .iter()
-        .map(|b| (b.xmax - b.xmin) * (b.ymax - b.ymin) / extent)
-        .sum::<f64>()
-        / boxes.len() as f64;
-    Some(mean)
-}
+/// A [`RowOrder::ratio`] above this reads as input in no spatial order
+/// (#768). Hilbert-sorted inputs score at most about 1.2 (1 for uniform
+/// points); the banded NZ parcels of #768 score 5.3, shuffled input hundreds.
+/// The calibration table is in `context/ARCHITECTURE.md`.
+pub(super) const UNSORTED_ROW_ORDER: f64 = 2.5;
 
-/// A row-group spread above this reads as input in no spatial order: each
-/// row group spans more than half the extent on average.
-const UNSORTED_ROW_GROUP_SPREAD: f64 = 0.5;
+/// Gaps a [`RowOrder`] needs before it judges the input.
+const MIN_ROW_ORDER_GAPS: usize = 500;
 
-/// Warn when the input does not look spatially sorted (#745). Row-group
-/// pruning works poorly on such input, and the merge size valve merges each
-/// feature into the one stored before it, which on unsorted input is an
-/// arbitrary feature rather than a neighbour. Footer statistics only.
-fn warn_if_unsorted(source: &ConvertSource, diagnostics: &crate::diagnostics::Diagnostics) {
-    let Ok(parts) = source.part_row_group_bounds() else {
-        return;
-    };
-    if let Some(spread) = row_group_spread(&parts) {
-        if spread > UNSORTED_ROW_GROUP_SPREAD {
-            diagnostics.warn(format!(
-                "[convert] the input does not look spatially sorted: each row group spans \
-                 {:.0}% of the data's extent on average. Row-group pruning, and merging \
-                 oversized tiles into neighbouring features, work best on Hilbert-sorted \
-                 input; sort it first with `gpio sort hilbert`.",
-                spread * 100.0
-            ));
-        }
+/// Warn when pass 1 found the rows in no spatial order (#768). tylertoo
+/// keeps file order, which the size valves read as spatial: merge takes each
+/// feature's gap from the row before it, and drop ranks a point by its row's
+/// place in the input, which spreads the kept points evenly only over
+/// spatially sorted rows. Pooled
+/// over every part of a multi-part input.
+pub(super) fn warn_if_unsorted(
+    source: &ConvertSource,
+    row_order: Option<f64>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
+    log::debug!("[convert] row order {row_order:?} (unsorted above {UNSORTED_ROW_ORDER})");
+    if let Some(ratio) = row_order.filter(|r| *r > UNSORTED_ROW_ORDER) {
+        diagnostics.once(crate::diagnostics::Diagnostic::UnsortedInput {
+            count: 1,
+            input: source.root_path(),
+            parts: source.parts().len(),
+            ratio,
+        });
     }
 }
 
@@ -4912,6 +4960,8 @@ pub(super) struct BboxTallies {
     /// The first [`OUT_OF_RANGE_EXEMPLAR_CAP`] wrapped features' rows and
     /// the coordinate past the edge.
     pub wrapped_exemplars: Vec<OutOfRangeExemplar>,
+    /// #768: [`RowOrder::ratio`] over the scan; `None` when it cannot tell.
+    pub row_order: Option<f64>,
 }
 impl BboxTallies {
     pub(super) fn record(
@@ -5034,6 +5084,64 @@ pub(super) struct BboxTally {
     /// [`OUT_OF_RANGE_EXEMPLAR_CAP`] wrapped features, resolved like
     /// `exemplars`.
     wrapped_exemplars: Vec<(usize, &'static str, f64)>,
+    /// #768: how far apart consecutive rows lie.
+    pub(super) order: RowOrder,
+}
+
+/// #768: the spacing of consecutive rows, folded during the pass-1 scan. Its
+/// [`Self::ratio`] is the mean distance between consecutive bbox centres
+/// over `sqrt(extent area / rows)`, the spacing of evenly spread rows: near
+/// 1 or below for spatially sorted input, far above it when rows jump.
+/// The mean, not the median: id-ordered rows are mostly neighbours, and it
+/// is their jumps that skew the size valves.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(super) struct RowOrder {
+    /// The previous kept row's centre in this chunk; chunks scan in
+    /// parallel, so no gap spans two of them.
+    prev: Option<[f64; 2]>,
+    pub(super) gap_sum: f64,
+    pub(super) gaps: usize,
+    /// The union of the kept bboxes.
+    extent: Option<[f64; 4]>,
+}
+
+impl RowOrder {
+    fn observe(&mut self, b: &[f64; 4]) {
+        let c = [(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0];
+        if let Some(p) = self.prev {
+            self.gap_sum += (c[0] - p[0]).hypot(c[1] - p[1]);
+            self.gaps += 1;
+        }
+        self.prev = Some(c);
+        self.grow(b);
+    }
+
+    fn grow(&mut self, b: &[f64; 4]) {
+        self.extent = Some(self.extent.map_or(*b, |e| {
+            [
+                e[0].min(b[0]),
+                e[1].min(b[1]),
+                e[2].max(b[2]),
+                e[3].max(b[3]),
+            ]
+        }));
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.gap_sum += other.gap_sum;
+        self.gaps += other.gaps;
+        if let Some(e) = &other.extent {
+            self.grow(e);
+        }
+    }
+
+    /// `None` with too few gaps or an extent with no area.
+    fn ratio(&self, rows: usize) -> Option<f64> {
+        let e = self.extent?;
+        let area = (e[2] - e[0]) * (e[3] - e[1]);
+        (self.gaps >= MIN_ROW_ORDER_GAPS && area > 0.0 && area.is_finite())
+            .then(|| self.gap_sum / self.gaps as f64 / (area / rows as f64).sqrt())
+    }
 }
 
 impl BboxTally {
@@ -5041,6 +5149,7 @@ impl BboxTally {
     /// during the scan (#543): the pass-1 feature table no longer retains
     /// bboxes, so there is nothing to make a second pass over afterwards.
     pub(super) fn observe(&mut self, bbox: &[f64; 4], crs: Crs, index: usize) {
+        self.order.observe(bbox);
         if bbox_antimeridian_suspect(bbox, crs) {
             self.antimeridian_suspect += 1;
         }
@@ -5073,6 +5182,7 @@ impl BboxTally {
         self.unprojectable += other.unprojectable;
         self.max_abs_out_of_range = self.max_abs_out_of_range.max(other.max_abs_out_of_range);
         self.wrapped += other.wrapped;
+        self.order.merge(&other.order);
         for (mine, theirs) in [
             (&mut self.exemplars, &other.exemplars),
             (&mut self.wrapped_exemplars, &other.wrapped_exemplars),
@@ -5128,6 +5238,7 @@ impl BboxTally {
             out_of_range_exemplars: resolve(self.exemplars),
             wrapped: self.wrapped,
             wrapped_exemplars: resolve(self.wrapped_exemplars),
+            row_order: self.order.ratio(total),
         };
         match all_lost_error(&t, total, crs) {
             Some(e) => Err(e),
@@ -6016,7 +6127,8 @@ pub(super) fn mixed_geometry_field(
 }
 
 /// Build the writer source schema: original fields, geometry field replaced by
-/// the geoarrow-typed field, no file-level metadata (the encoder regenerates it).
+/// the geoarrow-typed field, then the `input_row` field pass 2 appends (#768);
+/// no file-level metadata (the encoder regenerates it).
 pub(super) fn build_source_schema(
     descriptor: &crate::resolved_schema::ResolvedSchema,
     geom_out_field: Arc<Field>,
@@ -6036,6 +6148,7 @@ pub(super) fn build_source_schema(
                 f.clone()
             }
         })
+        .chain(std::iter::once(super::source::input_row_field()))
         .collect();
     Schema::new(fields)
 }
@@ -6649,7 +6762,7 @@ pub(super) fn validate_coalesce_schema(
 /// only in those modes — mirroring [`validate_cluster_schema`] /
 /// [`validate_coalesce_schema`].
 fn reserved_output_columns(options: &ConvertOptions) -> Vec<&'static str> {
-    let mut names = vec![LEVEL_COLUMN];
+    let mut names = vec![LEVEL_COLUMN, super::writer::INPUT_ROW_COLUMN];
     if options.cluster {
         names.push(POINT_COUNT_COLUMN);
     }
@@ -14433,7 +14546,7 @@ mod tests {
         super::super::testutil::write_one_row_groups(&input, &segments, true, None);
         let levels = LevelPlan::ZoomRange {
             min_zoom: 0,
-            max_zoom: 6,
+            max_zoom: 7,
         };
         let plan = dir.path().join("convert.plan");
         convert_to_overviews(
@@ -14441,7 +14554,7 @@ mod tests {
             dir.path().join("coarse.parquet"),
             &ConvertOptions {
                 levels: levels.clone(),
-                zoom_ceiling: Some(3),
+                zoom_ceiling: Some(5),
                 save_plan: Some(plan.clone()),
                 ..Default::default()
             },
@@ -14457,13 +14570,13 @@ mod tests {
     #[test]
     fn shard_chain_widening_matches_on_eager_and_streaming_input() {
         let (dir, input, levels, plan) = coarse_plan_over_one_chain();
-        // The z4 tile over lng 22.5..45: its window (two pivot tiles of
-        // margin) stops at lng -22.5.
-        let id = crate::pmtiles_writer::tile_id(4, 9, 7);
+        // The z6 tile over lng 39.4..45: its window (nine pivot tiles of
+        // margin, #768) stops at lng -11.3, east of the chain's start.
+        let id = crate::pmtiles_writer::tile_id(6, 39, 30);
         let shard = ConvertOptions {
             levels,
             plan: Some(plan),
-            shard: Some(crate::shard::TileRange::new(4, id, id).unwrap()),
+            shard: Some(crate::shard::TileRange::new(6, id, id).unwrap()),
             ..Default::default()
         };
         let build = |eager: bool| {
@@ -14519,7 +14632,7 @@ mod tests {
         let mut plan = super::super::plan_state::ConvertPlan::load(&plan_path).unwrap();
         let chains = plan.chains.as_mut().expect("the plan carries the chains");
         assert!(
-            chains.entries.iter().any(|c| c.level >= 4),
+            chains.entries.iter().any(|c| c.level >= 6),
             "chains above the coarse job's ceiling are saved too"
         );
         for c in &mut chains.entries {
@@ -14527,7 +14640,7 @@ mod tests {
         }
         plan.save(&plan_path).unwrap();
 
-        let id = crate::pmtiles_writer::tile_id(4, 9, 7);
+        let id = crate::pmtiles_writer::tile_id(6, 39, 30);
         let out = dir.path().join("shard.parquet");
         convert_to_overviews(
             &input,
@@ -14535,7 +14648,7 @@ mod tests {
             &ConvertOptions {
                 levels,
                 plan: Some(plan_path),
-                shard: Some(crate::shard::TileRange::new(4, id, id).unwrap()),
+                shard: Some(crate::shard::TileRange::new(6, id, id).unwrap()),
                 ..Default::default()
             },
         )

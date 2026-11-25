@@ -175,6 +175,25 @@ pub enum Diagnostic {
     /// The shared-border pins outgrew the scan's memory budget (#802).
     #[non_exhaustive]
     SharedBordersUnpinned { count: usize },
+    /// Pass 1 found the input rows in no spatial order (#768). `ratio` is
+    /// the mean distance between consecutive rows over the spacing of
+    /// evenly spread rows; `input` is the input's root path.
+    #[non_exhaustive]
+    UnsortedInput {
+        count: usize,
+        input: String,
+        parts: usize,
+        ratio: f64,
+    },
+    /// The `--valve-scope smooth|zoom` predictor (`predictor`), or the
+    /// floors it set, outgrew the export's memory budget, and the export
+    /// fell back to `tile` (#768). `scope` is the `--valve-scope` asked for.
+    #[non_exhaustive]
+    ValveFloorsShed {
+        count: usize,
+        scope: String,
+        predictor: bool,
+    },
     #[non_exhaustive]
     PyramidSharedTiles { count: usize },
     #[non_exhaustive]
@@ -303,6 +322,8 @@ macro_rules! event_count {
             | Self::DiskShortage { count, .. }
             | Self::SavedPlan { count, .. }
             | Self::SharedBordersUnpinned { count }
+            | Self::ValveFloorsShed { count, .. }
+            | Self::UnsortedInput { count, .. }
             | Self::PyramidSharedTiles { count }
             | Self::PyramidSkippedTiles { count }
             | Self::PyramidMissingBounds { count }
@@ -312,10 +333,26 @@ macro_rules! event_count {
     }};
 }
 
+/// The log target of a [`Diagnostic::is_user_warning`] event, so a frontend
+/// can raise each as a warning when it is recorded (Python's `UserWarning`)
+/// instead of printing it as a log line.
+pub const USER_WARNING_LOG_TARGET: &str = "tylertoo_core::user_warning";
+
 impl Diagnostic {
     /// Number of events represented by this aggregate.
     pub fn count(&self) -> usize {
         *event_count!(self)
+    }
+    /// Whether a frontend that hands its caller a report, not a log
+    /// (Python), raises this as a warning instead: advice a run owes its
+    /// caller, whether it then succeeds or fails (#768). Logged under
+    /// [`USER_WARNING_LOG_TARGET`], which such a frontend turns into its
+    /// warnings.
+    pub fn is_user_warning(&self) -> bool {
+        matches!(
+            self,
+            Self::DiskShortage { .. } | Self::UnsortedInput { .. } | Self::ValveFloorsShed { .. }
+        )
     }
     fn count_mut(&mut self) -> &mut usize {
         event_count!(self)
@@ -487,6 +524,23 @@ impl fmt::Display for Diagnostic {
             Self::Advisory {message,..} | Self::DiskShortage {message,..} => f.write_str(message),
             Self::MemoryBudget {machine,limit,..} => write!(f, "memory budget from cgroup limit: {limit} bytes (machine available: {machine:?} bytes)"),
             Self::SharedBordersUnpinned {..} => f.write_str("the shared-border pins outgrew the memory budget and were dropped: each polygon simplifies on its own, so neighbours may show slivers along their shared borders. Run on a machine with more memory, or pass --simplify-factor 0.25 to narrow the slivers (#802)"),
+            Self::ValveFloorsShed {scope,predictor,..} => {
+                let what = if *predictor { "its predictor's scan state" } else { "the floors it predicted" };
+                write!(f, "--valve-scope {scope}: {what} outgrew the export's memory budget, so this export ran as --valve-scope tile: each tile over the size cap was thinned only as much as it needed on its own, and the density can jump at the edge of every such tile. To keep the {scope} thresholds, give the export more memory (more RAM, or `--profile speed`)")?;
+                // Only the smooth floors' reach shrinks with the step.
+                if !predictor && scope == "smooth" {
+                    f.write_str(" or raise --valve-max-step, which shortens the floors' reach")?;
+                }
+                f.write_str("; pass --valve-scope tile to skip the prediction (#768)")
+            }
+            Self::UnsortedInput {input,parts,ratio,..} => {
+                write!(f, "the input is not sorted by location: consecutive rows lie {ratio:.1}x farther apart on average than in spatially sorted data. tylertoo keeps the input's row order, so tiles over the size cap will merge or drop features unevenly and may show stripes. Sort the input first: ")?;
+                if *parts > 1 {
+                    write!(f, "run `gpio sort hilbert <part> <sorted part>` on each of the {parts} files under {}", gpio_inspect_arg(input))
+                } else {
+                    write!(f, "`gpio sort hilbert {} {}`", gpio_inspect_arg(input), gpio_inspect_arg(&hilbert_output(input)))
+                }
+            }
             Self::PyramidSharedTiles {..} => write!(f, "{n} tile(s) shared across bands; counted once in the merged archive"),
             Self::PyramidSkippedTiles {..} => write!(f, "{n} tile(s) outside their band's declared zoom range skipped"),
             Self::PyramidMissingBounds {..} => write!(f, "{n} band archive(s) carried no usable bounds"),
@@ -714,6 +768,9 @@ impl Diagnostics {
                             | CoveringWarning::Reprojected,
                         ..
                     } => log::debug!("{event}"),
+                    _ if event.is_user_warning() => {
+                        log::warn!(target: USER_WARNING_LOG_TARGET, "{event}");
+                    }
                     _ => log::warn!("{event}"),
                 }
             }
@@ -883,7 +940,16 @@ pub fn write_report(path: &std::path::Path, report: &impl Serialize) -> Result<(
     pending.publish()
 }
 
-/// The shell-quoted path for a `gpio inspect` hint (#708).
+/// Where the `gpio sort hilbert` hint writes: `<stem>-hilbert.parquet`
+/// beside the input (#768).
+fn hilbert_output(input: &str) -> String {
+    format!(
+        "{}-hilbert.parquet",
+        input.strip_suffix(".parquet").unwrap_or(input)
+    )
+}
+
+/// The shell-quoted path for a `gpio` hint (#708).
 fn gpio_inspect_arg(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }

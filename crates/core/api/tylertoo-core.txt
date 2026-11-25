@@ -704,6 +704,11 @@ pub tylertoo_core::Diagnostic::TilesOverLimit::merged_tiles: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::Unprojectable
 pub tylertoo_core::Diagnostic::Unprojectable::context: core::option::Option<tylertoo_core::RangeContext>
 pub tylertoo_core::Diagnostic::Unprojectable::count: usize
+#[non_exhaustive] pub tylertoo_core::Diagnostic::UnsortedInput
+pub tylertoo_core::Diagnostic::UnsortedInput::count: usize
+pub tylertoo_core::Diagnostic::UnsortedInput::input: alloc::string::String
+pub tylertoo_core::Diagnostic::UnsortedInput::parts: usize
+pub tylertoo_core::Diagnostic::UnsortedInput::ratio: f64
 #[non_exhaustive] pub tylertoo_core::Diagnostic::UnusableGeometry
 pub tylertoo_core::Diagnostic::UnusableGeometry::count: usize
 pub tylertoo_core::Diagnostic::UnusableGeometry::total: usize
@@ -711,12 +716,17 @@ pub tylertoo_core::Diagnostic::UnusableGeometry::total: usize
 pub tylertoo_core::Diagnostic::ValidationSkipped::count: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::ValveDropped
 pub tylertoo_core::Diagnostic::ValveDropped::count: usize
+#[non_exhaustive] pub tylertoo_core::Diagnostic::ValveFloorsShed
+pub tylertoo_core::Diagnostic::ValveFloorsShed::count: usize
+pub tylertoo_core::Diagnostic::ValveFloorsShed::predictor: bool
+pub tylertoo_core::Diagnostic::ValveFloorsShed::scope: alloc::string::String
 #[non_exhaustive] pub tylertoo_core::Diagnostic::Wrapped
 pub tylertoo_core::Diagnostic::Wrapped::context: core::option::Option<tylertoo_core::RangeContext>
 pub tylertoo_core::Diagnostic::Wrapped::count: usize
 pub tylertoo_core::Diagnostic::Wrapped::exemplars: alloc::vec::Vec<tylertoo_core::OutOfRangeExemplar>
 impl tylertoo_core::Diagnostic
 pub fn tylertoo_core::Diagnostic::count(&self) -> usize
+pub fn tylertoo_core::Diagnostic::is_user_warning(&self) -> bool
 impl core::clone::Clone for tylertoo_core::Diagnostic
 pub fn tylertoo_core::Diagnostic::clone(&self) -> tylertoo_core::Diagnostic
 impl core::cmp::PartialEq for tylertoo_core::Diagnostic
@@ -2102,6 +2112,35 @@ impl core::marker::Unpin for tylertoo_core::TilesOutcome
 impl core::marker::UnsafeUnpin for tylertoo_core::TilesOutcome
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::TilesOutcome
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TilesOutcome
+#[non_exhaustive] pub enum tylertoo_core::ValveScope
+pub tylertoo_core::ValveScope::Smooth
+pub tylertoo_core::ValveScope::Tile
+pub tylertoo_core::ValveScope::Zoom
+impl tylertoo_core::ValveScope
+pub fn tylertoo_core::ValveScope::as_str(self) -> &'static str
+impl core::clone::Clone for tylertoo_core::ValveScope
+pub fn tylertoo_core::ValveScope::clone(&self) -> tylertoo_core::ValveScope
+impl core::cmp::Eq for tylertoo_core::ValveScope
+impl core::cmp::PartialEq for tylertoo_core::ValveScope
+pub fn tylertoo_core::ValveScope::eq(&self, &tylertoo_core::ValveScope) -> bool
+impl core::default::Default for tylertoo_core::ValveScope
+pub fn tylertoo_core::ValveScope::default() -> tylertoo_core::ValveScope
+impl core::fmt::Debug for tylertoo_core::ValveScope
+pub fn tylertoo_core::ValveScope::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::ValveScope
+pub fn tylertoo_core::ValveScope::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::ValveScope
+impl core::marker::StructuralPartialEq for tylertoo_core::ValveScope
+impl core::str::traits::FromStr for tylertoo_core::ValveScope
+pub type tylertoo_core::ValveScope::Err = alloc::string::String
+pub fn tylertoo_core::ValveScope::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl core::marker::Freeze for tylertoo_core::ValveScope
+impl core::marker::Send for tylertoo_core::ValveScope
+impl core::marker::Sync for tylertoo_core::ValveScope
+impl core::marker::Unpin for tylertoo_core::ValveScope
+impl core::marker::UnsafeUnpin for tylertoo_core::ValveScope
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ValveScope
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::ValveScope
 #[non_exhaustive] pub enum tylertoo_core::WriteError
 pub tylertoo_core::WriteError::Finalized
 #[non_exhaustive] pub tylertoo_core::WriteError::Io
@@ -2653,6 +2692,8 @@ pub tylertoo_core::ExportOptions::tile_buffer: u32
 pub tylertoo_core::ExportOptions::tile_format: tylertoo_core::TileFormat
 pub tylertoo_core::ExportOptions::tile_range: core::option::Option<tylertoo_core::TileRange>
 pub tylertoo_core::ExportOptions::tile_size_limit: core::option::Option<usize>
+pub tylertoo_core::ExportOptions::valve_max_step: f64
+pub tylertoo_core::ExportOptions::valve_scope: tylertoo_core::ValveScope
 pub tylertoo_core::ExportOptions::variable_depth: bool
 pub tylertoo_core::ExportOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::ExportOptions
@@ -2679,6 +2720,8 @@ pub fn tylertoo_core::ExportOptions::with_tile_buffer(self, u32) -> Self
 pub fn tylertoo_core::ExportOptions::with_tile_format(self, tylertoo_core::TileFormat) -> Self
 pub fn tylertoo_core::ExportOptions::with_tile_range(self, core::option::Option<tylertoo_core::TileRange>) -> Self
 pub fn tylertoo_core::ExportOptions::with_tile_size_limit(self, core::option::Option<usize>) -> Self
+pub fn tylertoo_core::ExportOptions::with_valve_max_step(self, f64) -> Self
+pub fn tylertoo_core::ExportOptions::with_valve_scope(self, tylertoo_core::ValveScope) -> Self
 pub fn tylertoo_core::ExportOptions::with_variable_depth(self, bool) -> Self
 pub fn tylertoo_core::ExportOptions::with_zoom_ceiling(self, core::option::Option<u8>) -> Self
 impl core::clone::Clone for tylertoo_core::ExportOptions
@@ -3598,6 +3641,7 @@ impl core::marker::Unpin for tylertoo_core::ZoomReport
 impl core::marker::UnsafeUnpin for tylertoo_core::ZoomReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ZoomReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::ZoomReport
+pub const tylertoo_core::USER_WARNING_LOG_TARGET: &str
 pub trait tylertoo_core::Classify
 pub fn tylertoo_core::Classify::kind(&self) -> tylertoo_core::ErrorKind
 impl tylertoo_core::Classify for tylertoo_core::ArchiveError

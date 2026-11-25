@@ -4,7 +4,7 @@
 //! live here and nowhere else; `docs/guides/tippecanoe.md` tabulates them.
 
 use crate::overview::convert::ConvertOptions;
-use crate::overview::export::{ExportOptions, SizeValve};
+use crate::overview::export::{ExportOptions, SizeValve, ValveScope};
 
 /// A named set of option defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -53,6 +53,10 @@ impl Preset {
             // fails the tile, naming `--drop-densest-as-needed` (tile.cpp:2867);
             // tylertoo has no failing valve, so drop is the nearest.
             base.size_valve = SizeValve::Drop;
+            // `--drop-densest-as-needed` raises one gap threshold for the
+            // whole zoom and rebuilds it (tile.cpp, `traverse_zooms`): one
+            // floor per zoom (#768).
+            base.valve_scope = ValveScope::Zoom;
             // `-S` 1 also simplifies lines and polygons at the max zoom
             // (`-pS` / `--simplify-only-low-zooms` turns that off); 0.25 for
             // the reason `convert` gives above. Polygons part at shared
@@ -78,7 +82,7 @@ mod tests {
         keywords::tiles(map(value)).unwrap()
     }
 
-    /// The eight values the tippecanoe preset sets, in one tuple.
+    /// The nine values the tippecanoe preset sets, in one tuple.
     type PresetFields = (
         f64,
         f64,
@@ -88,6 +92,7 @@ mod tests {
         Option<usize>,
         SizeValve,
         Option<f64>,
+        ValveScope,
     );
 
     fn preset_fields(o: &TilesOptions) -> PresetFields {
@@ -100,6 +105,7 @@ mod tests {
             o.export.tile_size_limit,
             o.export.size_valve,
             o.export.max_zoom_simplify_factor,
+            o.export.valve_scope,
         )
     }
 
@@ -116,7 +122,8 @@ mod tests {
                 Some(500_000),
                 None,
                 SizeValve::Drop,
-                Some(0.25)
+                Some(0.25),
+                ValveScope::Zoom,
             )
         );
         let mut expected = tiles(json!({}));
@@ -128,6 +135,7 @@ mod tests {
         expected.export.tile_size_limit = None;
         expected.export.size_valve = SizeValve::Drop;
         expected.export.max_zoom_simplify_factor = Some(0.25);
+        expected.export.valve_scope = ValveScope::Zoom;
         assert_eq!(
             serde_json::to_value(&preset).unwrap(),
             serde_json::to_value(&expected).unwrap()
@@ -156,6 +164,7 @@ mod tests {
             ("tile_size_limit", json!(4_000_000)),
             ("size_valve", json!("merge")),
             ("max_zoom_simplify_factor", json!(0.5)),
+            ("valve_scope", json!("smooth")),
         ] {
             let mut keywords = map(json!({"preset": "tippecanoe"}));
             keywords.insert(key.into(), value);
@@ -169,7 +178,8 @@ mod tests {
                 "max_compressed_tile_size" => expected.4 = Some(1_000_000),
                 "tile_size_limit" => expected.5 = Some(4_000_000),
                 "size_valve" => expected.6 = SizeValve::Merge,
-                _ => expected.7 = Some(0.5),
+                "max_zoom_simplify_factor" => expected.7 = Some(0.5),
+                _ => expected.8 = ValveScope::Smooth,
             }
             assert_eq!(got, expected, "{key}");
         }

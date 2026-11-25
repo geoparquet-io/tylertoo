@@ -57,6 +57,8 @@ Args:
     exclude_properties: See `overview()`.
     exclude_all_properties: See `overview()`.
     size_valve: See `export_pmtiles()`.
+    valve_scope: See `export_pmtiles()`.
+    valve_max_step: See `export_pmtiles()`.
     max_compressed_tile_size: See `export_pmtiles()`. `"auto"` is no
         limit with `verbatim`.
     coverage_fill: See `export_pmtiles()`.

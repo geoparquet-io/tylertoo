@@ -85,6 +85,31 @@ use crate::wkb_column::check_wkb_column;
 /// Name of the mandatory level column (§4.1).
 pub const LEVEL_COLUMN: &str = "level";
 
+/// The overview's optional `input_row` column (#768): each row's position
+/// in the convert's input, counted over every part and row group in file
+/// order (pruned ones too), so a shard numbers a row as the whole build
+/// does. Export ranks points by it (`export::point_rank`); it is never
+/// published as a property.
+pub(crate) const INPUT_ROW_COLUMN: &str = "input_row";
+
+/// Field metadata key the convert puts on its own `input_row` column. An
+/// overview written before #768 has none, so a column of its own named
+/// `input_row` is a user property: published, and never taken for a rank.
+pub(crate) const INPUT_ROW_MARKER: &str = "tylertoo:input_row";
+
+/// Whether `field` is the convert's own `input_row` column
+/// ([`INPUT_ROW_MARKER`]).
+pub(crate) fn is_input_row_column(field: &arrow_schema::Field) -> bool {
+    field.name() == INPUT_ROW_COLUMN && field.metadata().contains_key(INPUT_ROW_MARKER)
+}
+
+/// Whether `field` is one of the columns an overview reserves for itself and
+/// never publishes: `level` (case-insensitively, as the collision renames
+/// match it) or the convert's `input_row` ([`is_input_row_column`]).
+pub(crate) fn is_unpublished_column(field: &arrow_schema::Field) -> bool {
+    field.name().eq_ignore_ascii_case(LEVEL_COLUMN) || is_input_row_column(field)
+}
+
 /// Default ZSTD compression level (spec §4.5 recommends ZSTD).
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 

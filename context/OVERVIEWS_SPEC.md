@@ -591,6 +591,26 @@ still conformant but prunes poorly.
   coarse levels SHOULD be kept small enough to serve as a quick overview
   (the first level SHOULD be a small number of row groups).
 
+### 4.6 `input_row` column (OPTIONAL, additive)
+
+A writer MAY add a column recording where each row came from in its input:
+
+- **Name**: `input_row`
+- **Type**: Parquet `INT64` with an unsigned 64-bit logical type.
+- **Nullability**: NOT NULL.
+- **Value**: the row's position in the writer's input, counted over every
+  input file in order and every row group of each file, including row
+  groups the writer did not read. A row a level copies keeps the value of
+  its input row, so the same feature carries one value at every level.
+
+The count is taken from footer row counts alone, so a writer that reads
+only part of the input (a shard) numbers each row as a writer reading all
+of it would. tylertoo's convert always writes it; its PMTiles export ranks
+points by it when thinning a tile, so a point kept at one zoom is kept at
+the next (#768). It is never exported as a feature property. Readers MUST
+tolerate its absence; a source column of the same name
+(case-insensitively) is renamed, as for `level` (§3.5).
+
 ---
 
 ## 5. Read protocols

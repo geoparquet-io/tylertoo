@@ -73,14 +73,95 @@ static LOG_RESET: pyo3::sync::PyOnceLock<Option<pyo3_log::ResetHandle>> =
 /// give the CLI its own stderr logger (#819).
 fn refresh_log_levels(py: Python<'_>) {
     let handle = LOG_RESET.get_or_init(py, || {
-        pyo3_log::Logger::new(py, pyo3_log::Caching::LoggersAndLevels)
-            .ok()?
-            .install()
-            .ok()
+        let logger = pyo3_log::Logger::new(py, pyo3_log::Caching::LoggersAndLevels).ok()?;
+        let handle = logger.reset_handle();
+        log::set_boxed_logger(Box::new(Bridge(logger))).ok()?;
+        // pyo3-log's own default; Python's logging filters below it.
+        log::set_max_level(log::LevelFilter::Debug);
+        Some(handle)
     });
     if let Some(handle) = handle {
         handle.reset();
     }
+}
+
+/// Core's user-warning records (`tylertoo_core::USER_WARNING_LOG_TARGET`:
+/// unsorted input, a disk that may not fit, a shed valve prediction, #768),
+/// held for the binding that ran to raise as `UserWarning`s
+/// ([`detached`]), on success or failure, whatever Python's logging
+/// configuration.
+///
+/// shortcut: one buffer per process, so two bindings running at once on two
+/// Python threads may raise each other's warnings, and a run that panics,
+/// or a `_run_cli` beside a binding, takes the others' with it; key it by
+/// run if that ever matters.
+static USER_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The log bridge: pyo3-log, except for core's user warnings, which go to
+/// [`USER_WARNINGS`] instead of Python logging.
+struct Bridge(pyo3_log::Logger);
+
+impl log::Log for Bridge {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target() == tylertoo_core::USER_WARNING_LOG_TARGET || self.0.enabled(metadata)
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if record.target() == tylertoo_core::USER_WARNING_LOG_TARGET {
+            USER_WARNINGS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(record.args().to_string());
+        } else {
+            self.0.log(record);
+        }
+    }
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
+/// Empty [`USER_WARNINGS`], returning what it held.
+fn take_user_warnings() -> Vec<String> {
+    std::mem::take(
+        &mut *USER_WARNINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Run `f` with the GIL released, then raise the user warnings it logged
+/// ([`USER_WARNINGS`]), once each, from the caller's own frame; a warning
+/// escalated to an error (`-W error`) is the exception the call raises.
+fn detached<T: pyo3::marker::Ungil>(
+    py: Python<'_>,
+    f: impl pyo3::marker::Ungil + FnOnce() -> T,
+) -> PyResult<T> {
+    /// Empties the buffer when the run panics, so the next call does not
+    /// raise this one's warnings.
+    struct OnPanic;
+    impl Drop for OnPanic {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                take_user_warnings();
+            }
+        }
+    }
+    let guard = OnPanic;
+    let out = py.detach(f);
+    drop(guard);
+    let messages = take_user_warnings();
+    let mut seen = std::collections::HashSet::new();
+    for message in messages {
+        if seen.insert(message.clone()) {
+            PyErr::warn(
+                py,
+                &py.get_type::<PyUserWarning>(),
+                &CString::new(message)?,
+                1,
+            )?;
+        }
+    }
+    Ok(out)
 }
 
 /// Before each binding starts work: build the worker pool, then refresh
@@ -206,28 +287,6 @@ fn report_dict<T: serde::Serialize>(py: Python<'_>, report: &T) -> PyResult<Py<P
     Ok(pythonize::pythonize(py, report)?
         .cast_into::<PyDict>()?
         .unbind())
-}
-
-/// Rechecks arrive with a successful report; core already logged them while
-/// running. Deduplicate across report sections (including layered runs).
-fn warn_disk_shortages<'a>(
-    py: Python<'_>,
-    diagnostics: impl IntoIterator<Item = &'a tylertoo_core::Diagnostic>,
-) -> PyResult<()> {
-    let mut seen = std::collections::HashSet::new();
-    for diagnostic in diagnostics {
-        if let tylertoo_core::Diagnostic::DiskShortage { message, .. } = diagnostic {
-            if seen.insert(message) {
-                PyErr::warn(
-                    py,
-                    &py.get_type::<PyUserWarning>(),
-                    &CString::new(message.as_str())?,
-                    1,
-                )?;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Replace display-only JSON filenames with `PyO3`'s native filesystem paths.
@@ -357,12 +416,11 @@ fn convert(
     }
 
     // Release the GIL while the Rust pipelines run.
-    let outcome = py.detach(|| convert_to_pmtiles(&input, &output_path, &options));
+    let outcome = detached(py, || convert_to_pmtiles(&input, &output_path, &options))?;
     match outcome.map_err(tiles_error_to_py)? {
         // The combined report (#439): the two halves the two-step chain's own
         // reports would carry, keyed like the CLI's `tiles --report` JSON.
         TilesOutcome::Converted(mut report) => {
-            warn_disk_shortages(py, report.convert.diagnostics.iter().chain(&report.export.diagnostics))?;
             report.convert.source_losses = report.convert.source_losses
                 .for_python()
                 .map_err(accounting_error_to_py)?;
@@ -376,9 +434,6 @@ fn convert(
         },
         // #821: one report per layer, each keyed like a plain run's.
         TilesOutcome::Layered(mut report) => {
-            warn_disk_shortages(py, report.layers.iter().flat_map(|layer| {
-                layer.report.convert.diagnostics.iter().chain(&layer.report.export.diagnostics)
-            }).chain(&report.diagnostics))?;
             // The layers share one run's allowance for inline loss lists.
             let parts = report.layers.len();
             for layer in &mut report.layers {
@@ -455,8 +510,7 @@ fn overview(
     let output_path = PathBuf::from(output);
 
     // Release the GIL while the Rust pipeline runs.
-    let mut report = py
-        .detach(|| match &parsed {
+    let mut report = detached(py, || match &parsed {
             OverviewInput::Path(input_path) => {
                 convert_to_overviews(input_path, &output_path, &options)
             }
@@ -464,7 +518,7 @@ fn overview(
                 let source = ConvertSource::from_input_list(inputs).map_err(ConvertError::from)?;
                 convert_to_overviews_sources(&source, &output_path, &options)
             }
-        })
+        })?
         .map_err(convert_error_to_py)?;
 
     report.source_losses = report.source_losses
@@ -487,8 +541,7 @@ fn export_pmtiles(
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
 
-    let mut report = py
-        .detach(|| export_pmtiles_core(&input_path, &output_path, &options))
+    let mut report = detached(py, || export_pmtiles_core(&input_path, &output_path, &options))?
         .map_err(export_error_to_py)?;
 
     report.source_losses = report.source_losses
@@ -594,8 +647,7 @@ fn pyramid(
     let bands = parse_bands(&bands).map_err(config_err)?;
     let output_path = PathBuf::from(output);
 
-    let report = py
-        .detach(|| build_pyramid(&bands, &output_path, &options))
+    let report = detached(py, || build_pyramid(&bands, &output_path, &options))?
         .map_err(pyramid_error_to_py)?;
     // The same shape as the CLI's `pyramid --report` JSON.
     report_dict(py, &report)
@@ -680,7 +732,14 @@ fn _defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// logger, `--quiet`, and exit codes, a panic included (101).
 #[pyfunction]
 fn _run_cli(py: Python<'_>, argv: Vec<std::ffi::OsString>) -> u8 {
-    py.detach(|| tylertoo_cli::run(argv))
+    let code = py.detach(|| tylertoo_cli::run(argv));
+    // After a binding installed the bridge, the CLI's user warnings land in
+    // the buffer (and `RUST_LOG` is not read); print them, as `--quiet`
+    // keeps warnings too.
+    for message in take_user_warnings() {
+        eprintln!("{message}");
+    }
+    code
 }
 
 /// The compiled extension, imported as `tylertoo._tylertoo`.
@@ -707,64 +766,6 @@ fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(_run_cli, m)?)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod disk_warnings {
-    use super::*;
-
-    // Free-space probes use the real filesystem; the injected probes in
-    // core's disk tests are not available to a Python conversion. Exercise
-    // the frontend mapping directly with the report's typed wire shape.
-    #[test]
-    fn reported_disk_shortages_raise_user_warnings_once_per_message() {
-        Python::attach(|py| {
-            let warnings = py.import("warnings").unwrap();
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("record", true).unwrap();
-            let catch = warnings
-                .call_method("catch_warnings", (), Some(&kwargs))
-                .unwrap();
-            let records = catch.call_method0("__enter__").unwrap();
-            warnings.call_method1("simplefilter", ("always",)).unwrap();
-            let events: Vec<tylertoo_core::Diagnostic> = serde_json::from_value(
-                serde_json::json!([
-                    {"kind": "advisory", "count": 1, "message": "pre-read staging warning"},
-                    {"kind": "disk_shortage", "count": 1, "message": "projected disk footprint after pass 1 may not fit"},
-                    {"kind": "disk_shortage", "count": 1, "message": "projected disk footprint after pass 1 may not fit"},
-                    {"kind": "disk_shortage", "count": 1, "message": "another volume may not fit"}
-                ])
-            ).unwrap();
-            warn_disk_shortages(py, &events).unwrap();
-            catch
-                .call_method1("__exit__", (py.None(), py.None(), py.None()))
-                .unwrap();
-            assert_eq!(records.len().unwrap(), 2);
-            for (index, message) in [
-                "projected disk footprint after pass 1 may not fit",
-                "another volume may not fit",
-            ]
-            .iter()
-            .enumerate()
-            {
-                let warning = records.get_item(index).unwrap();
-                assert!(warning
-                    .getattr("category")
-                    .unwrap()
-                    .is(py.get_type::<PyUserWarning>()));
-                assert_eq!(
-                    warning
-                        .getattr("message")
-                        .unwrap()
-                        .str()
-                        .unwrap()
-                        .to_str()
-                        .unwrap(),
-                    *message
-                );
-            }
-        });
-    }
 }
 
 #[cfg(test)]
@@ -1115,6 +1116,62 @@ mod config_parity {
             serde_json::to_value(python).unwrap(),
             serde_json::to_value(core).unwrap(),
         );
+    }
+
+    /// #768: `--valve-max-step` and `valve_max_step=` set the same field
+    /// on every command that exports, and both refuse a ratio of 1.
+    #[test]
+    fn valve_max_step_cli_python_core_configs_are_equal() {
+        let flags = ["--valve-max-step", "1.25"];
+        let keywords = |step: f64| native_keywords(json!({"valve_max_step": step}));
+        let core = ExportOptions::default().with_valve_max_step(1.25);
+
+        let args = cli::ExportPmtilesArgs::parse_from(
+            [&["export-pmtiles", "in", "out"][..], &flags].concat(),
+        );
+        let expected = serde_json::to_value(&core).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli::export_options(&args).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(export_config(keywords(1.25)).unwrap()).unwrap(),
+            expected
+        );
+        let args = cli::TilesArgs::parse_from([&["tiles", "in", "out"][..], &flags].concat());
+        assert_eq!(
+            cli::tiles_options(&args).unwrap().export.valve_max_step,
+            1.25
+        );
+        assert_eq!(
+            tiles_config(keywords(1.25)).unwrap().export.valve_max_step,
+            1.25
+        );
+        let args = cli::PyramidArgs::parse_from(
+            [
+                &["pyramid", "out", "--band", "0-3:never-read.parquet"][..],
+                &flags,
+            ]
+            .concat(),
+        );
+        assert_eq!(cli::pyramid_options(&args).export.valve_max_step, 1.25);
+        assert_eq!(
+            pyramid_config(keywords(1.25))
+                .unwrap()
+                .export
+                .valve_max_step,
+            1.25
+        );
+
+        let args = cli::ExportPmtilesArgs::parse_from([
+            "export-pmtiles",
+            "in",
+            "out",
+            "--valve-max-step",
+            "1",
+        ]);
+        assert!(cli::export_options(&args).unwrap().validate().is_err());
+        assert!(export_config(keywords(1.0)).unwrap().validate().is_err());
     }
 
     /// #823: `--tile-format` and `--mlt-profile` on every command that

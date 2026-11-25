@@ -12,6 +12,10 @@ Options and defaults match the CLI. Ground sample distance (GSD) is the meters c
 
 Diagnostics go to Python's `logging` under the `tylertoo_core` logger: the warnings and progress lines the CLI prints. Python shows warnings by default; call `logging.basicConfig(level=logging.INFO)` to see progress. Each call reads the logging configuration when it starts.
 
+Input must be sorted in Hilbert order (`gpio sort hilbert`); tylertoo never reorders rows. `overview()` and `convert()` raise a `UserWarning` when the input is not sorted by location.
+
+Advice a caller owes a response to (unsorted input, a disk that may run out, a size valve that fell back to `valve_scope="tile"`) is a `UserWarning`, not a log record: raised as the call returns, whether it succeeds or fails, whatever the logging configuration.
+
 ## `overview`
 
 ```python
@@ -210,6 +214,8 @@ export_pmtiles(
     description: str | None = None,
     attribution: str | None = None,
     size_valve: Literal['merge', 'drop'] = "merge",
+    valve_scope: Literal['smooth', 'tile', 'zoom'] = "smooth",
+    valve_max_step: float = 2.0,
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     max_zoom_simplify_factor: float | None = None,
     no_simplification_of_shared_nodes: bool = False,
@@ -230,7 +236,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `output`: PMTiles archive to write.
 * `layer_name`: MVT layer name.
 * `tile_buffer`: Tile edge buffer in pixels, default 5, from 0 to 256.
-* `preset`: `"tippecanoe"` starts from tippecanoe's tile buffer, max-zoom simplification, size limits and size valve instead of tylertoo's; an option you pass still applies. See [the tippecanoe preset](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset).
+* `preset`: `"tippecanoe"` starts from tippecanoe's tile buffer, max-zoom simplification, size limits, size valve and one valve threshold per zoom (`valve_scope="zoom"`) instead of tylertoo's; an option you pass still applies. See [the tippecanoe preset](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset).
 * `extent`: Tile resolution in MVT units.
 * `tile_size_limit`: Maximum raw (uncompressed) tile size in bytes, a backstop behind `max_compressed_tile_size`; `"auto"` is 2 MiB, and `0` or `None` is no limit.
 * `simple_clip_fastpath`: Use faster clipping for simple polygons. `False` gives byte-stable output.
@@ -247,6 +253,8 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `description`: Description of the tileset, stored in the metadata.
 * `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.
 * `size_valve`: How to reduce a tile that exceeds its limit: `"merge"` merges the densest lines and polygons into a neighbor, which keeps its own attributes. If still over, drop unmerged features, halve the tile extent to 512, then drop whole features if needed. Merged features are never split into their sources. In a tile of lines or polygons, only a lone feature still over the cap at the extent floor is written over it, with a warning. `"drop"` removes features, leaving holes. Point tiles use feature dropping in both modes.
+* `valve_scope`: How far the size valve's thinning reaches past the tile that needs it. `"smooth"` predicts each tile's threshold from the export scan and fades it over the tiles around, so neighbouring tiles differ by at most `valve_max_step` (in point tiles, in the share of points they keep) and the density steps down over several tiles instead of jumping at a tile edge; tiles near a dense one are thinned too. `"tile"` thins each tile only as much as it needs on its own: the most detail, with visible steps at tile edges. `"zoom"` starts every tile from the largest threshold predicted at its zoom, like tippecanoe's one threshold per zoom: no edges, the least detail; `preset="tippecanoe"` sets it; not with `tile_range`.
+* `valve_max_step`: Under `valve_scope="smooth"`, the largest density step allowed between neighbouring tiles: a tile keeps at most this many times more points (or merges at most this many times less hard) than its neighbour. The fade reaches at most 8 tiles out: a tile thinned more than `valve_max_step ** 9` fades by the larger even step that ends there. Must be above 1, and only applies under `valve_scope="smooth"`. `1.25` makes the edges barely visible but spreads the thinning further; `2` is the default; larger values come closer to `valve_scope="tile"`.
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M`; `"auto"` is 500 KiB, and `0` or `None` is no limit.
 * `max_zoom_simplify_factor`: Simplify each feature of the finest (canonical) level once, before clipping, with tolerance factor × GSD at that level's zoom, like `simplify_factor` for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Only vertices are removed: features, individual MultiLineString or MultiPolygon parts, and polygon rings (including holes) that would collapse or be dropped under the tolerance keep their original geometry. Defaults to `None`: lines use factor 0.25 and polygons are not simplified. An explicit factor applies to both; `0` disables it. Explicit `None` selects the command's default, like `"auto"` for size caps: no max-zoom simplification under verbatim or for pyramid bands, and 0.25 for both kinds under the tippecanoe preset. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Comparable to tippecanoe's `-S`, which uses tile units at every zoom: `-S 10` is about factor 2.5.
 * `no_simplification_of_shared_nodes`: Set `True` to rebuild and keep shared-border pins at the finest zoom. Acts only when you set `max_zoom_simplify_factor` above 0 or use `preset="tippecanoe"`, which sets it to 0.25. Defaults to `False`.
@@ -301,6 +309,8 @@ pyramid(
     attribution: str | None = None,
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     size_valve: Literal['merge', 'drop'] = "merge",
+    valve_scope: Literal['smooth', 'tile', 'zoom'] = "smooth",
+    valve_max_step: float = 2.0,
     coverage_fill: bool = False,
     max_zoom_simplify_factor: float | None = None,
     simple_clip_fastpath: bool = True,
@@ -337,6 +347,8 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 * `attribution`: Attribution text or HTML for the output, `""` included. Unset, every PMTiles band's credit is kept, joined with `" | "`; GeoParquet bands carry none.
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes for bands tiled here; `"auto"`, `0` and `None` are no limit.
 * `size_valve`: See `export_pmtiles()`.
+* `valve_scope`: See `export_pmtiles()`.
+* `valve_max_step`: See `export_pmtiles()`.
 * `coverage_fill`: See `export_pmtiles()`.
 * `max_zoom_simplify_factor`: See `export_pmtiles()`. Bands default to `0`: nothing is simplified at the max zoom. `None` selects this default; an explicit factor applies to lines and polygons.
 * `simple_clip_fastpath`: See `export_pmtiles()`.
@@ -558,6 +570,8 @@ convert(
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
     size_valve: Literal['merge', 'drop'] = "merge",
+    valve_scope: Literal['smooth', 'tile', 'zoom'] = "smooth",
+    valve_max_step: float = 2.0,
     max_compressed_tile_size: int | Literal['auto'] | None = "auto",
     coverage_fill: bool = False,
     max_zoom_simplify_factor: float | None = None,
@@ -647,6 +661,8 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `exclude_properties`: See `overview()`.
 * `exclude_all_properties`: See `overview()`.
 * `size_valve`: See `export_pmtiles()`.
+* `valve_scope`: See `export_pmtiles()`.
+* `valve_max_step`: See `export_pmtiles()`.
 * `max_compressed_tile_size`: See `export_pmtiles()`. `"auto"` is no limit with `verbatim`.
 * `coverage_fill`: See `export_pmtiles()`.
 * `max_zoom_simplify_factor`: See `export_pmtiles()`.

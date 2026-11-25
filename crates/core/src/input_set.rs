@@ -301,6 +301,25 @@ impl StreamRowLocator {
         Some(self.part_bases[part] + row as u64)
     }
 
+    /// [`Self::global_row`] of the `n` stream rows from `first`, one
+    /// row-group run at a time; `None` when they run past the stream.
+    pub(crate) fn global_rows(&self, first: usize, n: usize) -> Option<Vec<u64>> {
+        let (mut r, end) = (first as u64, (first + n) as u64);
+        if end > self.total {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n);
+        let mut k = self.starts.partition_point(|&(start, _, _)| start <= r);
+        while r < end {
+            let &(start, part, file_first) = self.starts.get(k.checked_sub(1)?)?;
+            let run_end = self.starts.get(k).map_or(self.total, |s| s.0).min(end);
+            let base = self.part_bases[part] + file_first + (r - start);
+            out.extend((0..run_end - r).map(|i| base + i));
+            (r, k) = (run_end, k + 1);
+        }
+        Some(out)
+    }
+
     /// Half-open original row ranges constituting the selected read stream.
     pub(crate) fn ranges(&self) -> Vec<(u64, u64)> {
         let mut ranges: Vec<(u64, u64)> = Vec::new();
@@ -3634,6 +3653,28 @@ b.parquet
         assert_eq!(loc.locate(6), Some((2, 2)));
         assert_eq!(loc.locate(7), Some((2, 3)));
         assert_eq!(loc.locate(8), None);
+    }
+
+    /// #768: the run-at-a-time global rows agree with `global_row` row by
+    /// row, across pruned groups and parts, and refuse rows past the stream.
+    #[test]
+    fn global_rows_match_global_row_over_every_span() {
+        let counts = vec![vec![3, 0, 2, 4], vec![5, 5], vec![2, 2]];
+        let sel = RowGroupSelection::from_parts(vec![vec![1, 2, 3], vec![], vec![1]]);
+        for loc in [
+            StreamRowLocator::new(&counts, Some(&sel)),
+            StreamRowLocator::new(&counts, None),
+        ] {
+            let total = loc.len() as usize;
+            for first in 0..=total {
+                for n in 0..=total - first {
+                    let each: Option<Vec<u64>> =
+                        (first..first + n).map(|r| loc.global_row(r)).collect();
+                    assert_eq!(loc.global_rows(first, n), each, "{first} {n}");
+                }
+            }
+            assert_eq!(loc.global_rows(total, 1), None);
+        }
     }
 
     // --- #563: byte-array batch ceiling -------------------------------------

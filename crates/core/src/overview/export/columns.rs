@@ -56,6 +56,7 @@ pub(super) fn encode_level_tiles(
             members.push(Member {
                 key,
                 seq,
+                rank: point_rank(seq),
                 geom: geom.into(),
                 props: props.clone(),
                 id,
@@ -137,7 +138,7 @@ pub(super) fn decode_batch(
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
             .map_err(|e| crate::GeoParquetReadError::decode("geometry decode", e))?;
     let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
-    extract_geometries_from_array(
+    crate::batch_processor::extract_geometries_from_array(
         garr.as_ref(),
         &mut geoms,
         &crate::diagnostics::Diagnostics::default(),
@@ -609,8 +610,17 @@ pub(super) fn skipped_property_columns(
         .collect()
 }
 
+/// The overview's `input_row` column (#768): the convert's own, by its
+/// marker and type. A user column of that name is a property.
+fn input_row_column(schema: &Schema) -> Option<usize> {
+    let i = schema.index_of(INPUT_ROW_COLUMN).ok()?;
+    let f = schema.field(i);
+    (super::super::writer::is_input_row_column(f) && f.data_type() == &DataType::UInt64)
+        .then_some(i)
+}
+
 /// Every schema column that is a property candidate: not the geometry, not
-/// the `level` column, not a bbox covering struct ([`super::super::writer::is_covering_column`]:
+/// the `level` or `input_row` column, not a bbox covering struct ([`super::super::writer::is_covering_column`]:
 /// index metadata, not user data -- so it is neither exported nor warned
 /// about), and not withheld by the selection.
 pub(super) fn candidate_columns<'a>(
@@ -626,7 +636,7 @@ pub(super) fn candidate_columns<'a>(
         .filter(move |&(i, f)| {
             published.properties.as_ref().map_or(
                 i != geom_idx
-                    && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
+                    && !super::super::writer::is_unpublished_column(f)
                     && !super::super::writer::is_covering_column(
                         f,
                         geom,
@@ -645,6 +655,9 @@ pub(super) struct AttrColumns<'a> {
     /// `(column index, published name)` in schema order.
     pub(super) props: Vec<(usize, Arc<str>)>,
     pub(super) feature_id: Option<&'a ResolvedFeatureId>,
+    /// The overview's `input_row` column (#768), absent from overviews
+    /// written before it.
+    pub(super) input_row: Option<usize>,
 }
 
 impl<'a> AttrColumns<'a> {
@@ -667,6 +680,7 @@ impl<'a> AttrColumns<'a> {
             props,
             names,
             feature_id,
+            input_row: input_row_column(schema),
         }
     }
 
@@ -692,6 +706,9 @@ impl<'a> AttrColumns<'a> {
                     .unwrap_or_default();
                 (fid, ids)
             }),
+            input_rows: self
+                .input_row
+                .and_then(|i| batch.column(i).as_primitive_opt::<UInt64Type>().cloned()),
             #[cfg(debug_assertions)]
             read: vec![false; batch.num_rows()],
         })
@@ -704,12 +721,21 @@ pub(super) struct BatchAttributes<'a> {
     pub(super) rows: Vec<packed_props::arrow::Row>,
     /// The `--feature-id` column and its per-row ids (`None` = invalid).
     pub(super) ids: Option<(&'a ResolvedFeatureId, Vec<Option<u64>>)>,
+    /// The batch's `input_row` column, when the overview has one.
+    input_rows: Option<arrow_array::UInt64Array>,
     /// Rows [`Self::row`] has already moved out (debug builds only).
     #[cfg(debug_assertions)]
     pub(super) read: Vec<bool>,
 }
 
 impl BatchAttributes<'_> {
+    /// Row `row`'s [`point_rank`]: its input row's, or, in an overview
+    /// written before the `input_row` column, its overview row `seq`'s
+    /// (the same, unsharded, for points no convert thinned).
+    pub(super) fn rank(&self, row: usize, seq: u64) -> u64 {
+        point_rank(self.input_rows.as_ref().map_or(seq, |r| r.value(row)))
+    }
+
     /// Row `row`'s `--feature-id`, if one is set.
     pub(super) fn id(&self, row: usize) -> Result<Option<u64>, ExportError> {
         Ok(match &self.ids {

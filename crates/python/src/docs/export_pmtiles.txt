@@ -6,7 +6,8 @@ Args:
     layer_name: MVT layer name.
     tile_buffer: Tile edge buffer in pixels, default 5, from 0 to 256.
     preset: `"tippecanoe"` starts from tippecanoe's tile buffer, max-zoom
-        simplification, size limits and size valve instead of tylertoo's; an option you pass
+        simplification, size limits, size valve and one valve threshold per
+        zoom (`valve_scope="zoom"`) instead of tylertoo's; an option you pass
         still applies. See
         [the tippecanoe preset](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset).
     extent: Tile resolution in MVT units.
@@ -58,6 +59,27 @@ Args:
         `"drop"` removes
         features, leaving holes. Point tiles use feature dropping in
         both modes.
+    valve_scope: How far the size valve's thinning reaches past the
+        tile that needs it. `"smooth"` predicts each tile's threshold from
+        the export scan and fades it over the tiles around, so neighbouring
+        tiles differ by at most `valve_max_step` (in point
+        tiles, in the share of points they keep) and the
+        density steps down over several tiles instead of jumping at a tile
+        edge; tiles near a dense one are thinned too. `"tile"` thins each
+        tile only as much as it needs on its own: the most detail, with
+        visible steps at tile edges. `"zoom"` starts every tile from the
+        largest threshold predicted at its zoom, like tippecanoe's one
+        threshold per zoom: no edges, the least detail; `preset="tippecanoe"`
+        sets it; not with `tile_range`.
+    valve_max_step: Under `valve_scope="smooth"`, the largest density
+        step allowed between neighbouring tiles: a tile keeps at most this
+        many times more points (or merges at most this many times less
+        hard) than its neighbour. The fade reaches at most 8 tiles out: a
+        tile thinned more than `valve_max_step ** 9` fades by the larger
+        even step that ends there. Must be above 1, and only applies under
+        `valve_scope="smooth"`. `1.25` makes the edges barely visible but
+        spreads the thinning further; `2` is the default; larger values
+        come closer to `valve_scope="tile"`.
     max_compressed_tile_size: Maximum gzip-compressed tile size
         in bytes, like tippecanoe's `-M`; `"auto"` is 500 KiB, and
         `0` or `None` is no limit.

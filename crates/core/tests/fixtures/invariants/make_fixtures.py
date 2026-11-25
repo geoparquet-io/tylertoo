@@ -164,7 +164,8 @@ def banded_parcels() -> None:
                 poly = shapely.make_valid(poly)
             rows.append((i, j, poly))
     # Banded: west to east in 0.1 deg bands (10 columns), shuffled within a
-    # band, which is "sorted enough" that no unsorted-input warning fires.
+    # band. Each row group's bbox is a narrow strip, so footer statistics
+    # read it as sorted; pass 1's row-order check warns (#768).
     band = {}
     for r in rows:
         band.setdefault(r[0] // 10, []).append(r)

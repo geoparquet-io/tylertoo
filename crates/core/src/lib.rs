@@ -174,7 +174,8 @@ pub use overview::{
 // Export: overview GeoParquet -> PMTiles.
 pub use overview::export::{
     export_pmtiles, ExportError, ExportOptions, ExportReport, FeatureIdColumnProblem, FeatureOrder,
-    InvalidFeatureIdReason, SizeValve, SkippedPropertyColumn, VariableDepthReport, ZoomReport,
+    InvalidFeatureIdReason, SizeValve, SkippedPropertyColumn, ValveScope, VariableDepthReport,
+    ZoomReport,
 };
 // Check: validate an overview file against the spec.
 pub use overview::check::{validate_file, CheckError, CheckResult, ValidationReport};
@@ -201,7 +202,7 @@ pub use atomic_output::OutputNotWritable;
 pub use compression::Compression;
 pub use diagnostics::{
     AccountingError, CoveringWarning, CrsWarning, Diagnostic, PolygonRepairKind, RangeContext,
-    SourceLoss, SourceLossCause, SourceLosses,
+    SourceLoss, SourceLossCause, SourceLosses, USER_WARNING_LOG_TARGET,
 };
 pub use error::{Classify, ErrorKind};
 pub use input::{FetchStats, InputError};

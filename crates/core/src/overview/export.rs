@@ -100,13 +100,19 @@ use std::{
 };
 
 #[cfg(test)]
+use super::writer::LEVEL_COLUMN;
+#[cfg(test)]
 use crate::mvt::PropertyValue;
 #[cfg(test)]
 use arrow_array::types::{
     Decimal128Type, Float32Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
+    UInt8Type,
 };
-use arrow_array::{cast::AsArray, types::Float64Type, Array, RecordBatch};
+use arrow_array::{
+    cast::AsArray,
+    types::{Float64Type, UInt64Type},
+    Array, RecordBatch,
+};
 #[cfg(test)]
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{DataType, Schema};
@@ -143,14 +149,13 @@ use super::{
         write_export_profile_json, ExportPhaseWalls, ExportProfileJsonInputs, ExportTimers,
         ExportZoomProfile, RssSampler, RssSamplerReport,
     },
-    writer::LEVEL_COLUMN,
+    writer::INPUT_ROW_COLUMN,
 };
 #[cfg(test)]
 use crate::compression;
 #[cfg(test)]
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::{
-    batch_processor::extract_geometries_from_array,
     clip::{clip_geometry_simple, geometry_is_simple},
     compression::{Compression, TileGzipCache},
     dedup::TileHasher,
@@ -165,6 +170,7 @@ use crate::{
 
 mod coalesce_valve;
 mod tile_data;
+pub(crate) mod valve_predict;
 use tile_data::TileData;
 
 mod collect;
@@ -183,7 +189,8 @@ pub(in crate::overview) use self::scan::geometry_lnglat_bbox;
 use self::{collect::*, columns::*, driver::*, encode::*, plan::*, scan::*, store::*, valve::*};
 pub(crate) use self::{
     columns::webmerc_to_lnglat, encode::JoinedTile, encode::JoinedTileFitter, encode::JointMembers,
-    encode::JointSource, scan::lnglat_bbox, valve::select_kept_by_size, valve::MAX_DROP_PASSES,
+    encode::JointSource, scan::lnglat_bbox, valve::draws_one_point, valve::select_kept_by_size,
+    valve::valve_predicts, valve::MAX_DROP_PASSES,
 };
 pub use self::{
     encode::FeatureOrder, plan::resolve_partition_wave, plan::zoom_for_level,
@@ -241,9 +248,9 @@ pub(crate) const DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR: f64 = 0.25;
 /// `--buffer` has no cap; this is a divergence, and a deliberate one, since
 /// there is no output past this value that is not also reachable below it.
 ///
-/// This is the one bound. The sharded path's read-pruning margin
-/// (`shard::SHARD_READ_MARGIN_TILES`, two pivot tiles = 512 px) is
-/// wider than this, so the cap satisfies it with 2x headroom; the
+/// This is the one bound. The sharded path's read-pruning margin (two pivot
+/// tiles, `shard::SHARD_BUFFER_MARGIN_TILES`; nine when the export predicts
+/// valve floors, #768) is wider than this, so the cap satisfies it; the
 /// compile-time check next to that constant keeps it so, and
 /// [`ExportError::TileBufferTooWideForShard`] is no longer raised.
 pub const MAX_TILE_BUFFER_PX: u32 = 256;
@@ -300,8 +307,8 @@ pub const DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: usize = 500 * 1024;
 /// merged feature
 /// keeps the attributes of the feature it was merged into; the absorbed
 /// features' attributes are not carried. Points are never merged; a tile of
-/// points always takes the stride of [`SizeValve::Drop`]. See
-/// `overview::export::coalesce_valve`.
+/// points always takes [`SizeValve::Drop`], which keeps its best-ranked
+/// points. See `overview::export::coalesce_valve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum SizeValve {
@@ -314,7 +321,7 @@ pub enum SizeValve {
     #[default]
     Merge,
     /// Drop features until the tile fits: the largest sized geometries
-    /// survive, or a uniform stride of points. Every feature that remains
+    /// survive, or the best-ranked points, spread evenly. Every feature that remains
     /// keeps exactly its own geometry and attributes; dropped ones leave
     /// holes. The valve before #745 (which dropped once, without
     /// re-measuring).
@@ -350,6 +357,59 @@ impl std::str::FromStr for SizeValve {
         }
     }
 }
+
+/// How far the size valve's threshold reaches past the tile it fits (#768).
+///
+/// Applies with a size cap: to the merge valve's merge threshold
+/// ([`SizeValve::Merge`]) and to the share of its points a point tile keeps
+/// under [`SizeValve::Drop`].
+///
+/// DIVERGENCE FROM TIPPECANOE: tippecanoe's `--drop-densest-as-needed` and
+/// `--coalesce-densest-as-needed` keep one gap threshold per zoom: a tile
+/// too big raises it, and the zoom is rebuilt at the largest any tile
+/// needed (`tile.cpp`, `traverse_zooms`), so sparse tiles beside a dense
+/// one are thinned too. [`ValveScope::Zoom`] is that threshold, predicted
+/// from the export scan, in one pass; for points it is one kept share a
+/// zoom, as `--drop-fraction-as-needed` keeps. [`ValveScope::Tile`] fits each tile
+/// alone, as tylertoo did before #768, so the density can jump at a tile
+/// edge where one tile needed thinning and its neighbour did not.
+/// [`ValveScope::Smooth`] predicts each tile's need and starts every tile
+/// around it from that threshold faded by `1 / --valve-max-step` a tile, so
+/// the density steps down over several tiles and the rest of the zoom keeps
+/// its features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ValveScope {
+    /// The default. Each tile predicted over its cap starts from its
+    /// predicted threshold, and every tile around it, one that fits too,
+    /// from that threshold faded by `1 / --valve-max-step` a ring of tiles,
+    /// out to where it no longer thins anything (at most
+    /// `valve_predict::MAX_RINGS` rings). Under `merge` the threshold is a
+    /// merge gap; under `drop`, the share of its points a point tile keeps,
+    /// by rank, so a tile keeps at most `--valve-max-step` times its
+    /// neighbour's share.
+    #[default]
+    Smooth,
+    /// Each tile is thinned only as much as it needs on its own.
+    Tile,
+    /// Each tile starts from the largest threshold predicted at its zoom
+    /// (under `drop`, every point tile keeps the zoom's smallest predicted
+    /// share). Not shard-invariant, so refused with `--tile-range`.
+    Zoom,
+}
+
+impl ValveScope {
+    /// The value as the CLI spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Smooth => "smooth",
+            Self::Tile => "tile",
+            Self::Zoom => "zoom",
+        }
+    }
+}
+
+crate::tile_format::spelled_enum!(ValveScope, "valve scope", [Smooth, Tile, Zoom]);
 
 use crate::tile::WEBMERC_HALF_M;
 pub use crate::tile_format::{MltProfile, TileFormat};
@@ -420,6 +480,31 @@ pub struct ExportOptions {
     ))]
     #[cfg_attr(feature = "cli", arg(help = "How to reduce a tile over its cap: `merge` merges dense lines and polygons, drops singles, halves the extent down to 512, then drops whole features if needed. Merges keep the target's attributes and are never split into their sources. In a tile of lines or polygons, only a lone feature still over the cap at the extent floor is written over it, with a warning. `drop` removes features and keeps each survivor's attributes. Point tiles use dropping in both modes", long_help = None))]
     pub size_valve: SizeValve,
+    /// How far the size valve's threshold reaches past the tile it fits
+    /// (#768). Default [`ValveScope::Smooth`].
+    #[serde(with = "super::config::spelled")]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "smooth|tile|zoom",
+        default_value_t = ExportOptions::default().valve_scope
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "How far the size valve's thinning reaches past the tile that needs it: `smooth` predicts each tile's threshold from the export scan and fades it over the tiles around, so neighbouring tiles differ by at most `--valve-max-step` (in point tiles, in the share of points they keep) and the density steps down over several tiles instead of jumping at a tile edge; tiles near a dense one are thinned too. `tile` thins each tile only as much as it needs on its own: the most detail, with visible steps at tile edges. `zoom` starts every tile from the largest threshold predicted at its zoom, like tippecanoe's one threshold per zoom: no edges, the least detail; `--preset tippecanoe` sets it; not with --tile-range", long_help = None))]
+    pub valve_scope: ValveScope,
+    /// The largest density step `--valve-scope smooth` allows between
+    /// neighbouring tiles (#768): a tile keeps at most this many times the
+    /// share of points its neighbour keeps, or merges at most this many
+    /// times less hard. Each tile's floor fades by `1 / valve_max_step` a
+    /// ring and reaches out until it no longer thins anything, at most
+    /// `valve_predict::MAX_RINGS` (8) rings: a floor that would still thin
+    /// there fades at the even, larger step that ends it by then. Must be
+    /// finite and above 1; default 2; only under `smooth`.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "RATIO",
+        default_value_t = ExportOptions::default().valve_max_step
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "With `--valve-scope smooth`, the largest density step allowed between neighbouring tiles: a tile keeps at most RATIO times the points its neighbour keeps, or merges at most RATIO times less hard, so the thinning around a dense tile fades over the tiles beside it. The fade reaches at most 8 tiles out: a tile thinned more than RATIO^9 fades by the larger even step that ends there. 1.25 makes edges barely visible but spreads the thinning further; larger values come closer to `--valve-scope tile`. Must be above 1", long_help = None))]
+    pub valve_max_step: f64,
     /// Tile encoding, MVT by default. Each finished MVT tile is converted
     /// to MLT with mlt-core before gzip and both size caps, so the caps
     /// measure MLT bytes. MLT uses PMTiles tile type 6 and metadata format
@@ -699,6 +784,8 @@ with_setters!(ExportOptions {
     with_tile_size_limit => tile_size_limit: Option<usize>,
     with_compressed_tile_size_limit => compressed_tile_size_limit: Option<usize>,
     with_size_valve => size_valve: SizeValve,
+    with_valve_scope => valve_scope: ValveScope,
+    with_valve_max_step => valve_max_step: f64,
     with_tile_format => tile_format: TileFormat,
     with_mlt_profile => mlt_profile: MltProfile,
     with_coverage_fill => coverage_fill: bool,
@@ -727,6 +814,8 @@ impl Default for ExportOptions {
             tile_size_limit: Some(DEFAULT_TILE_SIZE_LIMIT),
             compressed_tile_size_limit: Some(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT),
             size_valve: SizeValve::Merge,
+            valve_scope: ValveScope::Smooth,
+            valve_max_step: 2.0,
             tile_format: TileFormat::Mvt,
             mlt_profile: MltProfile::Web,
             coverage_fill: false,
@@ -817,10 +906,30 @@ impl ExportOptions {
                 message: format!("{option} must be a finite number >= 0, got {factor}"),
             });
         }
+        if !(self.valve_max_step.is_finite() && self.valve_max_step > 1.0) {
+            let option = "--valve-max-step / valve_max_step";
+            return Err(ConfigError::InvalidSpec {
+                option,
+                message: format!(
+                    "{option} is the largest density step between neighbouring tiles and must \
+                     be a finite number above 1 (2 is the default), got {}",
+                    self.valve_max_step
+                ),
+            });
+        }
         if self.tile_format == TileFormat::Mlt && !crate::tile_format::MLT_SUPPORTED {
             return Err(ConfigError::InvalidSpec {
                 option: "--tile-format / tile_format",
                 message: "this build cannot write MLT: rebuild with the `mlt` cargo feature".into(),
+            });
+        }
+        if self.valve_scope != ValveScope::Smooth
+            && self.valve_max_step != Self::default().valve_max_step
+        {
+            return Err(ConfigError::OptionIgnored {
+                option: "valve_max_step",
+                command: "a --valve-scope tile or zoom export",
+                reason: "it sets how far --valve-scope smooth fades; pass --valve-scope smooth",
             });
         }
         if self.tile_format == TileFormat::Mvt && self.mlt_profile != MltProfile::default() {
@@ -853,6 +962,16 @@ impl ExportOptions {
             return Err(ConfigError::TileBufferTooWide {
                 buffer: self.tile_buffer,
                 max: MAX_TILE_BUFFER_PX,
+            });
+        }
+        if self.valve_scope == ValveScope::Zoom && self.tile_range.is_some() {
+            // A zoom's largest need comes from tiles a shard never reads.
+            return Err(ConfigError::InvalidSpec {
+                option: "--valve-scope / valve_scope",
+                message: "--valve-scope zoom takes each zoom's largest predicted need over the \
+                          whole input, which a shard (--tile-range) cannot see; use smooth or \
+                          tile (--preset tippecanoe sets zoom)"
+                    .into(),
             });
         }
         // #427: fail fast on a bad spill dir, the convert side's rule.
@@ -1506,6 +1625,55 @@ pub fn export_pmtiles(
     export_pmtiles_with_partition_target(input_path, output_path, options, DEFAULT_PARTITION_TARGET)
 }
 
+/// A tile's `(merge, drop)` valve floors ([`predicted_valve_floors`]).
+#[doc(hidden)]
+pub type FloorPair = (u64, u64);
+
+/// #768: the valve floors an export of `overview` under `options` starts
+/// its tiles from, keyed `(zoom, tile id)`, as `(merge, drop)`: for the
+/// shard parity oracle, which compares a shard's floors with the monolithic
+/// build's.
+///
+/// # Errors
+///
+/// As [`export_pmtiles`], for the scan and the price samples.
+#[doc(hidden)]
+pub fn predicted_valve_floors(
+    overview: &Path,
+    options: &ExportOptions,
+) -> Result<BTreeMap<(u8, u64), FloorPair>, ExportError> {
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    let reader = OverviewReader::open(overview)?;
+    let crs = crs_from_descriptor(reader.resolved_schema(), overview, &diagnostics)?;
+    let zooms = resolve_level_zooms(reader.meta(), reader.num_levels())?;
+    let mut budget = export_budget();
+    let band = BandRead {
+        source: reader.source(),
+        budget,
+        profile: options.profile,
+    };
+    let cols = resolve_export_columns((&reader, band), options, &zooms)?;
+    let (_, floors) = scan_with_floors(
+        &reader,
+        crs,
+        (&cols.published, cols.feature_id.as_ref()),
+        (options, &zooms),
+        &mut budget,
+        (&ExportTimers::default(), None),
+        &diagnostics,
+    )?;
+    Ok(floors
+        .merge
+        .tiles
+        .keys()
+        .chain(floors.drop.tiles.keys())
+        .map(|&(z, x, y)| {
+            let f = floors.for_tile((z, x, y));
+            ((z, tile_key(x, y, z)), (f.merge, f.drop))
+        })
+        .collect())
+}
+
 /// Intermediate archives run their ordinary valves; only over-limit tile
 /// reporting at shared zooms belongs to the merge.
 pub(crate) fn export_pmtiles_for_join(
@@ -1872,8 +2040,8 @@ fn export_pmtiles_validated(
         });
     }
     // #498: the read-pruning safety bound. A shard's convert prunes input row
-    // groups against its tile range widened by `SHARD_READ_MARGIN_TILES`
-    // pivot tiles; a buffer wider than that margin would let a feature render
+    // groups against its tile range widened by at least
+    // `SHARD_BUFFER_MARGIN_TILES` pivot tiles; a buffer wider than that margin would let a feature render
     // into a shard's tile from a row group the shard never read. Since #433
     // the universal `MAX_TILE_BUFFER_PX` cap (checked in `validate` above) is
     // at most that margin, so no buffer that reaches here can breach it; the
@@ -1996,17 +2164,18 @@ fn export_pmtiles_validated(
             variable_depth::VdScan::new(&meta, reader.geo_metadata_json(), level_zooms.clone())
         })
         .transpose()?;
-    let mut scans = scan_all_levels(
+    // #768: the valve floors, from the whole scan (before a shard restricts
+    // it). Each tile's need comes from its own members alone, so a shard,
+    // which holds every row of the tiles in its range and of their
+    // neighbours (`shard::SHARD_READ_MARGIN_TILES`), predicts the floors the
+    // full build does.
+    let (mut scans, floors) = scan_with_floors(
         &reader,
-        BandRead {
-            source: reader.source(),
-            budget: *budget,
-            profile: options.profile,
-        },
         crs,
-        options,
-        &timers,
-        vd_scan.as_mut(),
+        (&published, feature_id.as_ref()),
+        (options, &level_zooms),
+        budget,
+        (&timers, vd_scan.as_mut()),
         diagnostics,
     )?;
 
@@ -2267,6 +2436,7 @@ fn export_pmtiles_validated(
         level_read,
         member_bytes,
         pins: pins.as_ref(),
+        floors: Some(&floors),
         #[cfg(test)]
         work: &work,
     };

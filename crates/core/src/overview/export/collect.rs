@@ -32,7 +32,7 @@ pub(super) fn process_wave(
         ctx.gzip_cache,
         (buckets, None),
         ctx.zoom,
-        &TileEncoding::single(ctx.opts),
+        &TileEncoding::single(ctx.opts).with_floors(ctx.floors),
         ctx.fills,
         ctx.timers,
         diagnostics,
@@ -1078,6 +1078,7 @@ pub(super) fn collect_member_chunk(
             out.buckets[route_partition(input.wave, key)].push(Member {
                 key,
                 seq: source_row,
+                rank: attrs.rank(i, source_row),
                 geom,
                 props: props.clone(),
                 id,
@@ -2087,6 +2088,7 @@ mod tests {
                 Member {
                     key: 0,
                     seq: i,
+                    rank: point_rank(i),
                     geom: Geometry::Polygon(
                         geo::Rect::new(
                             geo::coord! { x: x, y: y },
@@ -2320,6 +2322,7 @@ mod tests {
         let half = |lng0: f64, lng1: f64, name: &str, id: u64| Member {
             key: 0,
             seq: 0,
+            rank: point_rank(0),
             geom: Geometry::Polygon(
                 geo::Rect::new(
                     geo::coord! { x: lng0, y: tb.lat_min },
