@@ -874,9 +874,9 @@ pub struct ConvertOptions {
     ///
     /// Pruning here is what makes a shard cheaper than the whole build, and
     /// it is safe because a row group is dropped only when its bbox does not
-    /// reach the range widened by the read margin ([`Self::shard_read`]),
-    /// past the export's edge buffer and, by default, its valve floors' reach. A feature inside such a group cannot land in a tile
-    /// this shard owns.
+    /// reach the range widened by the read margin, past the export's edge
+    /// buffer and, by default, its valve floors' reach. A feature inside such
+    /// a group cannot land in a tile this shard owns.
     ///
     /// This is **not** fingerprinted: the shard tiles the same input with the
     /// same thinning options as the plan and only narrows which row groups it
