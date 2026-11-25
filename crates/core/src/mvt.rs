@@ -893,46 +893,52 @@ impl QuantizedPolygons {
         let mut keys = Vec::new();
         // Keep projection parallel without staging every feature's outer
         // polygon Vec beside the flattened parts of the whole tile.
-        for (geometries, feature_keys) in geometries.chunks(4096).zip(feature_keys.chunks(4096)) {
-            let quantize = |g: &&Geometry| {
-                #[cfg(test)]
-                let _count_rings = crate::valve_counter::quantizing();
-                let (parts, multi) = match g {
-                    Geometry::Polygon(p) => (quantized_polygons(p, &proj), false),
-                    Geometry::MultiPolygon(mp) => (
-                        mp.0.iter()
-                            .flat_map(|p| quantized_polygons(p, &proj))
-                            .collect(),
-                        true,
-                    ),
-                    Geometry::Rect(r) => (quantized_polygons(&r.to_polygon(), &proj), false),
-                    Geometry::Triangle(t) => (quantized_polygons(&t.to_polygon(), &proj), false),
-                    _ => return None,
+        crate::tile_trace::stage(crate::tile_trace::Stage::QProject, || {
+            for (geometries, feature_keys) in geometries.chunks(4096).zip(feature_keys.chunks(4096))
+            {
+                let quantize = |g: &&Geometry| {
+                    #[cfg(test)]
+                    let _count_rings = crate::valve_counter::quantizing();
+                    let (parts, multi) = match g {
+                        Geometry::Polygon(p) => (quantized_polygons(p, &proj), false),
+                        Geometry::MultiPolygon(mp) => (
+                            mp.0.iter()
+                                .flat_map(|p| quantized_polygons(p, &proj))
+                                .collect(),
+                            true,
+                        ),
+                        Geometry::Rect(r) => (quantized_polygons(&r.to_polygon(), &proj), false),
+                        Geometry::Triangle(t) => {
+                            (quantized_polygons(&t.to_polygon(), &proj), false)
+                        }
+                        _ => return None,
+                    };
+                    Some((parts, multi, g.coords_count() > 0))
                 };
-                Some((parts, multi, g.coords_count() > 0))
-            };
-            let quantized: Vec<Option<Quantized>> = crate::tile_trace::wait("quantize", |site| {
-                geometries
-                    .par_iter()
-                    .map(|g| site.body(|| quantize(g)))
-                    .collect()
-            });
-            let count = quantized.iter().flatten().map(|(p, _, _)| p.len()).sum();
-            parts.reserve(count);
-            keys.reserve(count);
-            for (q, &key) in quantized.into_iter().zip(feature_keys) {
-                features.push(q.map(|(p, multi, has_coords)| {
-                    let start = parts.len();
-                    keys.extend(std::iter::repeat_n(key, p.len()));
-                    parts.extend(p);
-                    QuantizedFeature {
-                        parts: start..parts.len(),
-                        multi,
-                        has_coords,
-                    }
-                }));
+                let quantized: Vec<Option<Quantized>> =
+                    crate::tile_trace::wait("quantize", |site| {
+                        geometries
+                            .par_iter()
+                            .map(|g| site.body(|| quantize(g)))
+                            .collect()
+                    });
+                let count = quantized.iter().flatten().map(|(p, _, _)| p.len()).sum();
+                parts.reserve(count);
+                keys.reserve(count);
+                for (q, &key) in quantized.into_iter().zip(feature_keys) {
+                    features.push(q.map(|(p, multi, has_coords)| {
+                        let start = parts.len();
+                        keys.extend(std::iter::repeat_n(key, p.len()));
+                        parts.extend(p);
+                        QuantizedFeature {
+                            parts: start..parts.len(),
+                            multi,
+                            has_coords,
+                        }
+                    }));
+                }
             }
-        }
+        });
         let features_len = features.len();
         let parts_len = parts.len();
         drop(geometries);
@@ -947,29 +953,34 @@ impl QuantizedPolygons {
         // allocate millions of pairs only to discard them at the cap.
         // Per-part degrees also give exact capacities on the stored path.
         let mut degrees = vec![0usize; parts.len()];
-        let too_many = strip_box_pairs(&boxes, |i, j| {
-            if keys[i] == keys[j] {
-                degrees[i] += 1;
-                degrees[j] += 1;
-                slots += 1;
-            }
-            slots > max_slots
+        let too_many = crate::tile_trace::stage(crate::tile_trace::Stage::QBoxPairs1, || {
+            strip_box_pairs(&boxes, |i, j| {
+                if keys[i] == keys[j] {
+                    degrees[i] += 1;
+                    degrees[j] += 1;
+                    slots += 1;
+                }
+                slots > max_slots
+            })
         });
         #[cfg(test)]
         crate::valve_counter::note(|c| c.candidate_pairs += slots as usize);
         let candidates = if too_many {
+            crate::tile_trace::note(crate::tile_trace::Count::Dense);
             slots = 0;
             None
         } else {
             let mut candidates: Vec<_> = degrees.into_iter().map(Vec::with_capacity).collect();
             slots = 0;
-            strip_box_pairs(&boxes, |i, j| {
-                if keys[i] == keys[j] {
-                    candidates[i].push((j as u32, slots));
-                    candidates[j].push((i as u32, slots));
-                    slots += 1;
-                }
-                false
+            crate::tile_trace::stage(crate::tile_trace::Stage::QBoxPairs2, || {
+                strip_box_pairs(&boxes, |i, j| {
+                    if keys[i] == keys[j] {
+                        candidates[i].push((j as u32, slots));
+                        candidates[j].push((i as u32, slots));
+                        slots += 1;
+                    }
+                    false
+                })
             });
             Some(candidates)
         };
@@ -1043,7 +1054,9 @@ impl QuantizedPolygons {
         };
         if let Some(u) = found {
             crate::tile_trace::note(crate::tile_trace::Count::UnionHit);
-            return u.as_ref().clone();
+            return crate::tile_trace::stage(crate::tile_trace::Stage::EClone, || {
+                u.as_ref().clone()
+            });
         }
         crate::tile_trace::note(crate::tile_trace::Count::UnionMiss);
         let pieces = std::sync::Arc::new(union_group(group, parts));
@@ -1052,7 +1065,7 @@ impl QuantizedPolygons {
             .expect("union cache")
             .unions
             .insert(key, std::sync::Arc::clone(&pieces));
-        pieces.as_ref().clone()
+        crate::tile_trace::stage(crate::tile_trace::Stage::EClone, || pieces.as_ref().clone())
     }
 
     /// The encoded geometry of `group` (feature indices, the kept feature
@@ -1100,7 +1113,10 @@ impl QuantizedPolygons {
         };
         if let Some(Some(repair)) = &known {
             repair.record(diagnostics);
-            return Some(encoded(encode_finalized(&repair.parts)));
+            return Some(encoded(crate::tile_trace::stage(
+                crate::tile_trace::Stage::ECommands,
+                || encode_finalized(&repair.parts),
+            )));
         }
         let globals: Vec<usize> = feats.iter().flat_map(|f| f.parts.clone()).collect();
         // Parts with different keys are never tested against each other, so
@@ -1111,19 +1127,24 @@ impl QuantizedPolygons {
                 .all(|w| self.keys[w[0]] == self.keys[w[1]]),
             "a merged group spans merge keys"
         );
-        let polys: Vec<Vec<TileRing>> = globals.iter().map(|&g| self.parts[g].clone()).collect();
+        let polys: Vec<Vec<TileRing>> =
+            crate::tile_trace::stage(crate::tile_trace::Stage::EClone, || {
+                globals.iter().map(|&g| self.parts[g].clone()).collect()
+            });
         let resolve = !matches!(feats[..], [only] if !only.multi);
         let polys = if resolve {
             union_interacting_with(
                 polys,
                 |parts, join| {
-                    if let Some(candidates) = &self.candidates {
-                        self.pairs_within(&globals, candidates)
-                            .iter()
-                            .for_each(|&(i, j)| join(i, j, &|| true));
-                    } else {
-                        self.dense_pairs(leader, group, parts, join);
-                    }
+                    crate::tile_trace::stage(crate::tile_trace::Stage::EPairs, || {
+                        if let Some(candidates) = &self.candidates {
+                            self.pairs_within(&globals, candidates)
+                                .iter()
+                                .for_each(|&(i, j)| join(i, j, &|| true));
+                        } else {
+                            self.dense_pairs(leader, group, parts, join);
+                        }
+                    })
                 },
                 |group, parts| self.union_cached(group, parts, &globals),
             )
@@ -1132,7 +1153,10 @@ impl QuantizedPolygons {
         };
         if known.is_some() {
             // Valid when this group was last finalized.
-            return Some(encoded(encode_finalized(&polys)));
+            return Some(encoded(crate::tile_trace::stage(
+                crate::tile_trace::Stage::ECommands,
+                || encode_finalized(&polys),
+            )));
         }
         let (parts, repair) = match tile_polygon::finalize(polys) {
             tile_polygon::Finalized::Valid(parts) => (parts, None),
@@ -1142,7 +1166,9 @@ impl QuantizedPolygons {
                 (Vec::new(), Some(repair))
             }
         };
-        let commands = encode_finalized(repair.as_ref().map_or(&parts, |r| &r.parts));
+        let commands = crate::tile_trace::stage(crate::tile_trace::Stage::ECommands, || {
+            encode_finalized(repair.as_ref().map_or(&parts, |r| &r.parts))
+        });
         if lone {
             self.lone[leader].store(if repair.is_some() { 2 } else { 1 }, Relaxed);
         }

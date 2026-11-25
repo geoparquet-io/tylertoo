@@ -96,6 +96,39 @@ pub(crate) fn event(ev: &'static str, fields: impl FnOnce() -> Value) {
     }
 }
 
+/// Stages, waits, bodies and jobs this long or longer also emit a `span`
+/// event, so a tile's thread can be followed in time.
+const SPAN_MIN_NS: u64 = 1_000_000;
+
+/// Emit a `span` of `kind` and `name` at `ctx` over `(start, end)`.
+fn emit_span(
+    ctx: Ctx,
+    kind: &'static str,
+    name: &'static str,
+    owner: bool,
+    (start, end): (u64, u64),
+) {
+    let mut v = json!({
+        "kind": kind,
+        "name": name,
+        "owner": owner,
+        "start_ns": start,
+        "end_ns": end,
+    });
+    ctx.fields(&mut v);
+    emit("span", v);
+}
+
+/// [`emit_span`] at this thread's innermost frame, when at least
+/// [`SPAN_MIN_NS`] long.
+fn long_span(kind: &'static str, name: &'static str, owner: bool, (start, end): (u64, u64)) {
+    if end.saturating_sub(start) >= SPAN_MIN_NS {
+        if let Ok(ctx) = LOCAL.try_with(|l| l.borrow().ctx()) {
+            emit_span(ctx, kind, name, owner, (start, end));
+        }
+    }
+}
+
 /// Where a frame's work sits in the export: its tile (a PMTiles tile id),
 /// zoom, level, wave and partition, each when known.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -181,6 +214,25 @@ fn os_tid() -> u64 {
     u64::try_from(unsafe { libc::gettid() }).unwrap_or(0)
 }
 
+/// `CLOCK_MONOTONIC` now, for lining the trace up with `perf record -k
+/// CLOCK_MONOTONIC` samples (`t_ns` + the start event's `mono_ns`).
+#[cfg(target_os = "linux")]
+fn mono_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid timespec; CLOCK_MONOTONIC always exists.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
+    secs * 1_000_000_000 + u64::try_from(ts.tv_nsec).unwrap_or(0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mono_ns() -> u64 {
+    0
+}
+
 #[cfg(not(target_os = "linux"))]
 fn os_tid() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -203,7 +255,7 @@ struct Frame {
     stolen_ns: u64,
     foreign_ns: u64,
     /// The pass context and stage mask this frame replaced.
-    saved: (Option<(Arc<PassAcc>, bool)>, u8),
+    saved: (Option<(Arc<PassAcc>, bool)>, u16),
 }
 
 enum Entry {
@@ -218,7 +270,7 @@ struct Local {
     /// The valve pass this thread works for, and whether it owns it.
     pass: Option<(Arc<PassAcc>, bool)>,
     /// The [`Stage`]s open on this thread for the current pass context.
-    stages: u8,
+    stages: u16,
 }
 
 thread_local! {
@@ -460,6 +512,7 @@ impl Session {
             json!({
                 "pid": std::process::id(),
                 "threads": rayon::current_num_threads(),
+                "mono_ns": mono_ns(),
                 "unix_secs": std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0.0, |d| d.as_secs_f64()),
@@ -585,7 +638,16 @@ impl Site {
         let pass = self.pass.as_ref().map(|p| (Arc::clone(p), false));
         let guard = FrameGuard::push(Kind::Body, ctx, pass);
         let r = f();
-        if let Some((_, wall)) = guard.pop() {
+        if let Some((frame, wall)) = guard.pop() {
+            if wall >= SPAN_MIN_NS {
+                emit_span(
+                    ctx,
+                    "body",
+                    self.name,
+                    false,
+                    (frame.start, frame.start + wall),
+                );
+            }
             record_wait(self.key(), |a| {
                 a.bodies += 1;
                 a.core_ns += wall;
@@ -635,7 +697,9 @@ fn wait_traced<R>(name: &'static str, f: impl FnOnce(&Site) -> R) -> R {
     let pop = Pop;
     let r = f(&site);
     drop(pop);
-    let wall = now_ns().saturating_sub(start);
+    let end = now_ns();
+    let wall = end.saturating_sub(start);
+    long_span("wait", name, false, (start, end));
     record_wait(site.key(), |a| {
         a.calls += 1;
         a.wall_ns += wall;
@@ -653,7 +717,17 @@ pub(crate) fn job<R>(ctx: impl FnOnce() -> Ctx, f: impl FnOnce() -> R) -> R {
     }
     let guard = FrameGuard::push(Kind::Job, ctx(), None);
     let r = f();
-    drop(guard);
+    if let Some((frame, wall)) = guard.pop() {
+        if wall >= SPAN_MIN_NS {
+            emit_span(
+                frame.ctx,
+                "job",
+                "job",
+                false,
+                (frame.start, frame.start + wall),
+            );
+        }
+    }
     r
 }
 
@@ -719,16 +793,46 @@ pub(crate) enum Stage {
     Union,
     Finalize,
     Gzip,
+    /// Inside `quantize`: projecting and flattening the parts (its parallel
+    /// `quantize` site included).
+    QProject,
+    /// Inside `quantize`: the counting `strip_box_pairs` sweep.
+    QBoxPairs1,
+    /// Inside `quantize`: the storing sweep (the stored path only).
+    QBoxPairs2,
+    /// One feature's geometry encode in a layer build (`encode` closure).
+    EncodeGeom,
+    /// Inside a cached encode: cloning parts and cached unions.
+    EClone,
+    /// Inside a cached union: finding the interacting pairs.
+    EPairs,
+    /// Inside a cached encode: the finalized parts to commands.
+    ECommands,
+    /// A layer build's serial feature add (tags interned).
+    LAdd,
+    /// A layer build's `layer.build()` and `finish_tile`.
+    LFinish,
 }
 
-const STAGES: [(Stage, &str); 6] = [
+const STAGES: [(Stage, &str); N_STAGES] = [
     (Stage::Coalesce, "coalesce"),
     (Stage::Build, "build"),
     (Stage::Quantize, "quantize"),
     (Stage::Union, "union"),
     (Stage::Finalize, "finalize"),
     (Stage::Gzip, "gzip"),
+    (Stage::QProject, "q_project"),
+    (Stage::QBoxPairs1, "q_box_pairs_1"),
+    (Stage::QBoxPairs2, "q_box_pairs_2"),
+    (Stage::EncodeGeom, "encode_geom"),
+    (Stage::EClone, "e_clone"),
+    (Stage::EPairs, "e_pairs"),
+    (Stage::ECommands, "e_commands"),
+    (Stage::LAdd, "l_add"),
+    (Stage::LFinish, "l_finish"),
 ];
+
+const N_STAGES: usize = 15;
 
 /// Counts a valve pass keeps beside its stage times ([`note`]).
 #[derive(Clone, Copy, Debug)]
@@ -736,15 +840,17 @@ pub(crate) enum Count {
     UnionHit,
     UnionMiss,
     Repaired,
+    /// A quantized tile took the dense (on-demand sweep) path.
+    Dense,
 }
 
 /// One valve pass's accumulators, shared with the pool threads that run
 /// its parallel work.
 #[derive(Default)]
 pub(crate) struct PassAcc {
-    core: [AtomicU64; 6],
-    wall: [AtomicU64; 6],
-    counts: [AtomicU64; 3],
+    core: [AtomicU64; N_STAGES],
+    wall: [AtomicU64; N_STAGES],
+    counts: [AtomicU64; 4],
     largest_component: AtomicU64,
 }
 
@@ -761,13 +867,13 @@ pub(crate) fn stage<R>(s: Stage, f: impl FnOnce() -> R) -> R {
 }
 
 fn stage_traced<R>(s: Stage, f: impl FnOnce() -> R) -> R {
-    struct Close(u8);
+    struct Close(u16);
     impl Drop for Close {
         fn drop(&mut self) {
             let _ = LOCAL.try_with(|l| l.borrow_mut().stages &= !self.0);
         }
     }
-    let bit = 1u8 << s as u8;
+    let bit = 1u16 << s as u16;
     let open = LOCAL.with(|l| {
         let mut l = l.borrow_mut();
         if l.stages & bit != 0 {
@@ -781,14 +887,16 @@ fn stage_traced<R>(s: Stage, f: impl FnOnce() -> R) -> R {
         return f();
     };
     let close = Close(bit);
-    let t0 = Instant::now();
+    let start = now_ns();
     let r = f();
-    let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let end = now_ns();
+    let ns = end.saturating_sub(start);
     drop(close);
     acc.core[s as usize].fetch_add(ns, Relaxed);
     if owner {
         acc.wall[s as usize].fetch_add(ns, Relaxed);
     }
+    long_span("stage", STAGES[s as usize].1, owner, (start, end));
     r
 }
 
@@ -827,7 +935,7 @@ struct PassOpen {
     index: u32,
     threshold: u64,
     start: u64,
-    saved: (Option<(Arc<PassAcc>, bool)>, u8),
+    saved: (Option<(Arc<PassAcc>, bool)>, u16),
 }
 
 /// Open pass `index` of kind `kind` (`merge`, `drop`, `halve`,
@@ -868,7 +976,7 @@ impl PassSpan {
             (l.pass, l.stages) = (open.saved.0.clone(), open.saved.1);
             l.ctx()
         });
-        let stage_map = |a: &[AtomicU64; 6]| -> Value {
+        let stage_map = |a: &[AtomicU64; N_STAGES]| -> Value {
             STAGES
                 .iter()
                 .map(|&(s, name)| (name.to_string(), a[s as usize].load(Relaxed).into()))
@@ -891,6 +999,7 @@ impl PassSpan {
             "union_hits": acc.counts[Count::UnionHit as usize].load(Relaxed),
             "union_misses": acc.counts[Count::UnionMiss as usize].load(Relaxed),
             "repaired": acc.counts[Count::Repaired as usize].load(Relaxed),
+            "dense": acc.counts[Count::Dense as usize].load(Relaxed),
             "largest_component_vertices": acc.largest_component.load(Relaxed),
         });
         ctx.fields(&mut v);

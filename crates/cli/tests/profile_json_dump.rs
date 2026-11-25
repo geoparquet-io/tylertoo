@@ -1461,4 +1461,37 @@ fn tile_trace_has_one_tile_event_per_written_tile_and_changes_no_byte() {
     assert!(of("wait").any(|w| w["site"] == "tiles" && w["calls"].as_u64() > Some(0)));
     assert!(of("occ").count() >= 1);
     assert!(of("phase").any(|p| p["phase"] == "levels"));
+    assert!(
+        of("start").all(|s| s["mono_ns"].as_u64() > Some(0)),
+        "start carries the monotonic anchor for perf"
+    );
+    let quantized: Vec<_> = of("pass")
+        .filter(|p| p["core_ns"]["quantize"].as_u64() > Some(0))
+        .collect();
+    assert!(!quantized.is_empty(), "a merge pass quantizes the tile");
+    for p in quantized {
+        let ns = |k: &str| {
+            p["core_ns"][k]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{k}: {p}"))
+        };
+        assert!(ns("q_project") > 0 && ns("q_box_pairs_1") > 0, "{p}");
+        assert!(
+            ns("q_project") + ns("q_box_pairs_1") + ns("q_box_pairs_2") <= ns("quantize"),
+            "{p}"
+        );
+        assert!(p["dense"].is_u64(), "{p}");
+    }
+    assert!(of("pass").any(|p| p["core_ns"]["l_finish"].as_u64() > Some(0)));
+    for s in of("span") {
+        let (a, b) = (
+            s["start_ns"].as_u64().unwrap(),
+            s["end_ns"].as_u64().unwrap(),
+        );
+        assert!(b >= a + 1_000_000, "a span is at least 1 ms: {s}");
+        assert!(
+            ["stage", "wait", "body", "job"].contains(&s["kind"].as_str().unwrap()),
+            "{s}"
+        );
+    }
 }

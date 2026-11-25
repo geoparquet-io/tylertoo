@@ -1,4 +1,5 @@
 use super::*;
+use crate::tile_trace::Stage;
 
 /// Within-tile feature order (#361).
 ///
@@ -1312,11 +1313,12 @@ pub(super) fn build_tile_layers_with<M: TileFeature>(
         out.source_ids.extend(layer.source_ids);
         out.source_losses.extend(layer.source_losses);
     }
-    let (data, error) =
-        match crate::tile_format::finish_tile(bytes, opts.tile_format, opts.mlt_profile) {
-            Ok(data) => (data, None),
-            Err(e) => (Vec::new(), Some(e)),
-        };
+    let (data, error) = match crate::tile_trace::stage(Stage::LFinish, || {
+        crate::tile_format::finish_tile(bytes, opts.tile_format, opts.mlt_profile)
+    }) {
+        Ok(data) => (data, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
     out.data = data.into();
     out.mlt_error = error;
     out
@@ -1385,21 +1387,30 @@ pub(super) fn build_mvt_within<M: TileFeature>(
         for chunk in members.chunks(GEOMETRY_CHUNK_MEMBERS) {
             let encoded: Vec<EncodedFeatureGeometry> =
                 crate::tile_trace::wait("geometry_chunks", |site| {
-                    chunk.par_iter().map(|m| site.body(|| encode(m))).collect()
+                    chunk
+                        .par_iter()
+                        .map(|m| {
+                            site.body(|| crate::tile_trace::stage(Stage::EncodeGeom, || encode(m)))
+                        })
+                        .collect()
                 });
-            for (m, geom) in chunk.iter().zip(encoded) {
-                track(m.feature_id().map(|_| m.source_row()), &geom);
-                layer.add_borrowed_feature(m.feature_id(), geom, m.properties().iter());
-            }
+            crate::tile_trace::stage(Stage::LAdd, || {
+                for (m, geom) in chunk.iter().zip(encoded) {
+                    track(m.feature_id().map(|_| m.source_row()), &geom);
+                    layer.add_borrowed_feature(m.feature_id(), geom, m.properties().iter());
+                }
+            });
             if layer.encoded_len() > raw_limit {
                 return None;
             }
         }
     } else {
         for m in members {
-            let geom = encode(m);
-            track(m.feature_id().map(|_| m.source_row()), &geom);
-            layer.add_borrowed_feature(m.feature_id(), geom, m.properties().iter());
+            let geom = crate::tile_trace::stage(Stage::EncodeGeom, || encode(m));
+            crate::tile_trace::stage(Stage::LAdd, || {
+                track(m.feature_id().map(|_| m.source_row()), &geom);
+                layer.add_borrowed_feature(m.feature_id(), geom, m.properties().iter());
+            });
             if layer.encoded_len() > raw_limit {
                 return None;
             }
@@ -1410,11 +1421,12 @@ pub(super) fn build_mvt_within<M: TileFeature>(
     let features = layer.feature_count() - fill.len();
     let unencodable = layer.dropped_features();
     let quantized = layer.quantized_features();
-    let (data, mlt_error) =
-        match crate::tile_format::finish_tile(layer.build(), opts.tile_format, opts.mlt_profile) {
-            Ok(data) => (data, None),
-            Err(e) => (Vec::new(), Some(e)),
-        };
+    let (data, mlt_error) = match crate::tile_trace::stage(Stage::LFinish, || {
+        crate::tile_format::finish_tile(layer.build(), opts.tile_format, opts.mlt_profile)
+    }) {
+        Ok(data) => (data, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
     Some(TileMvt {
         gzip_cache: Arc::clone(gzip_cache),
         source_ids,
