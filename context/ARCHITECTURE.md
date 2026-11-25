@@ -733,6 +733,30 @@ tables, and so the bytes, do not change. The gzip of one tile stays
 single-threaded, because a parallel deflate would change the compressed
 bytes.
 
+**The in-tile maps do not use nested `par_iter` (#876).** The member
+geometry encode (`geometry_chunks` in `build_mvt_within`) and the ring
+quantization in `QuantizedPolygons::new` (`mvt.rs`) run inside the
+per-tile parallel section, so they are nested rayon calls. A nested
+`par_iter` caller that waits for a stolen piece runs whatever rayon hands
+it, and a worker holding a stolen piece can do the same. Either way, the
+map ends only after an unrelated job, often another tile's whole encode,
+finishes. Traced on Moldova at `--simplify-factor 0`, the longest tiles
+spent 85–95% of their wall in that wait.
+
+Both sites call `owner_map` (`crates/core/src/owner_map.rs`) instead. The
+calling thread claims short batches from a shared counter, and the helpers
+it spawns onto the same pool claim from that counter too. When none are
+left, the caller blocks on a condvar until the batches already claimed
+finish. It never runs other rayon jobs while it waits. A helper that
+starts after the map closed finds nothing to claim and returns. Results
+keep input order, so tile bytes are unchanged. On Moldova
+`--simplify-factor 0` the worst tile fell from 7.2 s to 2.35 s and the
+whole run from 10.3 s to 8.5 s. The closure is borrowed, so the helpers
+reach it through a lifetime-erased pointer (`unsafe`). The caller closes
+admission and drains claimed batches before the closure can drop, on
+return and on unwind. `rayon::scope` cannot replace this, because the
+scope's end also waits by running other rayon jobs.
+
 Border duplication is the expected delta between overview level counts and
 export per-zoom feature totals (a feature spanning a tile seam appears in
 every tile it touches): 0% while a level fits one tile, ~7% at z14 on
