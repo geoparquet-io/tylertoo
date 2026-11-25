@@ -723,8 +723,11 @@ archive is byte-identical (`concurrent_levels_are_byte_identical_to_serial`
 and `level_groups_commit_and_checkpoint_every_level_in_order` cover every
 pass-2 path). A checkpoint after level `z` covers only levels that are fully
 written. When a level fails, every coarser level of its group is already
-written and, when due, checkpointed. A multi-wave level, or a level that
-alone exceeds the cap, is a group of one and runs the unchanged wave loop.
+written and, when due, checkpointed. Under `bounded`, a level that alone
+exceeds the cap is a group of one and runs the unchanged wave loop. Under
+`auto` and `speed` every level joins one group (#876): the gate admits an
+over-cap wave only once nothing else is held, as the serial loop holds it,
+so the next level's store fills beside its encode instead of after it.
 
 Inside a tile, `build_mvt` encodes member geometries in parallel once the
 tile holds at least `PARALLEL_ENCODE_MIN_COORDS` (4,096) vertices over two or

@@ -1243,7 +1243,12 @@ proptest::proptest! {
             proptest::prop_assert!(gate.cap <= member_cap && gate.single_wave_cap <= member_cap);
             let overlap = profile != MemoryProfile::Bounded;
             proptest::prop_assert_eq!(gate.overlap, overlap);
-            for g in groups.iter().filter(|g| g.len() > 1) {
+            // #876: overlapping, the gate, not the group, bounds what is
+            // held, so every level shares one group.
+            if overlap && gate.waves {
+                proptest::prop_assert!(groups.len() <= 1, "{groups:?}");
+            }
+            for g in groups.iter().filter(|g| g.len() > 1 && !(overlap && gate.waves)) {
                 let singles: Vec<&LevelPlan> =
                     plans[g.clone()].iter().filter(|p| single(p)).collect();
                 proptest::prop_assert!(singles.iter().all(|p| members(p) <= member_cap));
@@ -1327,10 +1332,10 @@ fn plan_level_groups_coalesces_single_wave_levels_under_the_cap() {
         plan_level_groups(&plans, 100, (false, true)),
         vec![0..5, 5..6, 6..7, 7..8],
     );
-    assert_eq!(
-        plan_level_groups(&plans, 100, (true, true)),
-        vec![0..6, 6..7, 7..8],
-    );
+    // #876: with both, a level alone over the cap joins too: the gate
+    // admits its wave once nothing else is held, as the serial loop
+    // holds it, and the next level's store fills beside its encode.
+    assert_eq!(plan_level_groups(&plans, 100, (true, true)), vec![0..8]);
     let joined = plan_level_groups(&multi_first, 100, (true, true));
     assert!(joined.len() == 1 && joined[0] == (0..2), "{joined:?}");
 }
@@ -1338,8 +1343,8 @@ fn plan_level_groups_coalesces_single_wave_levels_under_the_cap() {
 /// A single-wave level joins the open group when it alone fits the
 /// member cap, whatever the group already holds: the in-flight gate, not
 /// the group's sum, bounds what is held, so the finest level's collect
-/// overlaps the coarser levels' last encodes. A level over the cap still
-/// runs alone.
+/// overlaps the coarser levels' last encodes. A level over the cap runs
+/// alone under `bounded`; overlapping, it joins as well (#876).
 #[test]
 fn a_single_wave_level_joins_the_open_group_when_it_alone_fits_the_cap() {
     let fits = vec![
@@ -1358,7 +1363,16 @@ fn a_single_wave_level_joins_the_open_group_when_it_alone_fits_the_cap() {
         plan_with_members(11, &[20], 6),
         plan_with_members(12, &[50], 6), // 50 > 40
     ];
-    assert_eq!(plan_level_groups(&over, 40, (true, true)), vec![0..2, 2..3]);
+    assert_eq!(
+        plan_level_groups(&over, 40, (true, false)),
+        vec![0..2, 2..3]
+    );
+    assert_eq!(plan_level_groups(&over, 40, (true, true)), vec![0..3]);
+    // Without overlapping waves (the serial oracle) it still runs alone.
+    assert_eq!(
+        plan_level_groups(&over, 40, (false, true)),
+        vec![0..2, 2..3]
+    );
 }
 
 /// #817: a group's members in flight never exceed the export's largest

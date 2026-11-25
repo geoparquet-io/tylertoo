@@ -18,8 +18,11 @@ use super::*;
 /// group to end. Without it (`bounded`) the group's summed members also stay
 /// within `member_cap`, so bounded's peak does not rise. A multi-wave level,
 /// or a level that alone exceeds the cap, is a group of one and exports
-/// through the unchanged wave loop. A `member_cap` of 0 is the serial
-/// schedule, one level per group.
+/// through the unchanged wave loop, unless `waves` and `overlap` are both
+/// on (#876): then every level joins, since the gate admits a wave over its
+/// cap only once nothing else is held, as the serial loop holds it, and the
+/// next level's store fills beside its encode instead of after it. A
+/// `member_cap` of 0 is the serial schedule, one level per group.
 pub(super) fn plan_level_groups(
     plans: &[LevelPlan],
     member_cap: usize,
@@ -33,7 +36,7 @@ pub(super) fn plan_level_groups(
     for (i, plan) in plans.iter().enumerate() {
         let members: usize = plan.partitions.iter().map(|p| p.members).sum();
         let single_wave = plan.wave_count() <= 1;
-        if waves && !single_wave {
+        if waves && (overlap || !single_wave) {
             // #817: its waves are bounded in flight and in write order, not
             // by the group's sum, so it joins the open group.
             match open.as_mut() {
