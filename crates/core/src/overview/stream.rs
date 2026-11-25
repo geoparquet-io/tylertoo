@@ -9615,7 +9615,8 @@ mod tests {
             assert!((p["utilization"].as_f64().unwrap() - eff / threads).abs() < 1e-9);
         }
         let row = &v["timeline"][0];
-        assert_eq!(row.as_array().map(Vec::len), Some(6), "{v}");
+        // #876 added the tile trace's busy column (null when untraced).
+        assert_eq!(row.as_array().map(Vec::len), Some(7), "{v}");
     }
 
     /// #810: each stage sum counts every disjoint stage exactly once. Each
