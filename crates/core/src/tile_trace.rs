@@ -595,6 +595,11 @@ pub(crate) struct Site {
     name: &'static str,
     ctx: Ctx,
     pass: Option<Arc<PassAcc>>,
+    /// This call's bodies: their summed wall on every thread, and when the
+    /// last one ended (a wait that ends long after it was held by a thread
+    /// that ran other work before returning, not by its bodies).
+    core_ns: AtomicU64,
+    last_body_end_ns: AtomicU64,
 }
 
 static OFF: Site = Site {
@@ -602,6 +607,8 @@ static OFF: Site = Site {
     name: "",
     ctx: Ctx::NONE,
     pass: None,
+    core_ns: AtomicU64::new(0),
+    last_body_end_ns: AtomicU64::new(0),
 };
 
 impl Site {
@@ -648,6 +655,8 @@ impl Site {
                     (frame.start, frame.start + wall),
                 );
             }
+            self.core_ns.fetch_add(wall, Relaxed);
+            self.last_body_end_ns.fetch_max(frame.start + wall, Relaxed);
             record_wait(self.key(), |a| {
                 a.bodies += 1;
                 a.core_ns += wall;
@@ -688,6 +697,8 @@ fn wait_traced<R>(name: &'static str, f: impl FnOnce(&Site) -> R) -> R {
             name,
             ctx: l.ctx(),
             pass: l.pass.as_ref().map(|p| Arc::clone(&p.0)),
+            core_ns: AtomicU64::new(0),
+            last_body_end_ns: AtomicU64::new(0),
         };
         l.stack.push(Entry::Wait);
         l.sync_busy();
@@ -699,7 +710,19 @@ fn wait_traced<R>(name: &'static str, f: impl FnOnce(&Site) -> R) -> R {
     drop(pop);
     let end = now_ns();
     let wall = end.saturating_sub(start);
-    long_span("wait", name, false, (start, end));
+    if wall >= SPAN_MIN_NS {
+        let mut v = json!({
+            "kind": "wait",
+            "name": name,
+            "owner": false,
+            "start_ns": start,
+            "end_ns": end,
+            "body_core_ns": site.core_ns.load(Relaxed),
+            "last_body_end_ns": site.last_body_end_ns.load(Relaxed),
+        });
+        site.ctx.fields(&mut v);
+        emit("span", v);
+    }
     record_wait(site.key(), |a| {
         a.calls += 1;
         a.wall_ns += wall;

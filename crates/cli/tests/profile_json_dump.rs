@@ -1493,5 +1493,11 @@ fn tile_trace_has_one_tile_event_per_written_tile_and_changes_no_byte() {
             ["stage", "wait", "body", "job"].contains(&s["kind"].as_str().unwrap()),
             "{s}"
         );
+        if s["kind"] == "wait" {
+            assert!(
+                s["body_core_ns"].is_u64() && s["last_body_end_ns"].as_u64() <= Some(b),
+                "a wait span carries its call's bodies: {s}"
+            );
+        }
     }
 }
