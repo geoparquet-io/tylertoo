@@ -266,6 +266,136 @@ pub(super) fn run_on_pool<'scope, R: Send + 'scope>(
     }
 }
 
+/// What [`ordered_ahead`] did: items it took, how many of them the
+/// ordered thread processed itself because no worker had started them,
+/// the most it held at once, and its time getting the next result, by
+/// processing it or waiting for its worker (traced runs only).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct AheadStats {
+    pub(super) items: u64,
+    pub(super) inline: u64,
+    pub(super) max_held: usize,
+    pub(super) wait_ns: u64,
+}
+
+/// One item of [`ordered_ahead`]: whichever thread takes `item` first
+/// processes it, a pool worker or the ordered thread, into `R`.
+struct AheadSlot<I, R> {
+    item: std::sync::Mutex<Option<I>>,
+    done: (
+        Sender<std::thread::Result<R>>,
+        Receiver<std::thread::Result<R>>,
+    ),
+}
+
+impl<I, R> AheadSlot<I, R> {
+    fn take(&self) -> Option<I> {
+        self.item
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// The items [`ordered_ahead`] has dispatched and not emitted, oldest
+/// first. Dropped early (an error or a panic), it takes back every item no
+/// worker started, so the pool does not process what nobody will emit.
+struct AheadQueue<I, R>(std::collections::VecDeque<(std::sync::Arc<AheadSlot<I, R>>, usize)>);
+
+impl<I, R> Drop for AheadQueue<I, R> {
+    fn drop(&mut self) {
+        for (slot, _) in &self.0 {
+            drop(slot.take());
+        }
+    }
+}
+
+/// Process items on the rayon pool up to `max_items` (and `max_bytes` of
+/// their weights) at once, and hand each result to `emit` on this thread in
+/// **push order** (#876).
+///
+/// `feed` pushes the items, each with its weight. A push first emits the
+/// oldest items until the new one fits, so at most `max_items` items (the
+/// one `emit` is working on among them) and `max_bytes` are held, except
+/// that one item is always admitted. `max_items` 1 is the serial loop.
+///
+/// The ordered thread never runs unrelated pool work while it waits: an
+/// item no worker has started it processes itself (so a one-worker pool,
+/// or a caller that is that pool's only worker, cannot deadlock), and an
+/// item a worker is processing it waits for by blocking, not by stealing.
+/// The rayon steal-while-waiting alternative let one ordered step run a
+/// stolen long job before the next result was taken.
+///
+/// Errors and panics keep serial precedence: the first `Err` or panic in
+/// push order, from `process` or `emit`, ends the run, and nothing after it
+/// is emitted; items no worker started are dropped unprocessed.
+pub(super) fn ordered_ahead<I, O, E>(
+    (max_items, max_bytes): (usize, usize),
+    process: &(impl Fn(I) -> Result<O, E> + Sync),
+    feed: impl FnOnce(&mut dyn FnMut(I, usize) -> Result<(), E>) -> Result<(), E>,
+    mut emit: impl FnMut(O) -> Result<(), E>,
+) -> Result<AheadStats, E>
+where
+    I: Send,
+    O: Send,
+    E: Send,
+{
+    let max_items = max_items.max(1);
+    let mut stats = AheadStats::default();
+    rayon::in_place_scope(|scope| {
+        let mut queue = AheadQueue(std::collections::VecDeque::new());
+        let mut held = 0usize;
+        let mut emit_oldest =
+            |queue: &mut AheadQueue<I, Result<O, E>>, held: &mut usize, stats: &mut AheadStats| {
+                let Some((slot, bytes)) = queue.0.pop_front() else {
+                    return Ok(());
+                };
+                *held -= bytes;
+                let t = crate::tile_trace::mark();
+                let out = if let Some(item) = slot.take() {
+                    stats.inline += 1;
+                    process(item)
+                } else {
+                    match slot.done.1.recv().expect("a started item sends its result") {
+                        Ok(out) => out,
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    }
+                };
+                stats.wait_ns += crate::tile_trace::since(t);
+                emit(out?)
+            };
+        feed(&mut |item, bytes| {
+            while !queue.0.is_empty()
+                && (queue.0.len() >= max_items || held.saturating_add(bytes) > max_bytes)
+            {
+                emit_oldest(&mut queue, &mut held, &mut stats)?;
+            }
+            let slot = std::sync::Arc::new(AheadSlot {
+                item: std::sync::Mutex::new(Some(item)),
+                done: bounded(1),
+            });
+            let task = std::sync::Arc::clone(&slot);
+            scope.spawn(move |_| {
+                if let Some(item) = task.take() {
+                    let out =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(item)));
+                    // Capacity one, one send: never blocks.
+                    let _ = task.done.0.send(out);
+                }
+            });
+            queue.0.push_back((slot, bytes));
+            held = held.saturating_add(bytes);
+            stats.items += 1;
+            stats.max_held = stats.max_held.max(queue.0.len());
+            Ok(())
+        })?;
+        while !queue.0.is_empty() {
+            emit_oldest(&mut queue, &mut held, &mut stats)?;
+        }
+        Ok(stats)
+    })
+}
+
 pub(super) fn process_window<T: Sync, R: Send, E: Send>(
     items: &[T],
     process: &(impl Fn(&T) -> Result<R, E> + Sync),
@@ -850,5 +980,195 @@ mod tests {
             },
             |_, ()| Ok(ReadFlow::Continue),
         );
+    }
+
+    // --- ordered_ahead (#876) -----------------------------------------------
+
+    /// Run `ordered_ahead` over `0..n` (item `i` weighing `weights[i % len]`)
+    /// on a `threads`-worker pool, the caller one of its workers. Returns
+    /// what reached `emit`, in order, and the run's result.
+    fn ahead_run(
+        threads: usize,
+        n: usize,
+        limits: (usize, usize),
+        weights: Vec<usize>,
+        process: impl Fn(usize) -> Result<usize, String> + Sync + Send + 'static,
+        emit_fails_at: Option<usize>,
+    ) -> (Vec<usize>, Result<AheadStats, String>) {
+        let run = within("ordered_ahead", move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool.install(|| {
+                    // Items created and not yet emitted, and their weights:
+                    // what the run holds, the one being pushed aside.
+                    let live = std::cell::Cell::new((0usize, 0usize));
+                    let mut emitted = Vec::new();
+                    let weight = |i: usize| weights[i % weights.len()];
+                    let r = ordered_ahead(
+                        limits,
+                        &process,
+                        |push| {
+                            for i in 0..n {
+                                push(i, weight(i))?;
+                                let (items, bytes) = live.get();
+                                let held = (items + 1, bytes + weight(i));
+                                live.set(held);
+                                assert!(held.0 <= limits.0.max(1), "held {held:?} of {limits:?}");
+                                assert!(
+                                    held.1 <= limits.1 || held.0 == 1,
+                                    "held {held:?} of {limits:?}"
+                                );
+                            }
+                            Ok(())
+                        },
+                        |i| {
+                            if emit_fails_at == Some(i) {
+                                return Err(format!("emit {i} failed"));
+                            }
+                            let (items, bytes) = live.get();
+                            live.set((items - 1, bytes - weight(i)));
+                            emitted.push(i);
+                            Ok(())
+                        },
+                    );
+                    (emitted, r)
+                })
+            }))
+        });
+        run.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+        /// Whatever the limits, weights, pool and timing, `emit` sees every
+        /// result in push order, and the run never holds more than its
+        /// limits allow.
+        #[test]
+        fn ahead_emits_in_push_order_within_its_limits(
+            threads in 1usize..5,
+            n in 0usize..40,
+            max_items in 1usize..7,
+            max_bytes in 1usize..16,
+            weights in proptest::collection::vec(1usize..6, 1..8),
+            sleeps in proptest::collection::vec(0u64..3, 1..8),
+        ) {
+            let (emitted, r) = ahead_run(
+                threads,
+                n,
+                (max_items, max_bytes),
+                weights,
+                move |i| {
+                    std::thread::sleep(Duration::from_millis(sleeps[i % sleeps.len()]));
+                    Ok(i)
+                },
+                None,
+            );
+            let stats = r.unwrap();
+            proptest::prop_assert_eq!(emitted, (0..n).collect::<Vec<_>>());
+            proptest::prop_assert_eq!(stats.items, n as u64);
+            proptest::prop_assert!(stats.max_held <= max_items);
+        }
+    }
+
+    /// The point of the clip-ahead: items wait for the pool together, not
+    /// one at a time.
+    #[test]
+    fn ahead_processes_items_concurrently() {
+        let live = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let (l, p) = (live.clone(), peak.clone());
+        let (emitted, r) = ahead_run(
+            4,
+            12,
+            (4, usize::MAX),
+            vec![1],
+            move |i| {
+                let now = l.fetch_add(1, Ordering::SeqCst) + 1;
+                p.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                l.fetch_sub(1, Ordering::SeqCst);
+                Ok(i)
+            },
+            None,
+        );
+        assert_eq!(emitted, (0..12).collect::<Vec<_>>());
+        assert!(r.unwrap().max_held == 4);
+        assert!(peak.load(Ordering::SeqCst) > 1, "items never overlapped");
+    }
+
+    /// An error or a panic from the middle of the in-flight items, from
+    /// `process` or from `emit`, ends the run with it, after exactly the
+    /// items before it were emitted; on one worker and on several.
+    #[test]
+    fn ahead_errors_and_panics_keep_push_order() {
+        for threads in [1, 4] {
+            let (emitted, r) = ahead_run(
+                threads,
+                20,
+                (5, usize::MAX),
+                vec![1],
+                |i| {
+                    if i == 7 {
+                        Err(format!("process {i} failed"))
+                    } else {
+                        Ok(i)
+                    }
+                },
+                None,
+            );
+            assert_eq!(r, Err("process 7 failed".to_string()));
+            assert_eq!(emitted, (0..7).collect::<Vec<_>>());
+
+            let (emitted, r) = ahead_run(threads, 20, (5, usize::MAX), vec![1], Ok, Some(6));
+            assert_eq!(r, Err("emit 6 failed".to_string()));
+            assert_eq!(emitted, (0..6).collect::<Vec<_>>());
+
+            let payload = std::panic::catch_unwind(|| {
+                ahead_run(
+                    threads,
+                    20,
+                    (5, usize::MAX),
+                    vec![1],
+                    |i| {
+                        assert!(i != 9, "process 9 panicked");
+                        Ok(i)
+                    },
+                    None,
+                )
+            })
+            .expect_err("the process panic must propagate");
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(ToString::to_string));
+            assert!(
+                msg.as_deref()
+                    .is_some_and(|m| m.contains("process 9 panicked")),
+                "{msg:?}"
+            );
+        }
+    }
+
+    /// The ordered thread is the pool's only worker and both halves use the
+    /// pool inside themselves: every item is still processed (by the ordered
+    /// thread itself) and emitted in order, with no deadlock.
+    #[test]
+    fn ahead_on_the_only_worker_does_not_deadlock() {
+        let (emitted, r) = ahead_run(
+            1,
+            30,
+            (6, usize::MAX),
+            vec![1],
+            |i| {
+                assert_eq!((0..100).into_par_iter().map(|_| 1).sum::<usize>(), 100);
+                Ok(i)
+            },
+            None,
+        );
+        assert_eq!(emitted, (0..30).collect::<Vec<_>>());
+        assert!(r.unwrap().max_held <= 6);
     }
 }

@@ -2237,10 +2237,10 @@ fn wave_collect_does_no_per_row_work_on_the_consumer_thread() {
     );
 }
 
-/// #817: a band read's batches are collected in groups, so a 64-thread
-/// pool joins once per group instead of once per 8,192-row batch. The
-/// grouping is scheduling only: one thread, which collects batch by
-/// batch, writes the same bytes.
+/// #817, #876: a band read's batches are collected in groups. A 64-thread
+/// pool clips every batch of the band ahead of the ordered finish, one
+/// group each; one thread joins each group's finish to the next one's clip.
+/// The grouping is scheduling only: both write the same bytes.
 #[test]
 fn band_batches_are_collected_in_groups() {
     let input = tempfile::NamedTempFile::new().unwrap();
@@ -2279,9 +2279,10 @@ fn band_batches_are_collected_in_groups() {
     };
     let (wide, wide_bytes) = run(64, &opts);
     assert_eq!(wide.collect_batches, 3, "20,000 rows in 8,192-row batches");
+    assert_eq!(wide.collect_groups, 3, "64 threads clip batch by batch");
     assert_eq!(
-        wide.collect_groups, 1,
-        "64 threads collect up to 32,768 rows per group"
+        wide.collect_max_held, 3,
+        "64 threads clip all three batches ahead (up to 8)"
     );
     assert_eq!(
         wide.band_reads_on_consumer, 0,
@@ -2289,6 +2290,7 @@ fn band_batches_are_collected_in_groups() {
     );
     let (one, one_bytes) = run(1, &opts);
     assert_eq!(one.collect_groups, 3, "one thread collects batch by batch");
+    assert_eq!(one.collect_max_held, 0, "one thread does not clip ahead");
     assert!(wide_bytes == one_bytes, "grouping changed the archive");
     let bounded = ExportOptions {
         profile: MemoryProfile::Bounded,
@@ -2301,6 +2303,77 @@ fn band_batches_are_collected_in_groups() {
         "bounded held two clipped groups at once"
     );
     assert!(tight_bytes == one_bytes, "bounded changed the archive");
+    assert_eq!(tight.collect_max_held, 0, "bounded clipped ahead");
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4))]
+    /// #876: the clip-ahead collect (64 threads) writes the archive the
+    /// one-group-at-a-time collect (one thread) does, on random points and
+    /// tile-crossing squares over two levels, several row groups and batches.
+    #[test]
+    fn clip_ahead_collect_matches_the_joined_collect(
+        rows in 8_200usize..26_000,
+        row_group in 3_000usize..12_000,
+        seed in 0u64..1_000,
+    ) {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let mut next = || {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let geoms: Vec<Geometry<f64>> = (0..rows)
+            .map(|i| {
+                let (x, y) = (-170.0 + 340.0 * next(), -70.0 + 140.0 * next());
+                if i % 3 == 0 {
+                    let d = 4.0 * next();
+                    Geometry::Polygon(geo::Rect::new((x, y), (x + d, y + d)).to_polygon())
+                } else {
+                    Geometry::Point(Point::new(x, y))
+                }
+            })
+            .collect();
+        let ids: Vec<i64> = (0..rows as i64).collect();
+        let coarse = (
+            ids.iter().step_by(8).copied().collect(),
+            geoms.iter().step_by(8).cloned().collect(),
+        );
+        write_mode_fixture(
+            input.path(),
+            &[coarse, (ids, geoms)],
+            Mode::Duplicating,
+            row_group,
+        );
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            ..Default::default()
+        };
+        let run = |threads: usize| {
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let run = pool.install(|| {
+                export_pmtiles_run(
+                    input.path(),
+                    out.path(),
+                    &opts,
+                    DEFAULT_PARTITION_TARGET,
+                    &knobs(false, None, false),
+                )
+                .unwrap()
+            });
+            (run.work, std::fs::read(out.path()).unwrap())
+        };
+        let (ahead, ahead_bytes) = run(64);
+        let (joined, joined_bytes) = run(1);
+        proptest::prop_assert!(ahead.collect_max_held > 1, "64 threads never clipped ahead");
+        proptest::prop_assert_eq!(joined.collect_max_held, 0);
+        proptest::prop_assert_eq!(ahead.band_rows_read, joined.band_rows_read);
+        proptest::prop_assert!(ahead_bytes == joined_bytes, "the clip-ahead changed the archive");
+    }
 }
 
 /// #817: a collect group closes before a batch that would take it past

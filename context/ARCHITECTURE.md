@@ -767,6 +767,19 @@ uses the same `gap_to_world_box` on the same values, so the gaps are bit
 for bit those of before. It is serial rather than `owner_map` because a
 row costs a few sums, less than claiming a batch.
 
+On more than 16 threads the fill also clips ahead (`collect_ahead`,
+`collect.rs`, over `pipe::ordered_ahead`): each read batch is a group,
+clipped in the pool while earlier groups finish, and finished strictly in
+read order, so every order-dependent step (gap walk, member append, sink
+append, diagnostics) runs in the order it did. One group at a time, each
+`rayon::join` waited for both halves, and a 40-thread fill kept 5–12
+threads busy. The groups held, the one finishing among them, are as many
+read batches as two of the joined path's groups take, under twice its
+byte cap, so the rows and members held do not grow. The ordered thread
+never steals while it waits for a clip: a clip no worker started it runs
+itself (a one-worker pool cannot deadlock), one a worker runs it blocks
+on. `bounded`, and pools of 16 threads or fewer, keep the joined path.
+
 Border duplication is the expected delta between overview level counts and
 export per-zoom feature totals (a feature spanning a tile seam appears in
 every tile it touches): 0% while a level fits one tile, ~7% at z14 on

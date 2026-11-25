@@ -1199,7 +1199,7 @@ where known `zoom`, `level` (the export's level index), `wave` and `part`
 | `commit_wait` | an encoded wave waiting for earlier waves' writes | wave fields, `queued` (its share of the cap) |
 | `group`, `serial_level` | a level group, and a level on the serial `export_level` path | `levels`, `zooms`, `cap`; `level`, `zoom`, `waves`, `members` |
 | `fill` | a level's one-level store fill, the coverage fill | `kind` (`level_store`, `coverage`), `level`, `zoom`, `early` |
-| `collect` | a band collect (a store fill's, or a wave's own read), on its driving thread | `level`, `zoom`, `groups`; `recv_ns` (blocked on the reader pipe), `join_ns` (in the finish-and-clip joins), of which `inject_ns` (before a worker took the join), `finish_ns` and `clip_ns` (each half's wall), `clip_core_ns` (the clip's bodies on every thread); `serial_ns` (`finish_group` outside a join); every `finish_group`'s `finish_gaps_ns` (ordered gap walk, serial since #876; its bbox projections run in the clip), `finish_chunks_ns` and `finish_chunks_core_ns` (the parallel member chunks' wall and core), `finish_append_ns` (ordered sink appends) |
+| `collect` | a band collect (a store fill's, or a wave's own read), on its driving thread | `level`, `zoom`, `groups`; `ahead` (the groups the clip-ahead may hold at once, 0 on the joined path) and `inline` (clips it ran on the driving thread because no worker had started them); `recv_ns` (blocked on the reader pipe), `join_ns` (in the finish-and-clip joins; clipping ahead, waiting for a group's clip), of which `inject_ns` (before a worker took the join), `finish_ns` and `clip_ns` (each half's wall; clipping ahead, `clip_ns` sums every group's clip wall on its thread), `clip_core_ns` (the clip's bodies on every thread); `serial_ns` (`finish_group` outside a join, which is every finish when clipping ahead, then also `finish_ns`); every `finish_group`'s `finish_gaps_ns` (ordered gap walk, serial since #876; its bbox projections run in the clip), `finish_chunks_ns` and `finish_chunks_core_ns` (the parallel member chunks' wall and core), `finish_append_ns` (ordered sink appends) |
 | `read` | a parallel ordered read (`read_in_parallel`), on its merge thread | `workers`, `segments`; per worker `read_ns` (open and decode) and `send_ns` (blocked on its full queue); `merge_wait_ns` (the merge blocked on a worker), `deliver_ns` (in the consumer's callback: for a band read, blocked on the pipe) |
 
 How to read them:
@@ -1219,7 +1219,8 @@ How to read them:
   `busy` column of the profile's `timeline`.
 - **Wait sites**: `sort` (`encode.rs` member sort), `tiles` (a partition's
   tiles), `encode_buckets` (a wave's partitions), `fill_clip` (a collect's
-  finish-and-clip join; bodies are the clip's), `fill_finish` (a finish's
+  finish-and-clip join, or a clip-ahead collect's whole read; bodies are
+  the clip's), `fill_finish` (a finish's
   member chunks), `geometry_chunks`,
   `layers`, `quantize`, `part_clean`, `box_pairs`, `pairs_within`.
   `wall_ns` is the caller's time in the call; `core_ns` is its bodies' time

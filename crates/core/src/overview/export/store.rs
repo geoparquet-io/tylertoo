@@ -172,6 +172,8 @@ pub(super) struct ExportWorkTally {
     pub(super) band_reads_on_consumer: u64,
     /// Groups clipped while an earlier group still waited to finish (#817).
     pub(super) collect_overlaps: u64,
+    /// The most groups one clip-ahead collect held at once (#876).
+    pub(super) collect_max_held: usize,
     /// Waves of multi-wave levels a level group collected and encoded in
     /// its pipeline, not the serial wave loop (#817).
     pub(super) group_waves: u64,

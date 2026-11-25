@@ -210,7 +210,6 @@ pub(super) fn collect_into(
     // #535: `band_read` is the reader open (footer/page-index setup, paid
     // per wave on this path) plus each `next()` (read + Arrow decode);
     // `clip_group` and `finish_group` charge their own `decode`/`clip`.
-    let timers = ctx.timers;
     let t_collect = crate::tile_trace::mark();
     let mut tr = CollectTrace::default();
 
@@ -230,12 +229,63 @@ pub(super) fn collect_into(
             .measuring(valve_merges(ctx.opts)),
         locator: ctx.reader.row_locator(&selected),
     };
-    // PERF (#817): a group's ordered finish (the gap walk, member routing
-    // and the sink appends) runs alongside the next group's decode and clip,
-    // so the pool is not idle while this thread walks the rows.
-    let mut group = CollectGroup::new(collect_group_rows(ctx.band.profile));
+    let ahead = clip_ahead_groups(ctx.band.profile);
+    if ahead > 2 {
+        collect_ahead(
+            ctx,
+            wave,
+            (&selected, ahead),
+            &mut rows,
+            sink,
+            &mut tr,
+            diagnostics,
+        )?;
+    } else {
+        collect_joined(ctx, wave, &selected, &mut rows, sink, &mut tr, diagnostics)?;
+    }
+    crate::tile_trace::span("collect", t_collect, || {
+        serde_json::json!({
+            "level": ctx.level_idx,
+            "zoom": ctx.zoom,
+            "groups": tr.groups,
+            "ahead": tr.ahead,
+            "inline": tr.inline,
+            "recv_ns": tr.recv_ns,
+            "join_ns": tr.join_ns,
+            "inject_ns": tr.inject_ns,
+            "finish_ns": tr.finish_ns,
+            "clip_ns": tr.clip_ns,
+            "clip_core_ns": tr.clip_core_ns,
+            "serial_ns": tr.serial_ns,
+            "finish_gaps_ns": tr.finish.gaps_ns,
+            "finish_chunks_ns": tr.finish.chunks_ns,
+            "finish_chunks_core_ns": tr.finish.chunks_core_ns,
+            "finish_append_ns": tr.finish.append_ns,
+        })
+    });
+    #[cfg(test)]
+    {
+        let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
+        *work.band_rows_read.entry(ctx.level_idx).or_default() += rows.read;
+    }
+    Ok(rows.read)
+}
+
+/// [`collect_into`]'s groups, one at a time: a group's ordered finish
+/// (the gap walk, member routing and the sink appends) runs alongside the
+/// next group's decode and clip in one `rayon::join`.
+fn collect_joined(
+    ctx: &LevelCtx<'_>,
+    wave: &[Partition],
+    selected: &[usize],
+    rows: &mut WaveRows,
+    sink: &mut dyn MemberSink,
+    tr: &mut CollectTrace,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<(), ExportError> {
+    // PERF (#817): the overlap keeps the pool busy while this thread walks
+    // the rows.
     let mut clipped: Option<ClippedGroup> = None;
-    let rows = &mut rows;
     // `bounded` finishes each group before clipping the next, so it never
     // holds two groups' geometry and members: that overlap is not budgeted.
     let overlap = !matches!(ctx.band.profile, MemoryProfile::Bounded);
@@ -286,66 +336,142 @@ pub(super) fn collect_into(
         clipped = Some(next?);
         Ok(())
     };
-    // #876: the time between batches is this thread blocked on the pipe.
-    let mut last = crate::tile_trace::mark();
-    read_band(
-        ctx.band,
-        &selected,
-        timers,
-        #[cfg(test)]
-        ctx.work,
-        |batch| {
-            tr.recv_ns += crate::tile_trace::since(last);
-            let bytes = batch.get_array_memory_size();
-            let r = group.push(batch, bytes, &mut step);
-            last = crate::tile_trace::mark();
-            r
-        },
-    )?;
-    tr.recv_ns += crate::tile_trace::since(last);
-    if !group.batches.is_empty() {
-        step(group.batches)?;
-    }
+    let group = CollectGroup::new(collect_group_rows(ctx.band.profile));
+    read_groups(ctx, selected, group, &mut tr.recv_ns, &mut step)?;
     if let Some(c) = clipped.take() {
         let t = crate::tile_trace::mark();
         finish_group(ctx, wave, c, rows, sink, &mut tr.finish, diagnostics)?;
         tr.serial_ns += crate::tile_trace::since(t);
     }
-    crate::tile_trace::span("collect", t_collect, || {
-        serde_json::json!({
-            "level": ctx.level_idx,
-            "zoom": ctx.zoom,
-            "groups": tr.groups,
-            "recv_ns": tr.recv_ns,
-            "join_ns": tr.join_ns,
-            "inject_ns": tr.inject_ns,
-            "finish_ns": tr.finish_ns,
-            "clip_ns": tr.clip_ns,
-            "clip_core_ns": tr.clip_core_ns,
-            "serial_ns": tr.serial_ns,
-            "finish_gaps_ns": tr.finish.gaps_ns,
-            "finish_chunks_ns": tr.finish.chunks_ns,
-            "finish_chunks_core_ns": tr.finish.chunks_core_ns,
-            "finish_append_ns": tr.finish.append_ns,
-        })
-    });
+    Ok(())
+}
+
+/// [`collect_into`]'s groups, up to `ahead` held at once (#876): each read
+/// batch is a group, clipped in the pool while earlier ones finish, and
+/// finished strictly in read order ([`ordered_ahead`]).
+///
+/// PERF (#876): one group at a time held a 40-thread fill to 5–12 busy
+/// threads: each `join` waited for both halves, and a group's clip, a few
+/// fork-joins over ~20,000 rows, ran at only 3–11× parallelism.
+///
+/// Memory: `ahead` ([`clip_ahead_groups`]) single-batch groups hold the
+/// batches, at most, that two of [`collect_joined`]'s groups do, under the
+/// same byte cap twice, so the rows held, and their members, are unchanged.
+fn collect_ahead(
+    ctx: &LevelCtx<'_>,
+    wave: &[Partition],
+    (selected, ahead): (&[usize], usize),
+    rows: &mut WaveRows,
+    sink: &mut dyn MemberSink,
+    tr: &mut CollectTrace,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<(), ExportError> {
+    let group = CollectGroup::new(1);
+    let max_bytes = group.max_bytes.saturating_mul(2);
+    let clip_ns = crate::tile_trace::Tally::<1>::new();
+    // One site for the whole read: its bodies are every group's clip.
+    let stats = crate::tile_trace::wait("fill_clip", |site| {
+        let clip = |batches: Vec<RecordBatch>| {
+            let t = crate::tile_trace::mark();
+            let r = clip_group(ctx, wave, batches, site, diagnostics);
+            clip_ns.add(0, crate::tile_trace::since(t));
+            r
+        };
+        let stats = super::super::pipe::ordered_ahead(
+            (ahead, max_bytes),
+            &clip,
+            |push| {
+                read_groups(ctx, selected, group, &mut tr.recv_ns, &mut |batches| {
+                    let bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+                    push(batches, bytes)
+                })
+            },
+            |c| {
+                let t = crate::tile_trace::mark();
+                let r = finish_group(ctx, wave, c, rows, sink, &mut tr.finish, diagnostics);
+                tr.serial_ns += crate::tile_trace::since(t);
+                r
+            },
+        );
+        tr.clip_core_ns += site.core_ns();
+        stats
+    })?;
+    tr.groups = stats.items;
+    tr.ahead = ahead;
+    tr.inline = stats.inline;
+    tr.join_ns = stats.wait_ns;
+    tr.clip_ns = clip_ns.get(0);
+    // Every finish ran here, outside a join: `serial_ns`, and the finish half.
+    tr.finish_ns = tr.serial_ns;
     #[cfg(test)]
     {
         let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
-        *work.band_rows_read.entry(ctx.level_idx).or_default() += rows.read;
+        work.collect_max_held = work.collect_max_held.max(stats.max_held);
     }
-    Ok(rows.read)
+    Ok(())
+}
+
+/// Read `selected` of the band ([`read_band`]) into `group`, handing each
+/// full group, then the last one, to `step`. `recv_ns`: the time between
+/// batches, this thread blocked on the pipe (#876).
+fn read_groups(
+    ctx: &LevelCtx<'_>,
+    selected: &[usize],
+    mut group: CollectGroup,
+    recv_ns: &mut u64,
+    step: &mut impl FnMut(Vec<RecordBatch>) -> Result<(), ExportError>,
+) -> Result<(), ExportError> {
+    let mut last = crate::tile_trace::mark();
+    read_band(
+        ctx.band,
+        selected,
+        ctx.timers,
+        #[cfg(test)]
+        ctx.work,
+        |batch| {
+            *recv_ns += crate::tile_trace::since(last);
+            let bytes = batch.get_array_memory_size();
+            let r = group.push(batch, bytes, &mut *step);
+            last = crate::tile_trace::mark();
+            r
+        },
+    )?;
+    *recv_ns += crate::tile_trace::since(last);
+    if group.batches.is_empty() {
+        Ok(())
+    } else {
+        step(group.batches)
+    }
+}
+
+/// The groups [`collect_into`] holds at once (#876), the one it is
+/// finishing among them: `bounded` 1, otherwise as many read batches as
+/// two of [`collect_group_rows`]'s groups take, the overlap of
+/// [`collect_joined`] that the clip-ahead ([`collect_ahead`]) reuses. Two
+/// or fewer (16 threads or fewer) keep the joined path.
+pub(super) fn clip_ahead_groups(profile: MemoryProfile) -> usize {
+    match profile {
+        MemoryProfile::Bounded => 1,
+        MemoryProfile::Auto | MemoryProfile::Speed => collect_group_rows(profile)
+            .div_ceil(EXPORT_BATCH_SIZE)
+            .saturating_mul(2),
+    }
 }
 
 /// #876: where a traced [`collect_into`]'s driving thread spent its wall,
 /// for its `collect` trace event. Untouched untraced.
 #[derive(Default)]
 struct CollectTrace {
-    /// Finish-and-clip joins.
+    /// Finish-and-clip joins, or groups the clip-ahead took.
     groups: u64,
+    /// [`clip_ahead_groups`] when the read clipped ahead, else 0; and the
+    /// groups it clipped on this thread, which no worker had started.
+    ahead: usize,
+    inline: u64,
     /// Blocked on the reader pipe.
     recv_ns: u64,
     /// In the joins, and of that, before a worker started the injected join.
+    /// Clipping ahead: waiting for a group's clip, run here or on a worker.
     join_ns: u64,
     inject_ns: u64,
     /// Inside the joins: `finish_group`'s and `clip_group`'s wall, and the

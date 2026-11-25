@@ -31,17 +31,17 @@ fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'st
     })
 }
 
-fn one_thread_pool() -> rayon::ThreadPool {
+fn pool(threads: usize) -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
+        .num_threads(threads)
         .build()
-        .expect("one-thread rayon pool")
+        .expect("rayon pool")
 }
 
 fn convert_in_pool(input: &Path, output: &Path) {
     let (input, output) = (input.to_owned(), output.to_owned());
     within(Duration::from_secs(60), move || {
-        one_thread_pool().install(|| {
+        pool(1).install(|| {
             convert_to_overviews(
                 &input,
                 &output,
@@ -66,6 +66,17 @@ fn convert_finishes_inside_a_one_thread_pool() {
 
 #[test]
 fn export_finishes_inside_a_one_thread_pool() {
+    export_in_pool(1);
+}
+
+/// More than 16 threads: the store fills clip ahead (#876), their ordered
+/// thread one of the caller's pool's workers.
+#[test]
+fn export_finishes_inside_a_wide_pool() {
+    export_in_pool(24);
+}
+
+fn export_in_pool(threads: usize) {
     let Some(input) = fixture::realdata("road-detections.parquet") else {
         return;
     };
@@ -75,7 +86,7 @@ fn export_finishes_inside_a_one_thread_pool() {
     convert_to_overviews(&input, &overview, &ConvertOptions::default()).expect("convert");
     let archive = dir.path().join("out.pmtiles");
     within(Duration::from_secs(60), move || {
-        one_thread_pool().install(|| {
+        pool(threads).install(|| {
             export_pmtiles(&overview, &archive, &ExportOptions::default()).expect("export");
         });
     });
