@@ -243,7 +243,7 @@ pub(super) fn collect_into(
         if !overlap {
             if let Some(c) = clipped.take() {
                 let t = crate::tile_trace::mark();
-                finish_group(ctx, wave, c, rows, sink, diagnostics)?;
+                finish_group(ctx, wave, c, rows, sink, &mut tr.finish, diagnostics)?;
                 tr.serial_ns += crate::tile_trace::since(t);
             }
         }
@@ -261,7 +261,7 @@ pub(super) fn collect_into(
                     || {
                         let t = crate::tile_trace::mark();
                         let r = clipped.take().map_or(Ok(()), |c| {
-                            finish_group(ctx, wave, c, rows, sink, diagnostics)
+                            finish_group(ctx, wave, c, rows, sink, &mut tr.finish, diagnostics)
                         });
                         (t, crate::tile_trace::since(t), r)
                     },
@@ -308,7 +308,7 @@ pub(super) fn collect_into(
     }
     if let Some(c) = clipped.take() {
         let t = crate::tile_trace::mark();
-        finish_group(ctx, wave, c, rows, sink, diagnostics)?;
+        finish_group(ctx, wave, c, rows, sink, &mut tr.finish, diagnostics)?;
         tr.serial_ns += crate::tile_trace::since(t);
     }
     crate::tile_trace::span("collect", t_collect, || {
@@ -323,6 +323,10 @@ pub(super) fn collect_into(
             "clip_ns": tr.clip_ns,
             "clip_core_ns": tr.clip_core_ns,
             "serial_ns": tr.serial_ns,
+            "finish_gaps_ns": tr.finish.gaps_ns,
+            "finish_chunks_ns": tr.finish.chunks_ns,
+            "finish_chunks_core_ns": tr.finish.chunks_core_ns,
+            "finish_append_ns": tr.finish.append_ns,
         })
     });
     #[cfg(test)]
@@ -351,6 +355,19 @@ struct CollectTrace {
     clip_core_ns: u64,
     /// `finish_group` on this thread, outside a join.
     serial_ns: u64,
+    /// Every `finish_group`'s stages.
+    finish: FinishTrace,
+}
+
+/// #876: where a traced [`finish_group`]'s wall went: the ordered gap
+/// walk, the parallel member chunks (wall, and their bodies' core time),
+/// and the ordered appends to the sink.
+#[derive(Default)]
+pub(super) struct FinishTrace {
+    gaps_ns: u64,
+    chunks_ns: u64,
+    chunks_core_ns: u64,
+    append_ns: u64,
 }
 
 /// The batches [`collect_into`] gathers before one [`clip_group`]: up to
@@ -955,6 +972,7 @@ pub(super) fn finish_group(
     group: ClippedGroup,
     rows: &mut WaveRows,
     sink: &mut dyn MemberSink,
+    tr: &mut FinishTrace,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), ExportError> {
     let timers = ctx.timers;
@@ -971,9 +989,11 @@ pub(super) fn finish_group(
         work.collect_batches += batches.len() as u64;
         work.collect_groups += 1;
     }
+    let t = crate::tile_trace::mark();
     let row_gaps: Vec<Vec<(u64, u16)>> = ExportTimers::time(&timers.decode, || {
         rects.iter().map(|r| rows.gaps.batch_rects(r)).collect()
     });
+    tr.gaps_ns += crate::tile_trace::since(t);
 
     // Property extraction and member routing, per chunk in the pool. #535:
     // `decode`, timed per chunk and around the merge below.
@@ -1005,23 +1025,33 @@ pub(super) fn finish_group(
             input
         })
         .collect();
-    let chunks: Vec<Vec<Result<ChunkMembers, ExportError>>> = row_members
-        .par_iter_mut()
-        .zip(&chunk_inputs)
-        .map(|(row_members, chunk)| {
-            let chunk_rows = collect_chunk_rows(chunk.batch.num_rows());
-            row_members
-                .par_chunks_mut(chunk_rows)
-                .enumerate()
-                .map(|(i, items)| {
-                    ExportTimers::time(&timers.decode, || {
-                        collect_member_chunk(chunk, i * chunk_rows, items)
-                    })
+    let t = crate::tile_trace::mark();
+    let chunks: Vec<Vec<Result<ChunkMembers, ExportError>>> =
+        crate::tile_trace::wait("fill_finish", |site| {
+            let chunks = row_members
+                .par_iter_mut()
+                .zip(&chunk_inputs)
+                .map(|(row_members, chunk)| {
+                    let chunk_rows = collect_chunk_rows(chunk.batch.num_rows());
+                    row_members
+                        .par_chunks_mut(chunk_rows)
+                        .enumerate()
+                        .map(|(i, items)| {
+                            site.body(|| {
+                                ExportTimers::time(&timers.decode, || {
+                                    collect_member_chunk(chunk, i * chunk_rows, items)
+                                })
+                            })
+                        })
+                        .collect()
                 })
-                .collect()
-        })
-        .collect();
+                .collect();
+            tr.chunks_core_ns += site.core_ns();
+            chunks
+        });
+    tr.chunks_ns += crate::tile_trace::since(t);
     drop(row_members);
+    let t = crate::tile_trace::mark();
 
     for chunk in chunks.into_iter().flatten() {
         let ChunkMembers {
@@ -1047,6 +1077,7 @@ pub(super) fn finish_group(
             }
         }
     }
+    tr.append_ns += crate::tile_trace::since(t);
     rows.read = first_read as u64;
     Ok(())
 }

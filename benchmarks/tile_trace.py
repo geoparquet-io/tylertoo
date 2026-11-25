@@ -182,6 +182,10 @@ def summarize(events, top):
             "inject_s": secs(c["inject_ns"]), "clip_wall_s": secs(c["clip_ns"]),
             "clip_core_s": secs(c["clip_core_ns"]), "finish_s": secs(c["finish_ns"]),
             "serial_s": secs(c["serial_ns"]),
+            "finish_gaps_s": secs(c.get("finish_gaps_ns", 0)),
+            "finish_chunks_s": secs(c.get("finish_chunks_ns", 0)),
+            "finish_chunks_core_s": secs(c.get("finish_chunks_core_ns", 0)),
+            "finish_append_s": secs(c.get("finish_append_ns", 0)),
             "rest_s": secs(wall - c["recv_ns"] - c["join_ns"] - c["serial_ns"]),
             "occupancy_mean": round(sum(x for _, x in window) / len(window), 1) if window else None,
             "readers": sum(r["workers"] for r in reads),
@@ -235,15 +239,19 @@ def report(s):
         p(f"{name:>16} {w['calls']:>8} {w['bodies']:>9} {w['owner_wall_s']:>12.3f} "
           f"{w['body_core_s']:>11.3f} {w['max_call_s']:>10.3f}")
     p("\n(e) band collects (seconds): driving thread = recv + join + serial + rest;"
-      " join = inject + max(finish, clip); readers: busy / blocked in send of their summed wall")
+      " join = inject + max(finish, clip); finish = gaps + chunks + append;"
+      " readers: busy / blocked in send of their summed wall")
     p(f"{'kind':>4} {'z':>3} {'start':>6} {'wall':>6} {'xtra':>5} {'grp':>4} {'recv':>6} {'join':>6} "
-      f"{'inject':>6} {'clip':>6} {'core':>7} {'finish':>6} {'serial':>6} {'rest':>5} {'occ':>5} "
+      f"{'inject':>6} {'clip':>6} {'core':>7} {'finish':>6} {'serial':>6} {'rest':>5} "
+      f"{'f_gaps':>6} {'f_chnk':>6} {'f_core':>6} {'f_app':>6} {'occ':>5} "
       f"{'rd':>3} {'rd_wall':>7} {'rd_busy':>7} {'rd_send':>7} {'mrg_wait':>8} {'mrg_dlv':>7}")
     for c in s["collects"]:
         xtra = "" if c["fill_extra_s"] is None else f"{c['fill_extra_s']:.2f}"
         p(f"{c['kind']:>4} {c['zoom']:>3} {c['start_s']:>6.2f} {c['wall_s']:>6.2f} {xtra:>5} {c['groups']:>4} "
           f"{c['recv_s']:>6.2f} {c['join_s']:>6.2f} {c['inject_s']:>6.2f} {c['clip_wall_s']:>6.2f} "
           f"{c['clip_core_s']:>7.2f} {c['finish_s']:>6.2f} {c['serial_s']:>6.2f} {c['rest_s']:>5.2f} "
+          f"{c['finish_gaps_s']:>6.2f} {c['finish_chunks_s']:>6.2f} {c['finish_chunks_core_s']:>6.2f} "
+          f"{c['finish_append_s']:>6.2f} "
           f"{c['occupancy_mean'] if c['occupancy_mean'] is not None else '-':>5} {c['readers']:>3} "
           f"{c['reader_wall_s']:>7.2f} {c['reader_busy_s']:>7.2f} {c['reader_send_blocked_s']:>7.2f} "
           f"{c['merge_wait_s']:>8.2f} {c['merge_deliver_s']:>7.2f}")
