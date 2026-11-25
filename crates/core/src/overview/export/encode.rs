@@ -1387,12 +1387,9 @@ pub(super) fn build_mvt_within<M: TileFeature>(
         for chunk in members.chunks(GEOMETRY_CHUNK_MEMBERS) {
             let encoded: Vec<EncodedFeatureGeometry> =
                 crate::tile_trace::wait("geometry_chunks", |site| {
-                    chunk
-                        .par_iter()
-                        .map(|m| {
-                            site.body(|| crate::tile_trace::stage(Stage::EncodeGeom, || encode(m)))
-                        })
-                        .collect()
+                    crate::owner_map::owner_map(chunk, |m| {
+                        site.body(|| crate::tile_trace::stage(Stage::EncodeGeom, || encode(m)))
+                    })
                 });
             crate::tile_trace::stage(Stage::LAdd, || {
                 for (m, geom) in chunk.iter().zip(encoded) {

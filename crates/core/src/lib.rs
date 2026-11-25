@@ -127,6 +127,7 @@ mod ioverlay_clip;
 mod merge;
 mod mvt;
 mod overview;
+mod owner_map;
 mod pmtiles_metadata;
 mod pmtiles_writer;
 mod pyramid;

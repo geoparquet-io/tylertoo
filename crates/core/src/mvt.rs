@@ -881,7 +881,6 @@ impl QuantizedPolygons {
         bounds: &TileBounds,
         extent: u32,
     ) -> Option<Self> {
-        use rayon::prelude::*;
         #[cfg(test)]
         let mut count_new = crate::valve_counter::quantized_new();
         let proj = TileProjector::new(bounds, extent);
@@ -917,10 +916,7 @@ impl QuantizedPolygons {
                 };
                 let quantized: Vec<Option<Quantized>> =
                     crate::tile_trace::wait("quantize", |site| {
-                        geometries
-                            .par_iter()
-                            .map(|g| site.body(|| quantize(g)))
-                            .collect()
+                        crate::owner_map::owner_map(geometries, |g| site.body(|| quantize(g)))
                     });
                 let count = quantized.iter().flatten().map(|(p, _, _)| p.len()).sum();
                 parts.reserve(count);
