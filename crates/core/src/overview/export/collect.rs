@@ -108,11 +108,22 @@ pub(super) fn fill_level_store(
     // Marked before any Rayon work: a held encode that waits for it must
     // not hold the only worker the fill needs.
     #[cfg(test)]
-    ctx.work
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .fills_started
-        .insert(ctx.level_idx);
+    {
+        let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
+        work.fills_started.insert(ctx.level_idx);
+        match work.fault_fill {
+            Some((level, false)) if level == ctx.level_idx => {
+                return Err(ExportError::Io(std::io::Error::other(format!(
+                    "injected fill fault at level {level}"
+                ))));
+            }
+            Some((level, true)) if level == ctx.level_idx => {
+                drop(work);
+                panic!("injected fill panic at level {level}");
+            }
+            _ => {}
+        }
+    }
     let t_collect = Instant::now();
     let mut store = MemberStore::new(
         std::slice::from_ref(plan),

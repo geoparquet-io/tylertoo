@@ -574,7 +574,7 @@ pub(super) fn export_level(
             let t_fill = Instant::now();
             let (backing, grants) = level_read_backing(read, plan, budget, 0);
             let filled = fill_level_store(&ctx, plan, backing, diagnostics)?;
-            trace_fill(t_fill, level, false);
+            trace_fill(t_fill, level, (false, false));
             (Some(filled), grants)
         }
         _ => (None, Vec::new()),
@@ -787,11 +787,16 @@ pub(super) fn injected_fault(
 /// one; under `bounded` a group's single-wave levels are bounded by the
 /// group's sum.
 ///
-/// A multi-wave level's one-level store fills as soon as the collect
-/// reaches the level under `auto` and `speed`, before those waits, so the
-/// level's band read and clip run while the coarser levels still encode
-/// ([`GroupGate::overlap`]). Under `bounded` it fills once the group
-/// holds no members, as the serial loop does.
+/// A multi-wave level's one-level store fills under `auto` and `speed` as
+/// the collect reaches the level before it, on a thread of its own
+/// ([`start_fill`], #876), so the level's band read and clip run while the
+/// level before it is admitted and the coarser levels still encode
+/// ([`GroupGate::overlap`]); the first such level of a group, and every one
+/// when the collect runs on a pool worker, fills on the calling thread as
+/// the collect reaches it. At most one fill runs, so two stores are alive at
+/// once: the one being taken and the next. Under `bounded` it fills on
+/// the calling thread once the group holds no members, as the serial loop
+/// does.
 ///
 /// The collect stays on the calling thread because the legacy read blocks on
 /// a channel (see [`scoped_pipe`]). In a Rayon task it would park a worker,
@@ -845,184 +850,189 @@ pub(super) fn export_level_group(
             gate.single_wave_cap
         })
     };
-    let collected = rayon::in_place_scope(|scope| -> Result<(), (usize, ExportError)> {
-        // The group's ordinal of the next wave to collect.
-        let mut unit = 0;
-        'levels: for (i, level) in levels.iter().enumerate() {
-            if lock_commit(&commit, &timers).error.is_some() {
-                // A coarser level already failed. Its error is returned.
-                break;
-            }
-            injected_fault(level, fail_level).map_err(|e| (i, e))?;
-            let multi_wave = level_waves(level.plan) > 1;
-            let mut level_store = None;
-            let mut grants = Vec::new();
-            for w in 0..level_waves(level.plan) {
-                let wave = level.plan.wave(w);
-                let fills = w == 0 && multi_wave && store.is_none() && level.level_read.is_some();
-                let early = fills && gate.overlap;
-                let mut fill = |floor: usize| -> Result<f64, (usize, ExportError)> {
-                    let t_fill = Instant::now();
-                    if let Some(read) = level.level_read {
-                        let (backing, g) = level_read_backing(read, level.plan, budget, floor);
+    let collected = rayon::in_place_scope(|scope| {
+        std::thread::scope(|threads| -> Result<(), (usize, ExportError)> {
+            // #876: the next level's store, filling on a thread of its own.
+            let mut ahead: Option<LevelFill<'_>> = None;
+            // Its clip joins go to the global pool, so a caller on a pool
+            // worker (a pool of its own, rayon_pool_reentry.rs) fills each
+            // store on this thread as the level starts, in its own pool.
+            let ahead_fills = gate.overlap && rayon::current_thread_index().is_none();
+            let collected = (|| -> Result<(), (usize, ExportError)> {
+                // The group's ordinal of the next wave to collect.
+                let mut unit = 0;
+                'levels: for (i, level) in levels.iter().enumerate() {
+                    if lock_commit(&commit, &timers).error.is_some() {
+                        // A coarser level already failed. Its error is returned.
+                        break;
+                    }
+                    injected_fault(level, fail_level).map_err(|e| (i, e))?;
+                    let multi_wave = level_waves(level.plan) > 1;
+                    let fills = fills_own_store(level, store.is_none());
+                    // Under `auto` and `speed` the store fills before the waits,
+                    // while the levels before it still encode.
+                    let early = fills && gate.overlap;
+                    let (mut level_store, mut grants, filled) = level_fills(
+                        threads,
+                        (levels, i, unit),
+                        (&mut ahead, ahead_fills),
+                        (&mut *budget, gate, &in_flight),
+                        store.is_none(),
+                        &timers,
+                        diagnostics,
+                    )
+                    .map_err(|e| (i, e))?;
+                    for w in 0..level_waves(level.plan) {
+                        let wave = level.plan.wave(w);
+                        let fills = w == 0 && fills;
+                        if multi_wave {
+                            gate_wait(("window_wait", level, w), &in_flight, || {
+                                in_flight.wait_until(|| {
+                                    let c = lock_commit(&commit, &timers);
+                                    c.error.is_some() || c.written + 1 >= unit
+                                });
+                            });
+                            if lock_commit(&commit, &timers).error.is_some() {
+                                break 'levels;
+                            }
+                        }
+                        if fills && !early {
+                            // The store's grant is sized beside this level's widest
+                            // wave only, so it fills once every earlier wave is
+                            // encoded: the grant plus one wave, as in the serial loop.
+                            gate_wait(("drain_wait", level, w), &in_flight, || {
+                                drop(in_flight.wait_for(|held| held == 0));
+                            });
+                        }
+                        let held = gate_wait(("admit_wait", level, w), &in_flight, || {
+                            in_flight.admit(wave.iter().map(|p| p.members).sum())
+                        });
+                        // The level's wall starts with its fill.
+                        let (start, fill_secs) = match filled {
+                            Some(fill) if w == 0 => fill,
+                            _ => (Instant::now(), 0.0),
+                        };
+                        let t_collect = Instant::now();
+                        if fills && !early {
+                            #[cfg(test)]
+                            note_fill_start(level, unit);
+                            let (backing, g) = fill_grants(level, budget, 0, in_flight.held());
+                            grants = g;
+                            let (s, _, _) =
+                                run_fill(level, backing, &timers, diagnostics, (false, false))
+                                    .map_err(|e| (i, e))?;
+                            level_store = Some(s);
+                        }
+                        let spill_bytes = match (&level_store, &store) {
+                            _ if w > 0 => 0,
+                            (Some(s), _) => s.level_spilled_bytes(0),
+                            (None, Some(s)) => s.level_spilled_bytes(level.level_idx),
+                            (None, None) => 0,
+                        };
+                        let own = level_store.is_some();
+                        let buckets = collect_unit(
+                            level_store.as_mut().or(store.as_deref_mut()),
+                            (level, own),
+                            (w, wave),
+                            &timers,
+                            diagnostics,
+                        )
+                        .map_err(|e| (i, e))?;
+                        trace_wave("collected", level, w);
+                        // The fill is timed on its own: an early one does not count
+                        // the waits between it and the wave's admission.
+                        let collect_secs = t_collect.elapsed().as_secs_f64() + fill_secs;
                         #[cfg(test)]
-                        if let Some(wave) = g.first() {
+                        if multi_wave {
                             level
                                 .work
                                 .lock()
                                 .unwrap_or_else(PoisonError::into_inner)
-                                .fill_grants
-                                .push((in_flight.held(), wave.units));
+                                .group_waves += 1;
                         }
-                        grants = g;
-                        let ctx = level.level_ctx(&timers);
-                        level_store = Some(
-                            fill_level_store(&ctx, level.plan, backing, diagnostics)
-                                .map_err(|e| (i, e))?,
-                        );
-                        trace_fill(t_fill, level, early);
-                    }
-                    Ok(t_fill.elapsed().as_secs_f64())
-                };
-                // Under `auto` and `speed` the store fills at once, while the
-                // levels before it still encode: the gate keeps their members
-                // and this level's waves within its cap together, so the
-                // store's wave grant is the cap, not this level's widest wave.
-                // A wave the gate let past the cap because nothing else was
-                // held can still be in flight: the grant then covers it, and
-                // no wave of this level is admitted until it is released.
-                let fill_start = Instant::now();
-                let fill_secs = if early {
-                    fill(gate.cap.max(in_flight.held()))?
-                } else {
-                    0.0
-                };
-                if multi_wave {
-                    gate_wait(("window_wait", level, w), &in_flight, || {
-                        in_flight.wait_until(|| {
-                            let c = lock_commit(&commit, &timers);
-                            c.error.is_some() || c.written + 1 >= unit
+                        #[cfg(test)]
+                        let next_fill = (w + 1 == level_waves(level.plan))
+                            .then(|| levels.get(i + 1))
+                            .flatten()
+                            .filter(|next| level_waves(next.plan) > 1 && store.is_none())
+                            .map(|next| next.level_idx);
+                        let (commit, timers, in_flight) = (&commit, &*timers, &in_flight);
+                        trace_wave("spawned", level, w);
+                        scope.spawn(move |_| {
+                            wave_job(level, w, || {
+                                #[cfg(test)]
+                                if let Some(next) = next_fill {
+                                    hold_for_fill(level.work, next);
+                                }
+                                #[cfg(test)]
+                                if (i, w) == (0, 0) {
+                                    stall_first_wave(level.work, commit, levels.len());
+                                }
+                                let run =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        let t_encode = Instant::now();
+                                        let tiles = encode_buckets(
+                                            level.gzip_cache,
+                                            (buckets, Some(&held)),
+                                            level.plan.zoom,
+                                            &TileEncoding::single(level.options)
+                                                .with_floors(level.floors),
+                                            level.fills,
+                                            timers,
+                                            diagnostics,
+                                        );
+                                        let encoded_ns = trace_wave("encoded", level, w);
+                                        // The tiles' share of the cap goes with them until
+                                        // written; a failed wave's goes back with `held`.
+                                        let queued =
+                                            if tiles.is_ok() { held.take_queued() } else { 0 };
+                                        drop(held);
+                                        let encoded = tiles.map(|tiles| EncodedWave {
+                                            tiles,
+                                            start,
+                                            collect_secs,
+                                            encode_secs: t_encode.elapsed().as_secs_f64(),
+                                            spill_bytes,
+                                            queued,
+                                            encoded_ns,
+                                        });
+                                        lock_commit(commit, timers).finish((i, w), encoded);
+                                    }));
+                                let freed = {
+                                    let mut c = lock_commit(commit, timers);
+                                    if run.is_err() {
+                                        // The collect may wait on this wave's write: fail
+                                        // the group so it stops, then let Rayon re-raise.
+                                        let e = std::io::Error::other(
+                                            "a wave's encode or write panicked",
+                                        );
+                                        c.fail(i, ExportError::Io(e));
+                                    }
+                                    std::mem::take(&mut c.freed)
+                                };
+                                in_flight.release(freed);
+                                in_flight.notify();
+                                if let Err(panic) = run {
+                                    std::panic::resume_unwind(panic);
+                                }
+                            })
                         });
-                    });
-                    if lock_commit(&commit, &timers).error.is_some() {
-                        break 'levels;
+                        unit += 1;
+                    }
+                    // The level's waves are all taken: its one-level store is empty.
+                    drop(level_store);
+                    for grant in grants {
+                        budget.release(grant);
                     }
                 }
-                if fills && !early {
-                    // The store's grant is sized beside this level's widest
-                    // wave only, so it fills once every earlier wave is
-                    // encoded: the grant plus one wave, as in the serial loop.
-                    gate_wait(("drain_wait", level, w), &in_flight, || {
-                        drop(in_flight.wait_for(|held| held == 0));
-                    });
-                }
-                let held = gate_wait(("admit_wait", level, w), &in_flight, || {
-                    in_flight.admit(wave.iter().map(|p| p.members).sum())
-                });
-                // The level's wall starts with its fill.
-                let start = if early { fill_start } else { Instant::now() };
-                let t_collect = Instant::now();
-                if fills && !early {
-                    fill(0)?;
-                }
-                let spill_bytes = match (&level_store, &store) {
-                    _ if w > 0 => 0,
-                    (Some(s), _) => s.level_spilled_bytes(0),
-                    (None, Some(s)) => s.level_spilled_bytes(level.level_idx),
-                    (None, None) => 0,
-                };
-                let own = level_store.is_some();
-                let buckets = collect_unit(
-                    level_store.as_mut().or(store.as_deref_mut()),
-                    (level, own),
-                    (w, wave),
-                    &timers,
-                    diagnostics,
-                )
-                .map_err(|e| (i, e))?;
-                trace_wave("collected", level, w);
-                // The fill is timed on its own: an early one does not count
-                // the waits between it and the wave's admission.
-                let collect_secs = t_collect.elapsed().as_secs_f64() + fill_secs;
-                #[cfg(test)]
-                if multi_wave {
-                    level
-                        .work
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .group_waves += 1;
-                }
-                #[cfg(test)]
-                let next_fill = (w + 1 == level_waves(level.plan))
-                    .then(|| levels.get(i + 1))
-                    .flatten()
-                    .filter(|next| level_waves(next.plan) > 1 && store.is_none())
-                    .map(|next| next.level_idx);
-                let (commit, timers, in_flight) = (&commit, &*timers, &in_flight);
-                trace_wave("spawned", level, w);
-                scope.spawn(move |_| {
-                    wave_job(level, w, || {
-                        #[cfg(test)]
-                        if let Some(next) = next_fill {
-                            hold_for_fill(level.work, next);
-                        }
-                        #[cfg(test)]
-                        if (i, w) == (0, 0) {
-                            stall_first_wave(level.work, commit, levels.len());
-                        }
-                        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let t_encode = Instant::now();
-                            let tiles = encode_buckets(
-                                level.gzip_cache,
-                                (buckets, Some(&held)),
-                                level.plan.zoom,
-                                &TileEncoding::single(level.options).with_floors(level.floors),
-                                level.fills,
-                                timers,
-                                diagnostics,
-                            );
-                            let encoded_ns = trace_wave("encoded", level, w);
-                            // The tiles' share of the cap goes with them until
-                            // written; a failed wave's goes back with `held`.
-                            let queued = if tiles.is_ok() { held.take_queued() } else { 0 };
-                            drop(held);
-                            let encoded = tiles.map(|tiles| EncodedWave {
-                                tiles,
-                                start,
-                                collect_secs,
-                                encode_secs: t_encode.elapsed().as_secs_f64(),
-                                spill_bytes,
-                                queued,
-                                encoded_ns,
-                            });
-                            lock_commit(commit, timers).finish((i, w), encoded);
-                        }));
-                        let freed = {
-                            let mut c = lock_commit(commit, timers);
-                            if run.is_err() {
-                                // The collect may wait on this wave's write: fail
-                                // the group so it stops, then let Rayon re-raise.
-                                let e = std::io::Error::other("a wave's encode or write panicked");
-                                c.fail(i, ExportError::Io(e));
-                            }
-                            std::mem::take(&mut c.freed)
-                        };
-                        in_flight.release(freed);
-                        in_flight.notify();
-                        if let Err(panic) = run {
-                            std::panic::resume_unwind(panic);
-                        }
-                    })
-                });
-                unit += 1;
-            }
-            // The level's waves are all taken: its one-level store is empty.
-            drop(level_store);
-            for grant in grants {
-                budget.release(grant);
-            }
-        }
-        Ok(())
+                Ok(())
+            })();
+            // A fill no level took, the group having failed first: wait for
+            // it, and re-raise its panic as an encode's would be. On a panic
+            // the thread scope joins it instead.
+            drop(ahead.take().map(LevelFill::join));
+            collected
+        })
     });
     let mut commit = commit.into_inner().unwrap_or_else(PoisonError::into_inner);
     if let Err((i, e)) = collected {
@@ -1135,8 +1145,14 @@ pub(super) fn gate_wait<R>(
     r
 }
 
-/// #876: a level's one-level store fill, started at `t_fill`.
-pub(super) fn trace_fill(t_fill: Instant, level: &ExportLevelCtx<'_>, early: bool) {
+/// #876: a level's one-level store fill, started at `t_fill`: `early`
+/// before the level's waits, `ahead` on its own thread beside the level
+/// before it.
+pub(super) fn trace_fill(
+    t_fill: Instant,
+    level: &ExportLevelCtx<'_>,
+    (early, ahead): (bool, bool),
+) {
     let start = crate::tile_trace::mark().map(|now| {
         now.saturating_sub(u64::try_from(t_fill.elapsed().as_nanos()).unwrap_or(u64::MAX))
     });
@@ -1146,8 +1162,202 @@ pub(super) fn trace_fill(t_fill: Instant, level: &ExportLevelCtx<'_>, early: boo
             "level": level.level_idx,
             "zoom": level.plan.zoom,
             "early": early,
+            "ahead": ahead,
         })
     });
+}
+
+/// Whether `level` reads its band into a one-level store of its own (#740):
+/// a multi-wave level when no export-wide store was filled.
+pub(super) fn fills_own_store(level: &ExportLevelCtx<'_>, no_store: bool) -> bool {
+    level_waves(level.plan) > 1 && no_store && level.level_read.is_some()
+}
+
+/// The wave grant of a store that fills while `level` is collected, and
+/// what it must cover: the members in flight and `level`'s widest wave,
+/// which the gate lets past its cap when nothing else is held. The grant is
+/// at least the gate's cap.
+pub(super) fn fill_floor(
+    gate: GroupGate,
+    in_flight: &InFlight,
+    level: &ExportLevelCtx<'_>,
+) -> (usize, usize) {
+    let widest = level
+        .plan
+        .waves()
+        .map(|wave| wave.iter().map(|p| p.members).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    let covers = in_flight.held().max(widest);
+    (gate.cap.max(covers), covers)
+}
+
+/// Take `level`'s store grants ([`level_read_backing`]), its wave grant at
+/// least `floor`; `covers` is what that grant must cover, for the tests.
+pub(super) fn fill_grants(
+    level: &ExportLevelCtx<'_>,
+    budget: &mut MemoryBudget,
+    floor: usize,
+    #[cfg_attr(
+        not(test),
+        expect(unused_variables, reason = "only the tests record what it covers")
+    )]
+    covers: usize,
+) -> (StoreBacking, Vec<Grant>) {
+    let read = level
+        .level_read
+        .expect("a level that fills its store reads one");
+    let (backing, grants) = level_read_backing(read, level.plan, budget, floor);
+    #[cfg(test)]
+    if let Some(wave) = grants.first() {
+        level
+            .work
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fill_grants
+            .push((covers, wave.units));
+    }
+    (backing, grants)
+}
+
+/// [`ExportWorkTally::fill_starts`]: `level`'s store starts to fill with
+/// `unit` waves of its group admitted.
+#[cfg(test)]
+pub(super) fn note_fill_start(level: &ExportLevelCtx<'_>, unit: usize) {
+    level
+        .work
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .fill_starts
+        .push((level.level_idx, unit));
+}
+
+/// The fills as the collect reaches group level `i` under `auto` and
+/// `speed`: the level's own store, taken from `ahead` or filled here, and
+/// with `ahead_fills` the next level's, started into `ahead`. Returns the
+/// level's store, its grants, and an early fill's start and duration.
+///
+/// #876: the next level's store fills beside this level's collect, not
+/// after its last admission. The gate keeps the members of every level in
+/// flight within its cap together, so one wave grant prices them: the next
+/// fill's, sized at the cap, at what is in flight, and at this level's
+/// widest wave, which the gate admits alone when it is over the cap. It
+/// takes over from this level's, released here; the level grants of the
+/// two stores are both held until this level's last wave is taken.
+#[expect(
+    clippy::type_complexity,
+    reason = "the level store, its grants and its fill times, used at once"
+)]
+pub(super) fn level_fills<'scope, 'env>(
+    threads: &'scope std::thread::Scope<'scope, 'env>,
+    (levels, i, unit): (&'env [ExportLevelCtx<'env>], usize, usize),
+    (ahead, ahead_fills): (&mut Option<LevelFill<'scope>>, bool),
+    (budget, gate, in_flight): (&mut MemoryBudget, GroupGate, &InFlight),
+    no_store: bool,
+    timers: &'env ExportTimers,
+    diagnostics: &'env crate::diagnostics::Diagnostics,
+) -> Result<(Option<MemberStore>, Vec<Grant>, Option<(Instant, f64)>), ExportError> {
+    #[cfg(not(test))]
+    let _ = unit;
+    let level = &levels[i];
+    let (mut level_store, mut grants, mut filled) = (None, Vec::new(), None);
+    if gate.overlap && fills_own_store(level, no_store) {
+        let (s, g, t_fill, secs) = match ahead.take() {
+            Some(fill) => fill.join()?,
+            None => {
+                let (floor, covers) = fill_floor(gate, in_flight, level);
+                #[cfg(test)]
+                note_fill_start(level, unit);
+                let (backing, g) = fill_grants(level, budget, floor, covers);
+                let (s, t, secs) = run_fill(level, backing, timers, diagnostics, (true, false))?;
+                (s, g, t, secs)
+            }
+        };
+        level_store = Some(s);
+        grants = g;
+        filled = Some((t_fill, secs));
+    }
+    let next = levels
+        .get(i + 1)
+        .filter(|next| ahead_fills && fills_own_store(next, no_store));
+    if let Some(next) = next {
+        // `level_read_backing` returns the wave grant first.
+        let handed = if grants.len() == 2 {
+            let wave = grants.remove(0);
+            budget.release(wave);
+            wave.units
+        } else {
+            0
+        };
+        let (floor, covers) = fill_floor(gate, in_flight, level);
+        #[cfg(test)]
+        note_fill_start(next, unit);
+        *ahead = Some(start_fill(
+            threads,
+            next,
+            (budget, (floor.max(handed), covers)),
+            timers,
+            diagnostics,
+        ));
+    }
+    Ok((level_store, grants, filled))
+}
+
+/// What a store fill hands back: the store, when it started, and how long
+/// it took.
+type Filled = Result<(MemberStore, Instant, f64), ExportError>;
+
+/// Fill `level`'s one-level store into `backing` on this thread, and trace
+/// it ([`trace_fill`]).
+pub(super) fn run_fill(
+    level: &ExportLevelCtx<'_>,
+    backing: StoreBacking,
+    timers: &ExportTimers,
+    diagnostics: &crate::diagnostics::Diagnostics,
+    (early, ahead): (bool, bool),
+) -> Filled {
+    let t_fill = Instant::now();
+    let store = fill_level_store(&level.level_ctx(timers), level.plan, backing, diagnostics)?;
+    trace_fill(t_fill, level, (early, ahead));
+    Ok((store, t_fill, t_fill.elapsed().as_secs_f64()))
+}
+
+/// A level's one-level store filling on a thread of its own (#876), and
+/// the grants taken for it.
+pub(super) struct LevelFill<'scope> {
+    grants: Vec<Grant>,
+    thread: std::thread::ScopedJoinHandle<'scope, Filled>,
+}
+
+impl LevelFill<'_> {
+    /// Wait for the fill and re-raise its panic. Returns the store, its
+    /// grants, its start and its duration.
+    pub(super) fn join(self) -> Result<(MemberStore, Vec<Grant>, Instant, f64), ExportError> {
+        match self.thread.join() {
+            Ok(filled) => filled.map(|(s, t, secs)| (s, self.grants, t, secs)),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+}
+
+/// Take `level`'s store grants on the collecting thread, which owns the
+/// budget, and fill the store on a thread of `threads`, off the pool.
+///
+/// Not a Rayon task: the band read blocks on a channel ([`scoped_pipe`]),
+/// and in a task it would park a worker. Its clip joins go to the global
+/// pool, so only a collect off the pool starts one, whose own Rayon work
+/// goes there too.
+pub(super) fn start_fill<'scope, 'env>(
+    threads: &'scope std::thread::Scope<'scope, 'env>,
+    level: &'env ExportLevelCtx<'env>,
+    (budget, (floor, covers)): (&mut MemoryBudget, (usize, usize)),
+    timers: &'env ExportTimers,
+    diagnostics: &'env crate::diagnostics::Diagnostics,
+) -> LevelFill<'scope> {
+    debug_assert!(rayon::current_thread_index().is_none());
+    let (backing, grants) = fill_grants(level, budget, floor, covers);
+    let thread = threads.spawn(move || run_fill(level, backing, timers, diagnostics, (true, true)));
+    LevelFill { grants, thread }
 }
 
 /// How a level group runs ([`export_level_group`]): the [`InFlight`] cap

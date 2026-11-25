@@ -1877,6 +1877,8 @@ impl Pass2Knobs {
             hold_for_fill: false,
             #[cfg(test)]
             stall_first_wave: false,
+            #[cfg(test)]
+            fault_fill: None,
             memory_limit: None,
             budget_available: None,
         }
@@ -1914,6 +1916,11 @@ struct Pass2Knobs {
     /// ([`ExportWorkTally::peak_queued_waves`]).
     #[cfg(test)]
     stall_first_wave: bool,
+    /// Fail, or with `true` panic, the one-level store fill of this level,
+    /// to test that a fill on its own thread fails the export as one on
+    /// the collecting thread does.
+    #[cfg(test)]
+    fault_fill: Option<(usize, bool)>,
     /// The memory figure for the #665 dense-tile refusal. `None` probes
     /// ([`probe_oom_memory_limit`]); tests inject one.
     memory_limit: Option<MemoryLimit>,
@@ -2396,6 +2403,7 @@ fn export_pmtiles_validated(
     let work = Mutex::new(ExportWorkTally {
         hold_for_fill: knobs.hold_for_fill,
         stall_first_wave: knobs.stall_first_wave,
+        fault_fill: knobs.fault_fill,
         ..ExportWorkTally::default()
     });
     let (head, rest) = scans.split_at_mut(planned);

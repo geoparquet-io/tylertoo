@@ -1646,6 +1646,139 @@ fn level_store_fills_beside_the_previous_level_encode() {
     }
 }
 
+/// Four levels for #876's fill-ahead tests: one point, then three of five
+/// edge points, which with an 8 px buffer and waves of 2 are multi-wave.
+fn fill_ahead_fixture(path: &Path) {
+    let pts = |n: usize, l: i64| -> (Vec<i64>, Vec<Geometry<f64>>) {
+        let g = (0..n)
+            .map(|k| Geometry::Point(Point::new(-150.3 + k as f64 * 70.0, -40.3)))
+            .collect();
+        ((0..n as i64).map(|k| l * 10 + k).collect(), g)
+    };
+    write_mode_fixture(
+        path,
+        &[pts(1, 0), pts(5, 1), pts(5, 2), pts(5, 3)],
+        Mode::Duplicating,
+        64,
+    );
+}
+
+fn fill_ahead_run(
+    input: &Path,
+    profile: MemoryProfile,
+    knobs: &Pass2Knobs,
+) -> Result<(Vec<u8>, Pass2Run), ExportError> {
+    let opts = ExportOptions {
+        layer_name: "ahead".to_string(),
+        partition_wave: 2,
+        profile,
+        tile_buffer: 8,
+        ..Default::default()
+    };
+    let out = tempfile::NamedTempFile::new().unwrap();
+    let run = export_pmtiles_run(input, out.path(), &opts, 1, knobs)?;
+    Ok((std::fs::read(out.path()).unwrap(), run))
+}
+
+/// #876: under `auto` and `speed` a multi-wave level's store starts to
+/// fill, on its own thread, as the level before it starts, not after that
+/// level's last wave is admitted; `bounded` fills it on the collecting
+/// thread once the group holds no members. Inside a pool of its own the
+/// collect fills each store itself as its level starts, so the fill's work
+/// stays in that pool. The archive is the serial loop's either way.
+#[test]
+fn the_next_level_store_fills_before_the_last_wave_is_admitted() {
+    let input = tempfile::NamedTempFile::new().unwrap();
+    fill_ahead_fixture(input.path());
+    let (serial_bytes, serial) = fill_ahead_run(
+        input.path(),
+        MemoryProfile::Auto,
+        &knobs(false, None, false),
+    )
+    .unwrap();
+    let waves: Vec<usize> = serial.wave_starts.iter().map(Vec::len).collect();
+    assert!(
+        waves.len() == 4 && waves[1..].iter().all(|&w| w > 1),
+        "{waves:?}"
+    );
+    let before = |level: usize| waves[..level].iter().sum::<usize>();
+    for profile in [
+        MemoryProfile::Auto,
+        MemoryProfile::Speed,
+        MemoryProfile::Bounded,
+    ] {
+        let (bytes, run) =
+            fill_ahead_run(input.path(), profile, &knobs(false, None, true)).unwrap();
+        assert_eq!(run.level_groups, vec![0..4], "{profile:?}");
+        // Level k's fill starts once the levels before k - 1 are admitted,
+        // or, under `bounded`, every level before k.
+        let lag = usize::from(profile == MemoryProfile::Bounded);
+        let starts: Vec<(usize, usize)> = (1..4).map(|k| (k, before(k - 1 + lag))).collect();
+        assert_eq!(run.work.fill_starts, starts, "{profile:?}");
+        assert_eq!(bytes, serial_bytes, "{profile:?}");
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let (pooled, run) = pool
+        .install(|| fill_ahead_run(input.path(), MemoryProfile::Auto, &knobs(false, None, true)))
+        .unwrap();
+    let starts: Vec<(usize, usize)> = (1..4).map(|k| (k, before(k))).collect();
+    assert_eq!(run.work.fill_starts, starts);
+    assert_eq!(pooled, serial_bytes);
+}
+
+/// #876: a store filling on its own thread fails the export as one on the
+/// collecting thread does: its error is the export's and its panic is
+/// re-raised. An error the collect meets first still wins over the fill's
+/// error, which is waited for and dropped, but not over its panic.
+#[test]
+fn a_fill_on_its_own_thread_fails_the_export() {
+    let input = tempfile::NamedTempFile::new().unwrap();
+    fill_ahead_fixture(input.path());
+    let run = |profile, fault_fill, fail_level| {
+        let knobs = Pass2Knobs {
+            fault_fill,
+            fail_level,
+            ..knobs(false, None, true)
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fill_ahead_run(input.path(), profile, &knobs).map(|_| ())
+        }))
+    };
+    let panic_message = |panic: Box<dyn std::any::Any + Send>| {
+        panic.downcast_ref::<String>().cloned().unwrap_or_default()
+    };
+    for profile in [
+        MemoryProfile::Auto,
+        MemoryProfile::Speed,
+        MemoryProfile::Bounded,
+    ] {
+        let err = run(profile, Some((3, false)), None).unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("injected fill fault at level 3"),
+            "{profile:?}: {err}"
+        );
+        let panic = run(profile, Some((3, true)), None).unwrap_err();
+        let message = panic_message(panic);
+        assert!(
+            message.contains("injected fill panic at level 3"),
+            "{profile:?}: {message}"
+        );
+        // Level 3 fills while level 2 collects (`bounded`: never).
+        let err = run(profile, Some((3, false)), Some(3))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected fault at level 3"),
+            "{profile:?}: {err}"
+        );
+    }
+    let panic = run(MemoryProfile::Auto, Some((3, true)), Some(3)).unwrap_err();
+    assert!(panic_message(panic).contains("injected fill panic at level 3"));
+}
+
 /// A coarse wave that stalls does not let the finer levels' encoded
 /// waves queue behind it past the group's cap: each queued wave keeps a
 /// share of the cap until it is written.
@@ -1834,6 +1967,7 @@ fn knobs(
         panic_write_level: None,
         hold_for_fill: false,
         stall_first_wave: false,
+        fault_fill: None,
         memory_limit: None,
         budget_available: None,
     }

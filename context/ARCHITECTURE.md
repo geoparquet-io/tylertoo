@@ -709,6 +709,16 @@ keeps the wait. A prefetch thread that filled the next level while this one
 drained measured no better: the fills, one after another, are then the
 critical path.
 
+Since #876 the next level's store starts to fill, on a plain thread of its
+own, as the collect reaches the level before it, so the fill no longer
+waits for that level's last wave to be admitted. The grants are taken on
+the collecting thread before the thread starts: the new store's level grant
+is priced with the current store's still held, so it spills what the budget
+does not cover, and its wave grant takes over from the current one. At most
+one fill runs, so at most two stores are alive. A collect on a pool worker
+(a caller's own pool) fills each store on the collecting thread, so its Rayon
+work stays in that pool; `bounded` keeps the wait.
+
 `export_level_group` collects the levels' members on the calling thread, one
 level at a time and in level order, as the serial loop does. Each collected
 level then encodes in its own Rayon task while the next level is collected.

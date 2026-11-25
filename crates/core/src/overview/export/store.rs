@@ -187,6 +187,11 @@ pub(super) struct ExportWorkTally {
     pub(super) fill_grants: Vec<(usize, usize)>,
     /// [`Pass2Knobs::stall_first_wave`].
     pub(super) stall_first_wave: bool,
+    /// [`Pass2Knobs::fault_fill`].
+    pub(super) fault_fill: Option<(usize, bool)>,
+    /// Per one-level store fill, in the order they start: the level, and
+    /// the waves its group had admitted by then (#876).
+    pub(super) fill_starts: Vec<(usize, usize)>,
     /// The most encoded waves a level group held unwritten at once.
     pub(super) peak_queued_waves: usize,
 }
