@@ -61,11 +61,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
-#[expect(
-    clippy::disallowed_types,
-    reason = "#768: one flush's dense-state charge, shared by its parallel tasks; no diagnostic globals"
-)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use geo::Rect;
 use rayon::prelude::*;
@@ -654,6 +649,7 @@ impl Scan {
         // Dense state a flush adds, charged as it is allocated, so it stops
         // at the budget's room rather than after the flush (superagent, #913).
         let (base, room) = (self.resident_bytes(), self.room);
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         let added = AtomicU64::new(0);
         let over = AtomicBool::new(false);
         let charge = |bytes: u64| {
