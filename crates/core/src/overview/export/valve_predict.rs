@@ -1405,6 +1405,21 @@ mod tests {
                 for_each_member_key(&b, zoom, &opts, |_| n += 1);
                 let bound = member_tiles_bound(&b, zoom, &opts);
                 assert!(n <= bound, "{b:?} z{zoom}: {n} members, bound {bound}");
+                // The sampler's one-key test agrees with the enumeration.
+                let mut keys = HashSet::new();
+                for_each_member_key(&b, zoom, &opts, |k| {
+                    keys.insert(k);
+                });
+                let side = 1u32 << zoom;
+                for (x, y) in (0..side.min(64)).flat_map(|x| (0..side.min(64)).map(move |y| (x, y)))
+                {
+                    let k = super::super::tile_key(x, y, zoom);
+                    assert_eq!(
+                        super::super::scan::is_member_key(&b, zoom, &opts, k),
+                        keys.contains(&k),
+                        "{b:?} z{zoom} {x},{y}"
+                    );
+                }
             }
         }
     }

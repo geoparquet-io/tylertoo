@@ -590,6 +590,19 @@ pub(super) fn for_each_member_key(
     }
 }
 
+/// Whether [`for_each_member_key`] would call back with `key`: one range
+/// test per copy, not one callback per tile the row reaches.
+pub(super) fn is_member_key(bbox: &TileBounds, zoom: u8, opts: &ExportOptions, key: u64) -> bool {
+    let (x, y) = key_to_xy(key, zoom);
+    let tc = TileCoord::new(x, y, zoom);
+    let buffer = buffer_deg_at_zoom(zoom, opts);
+    if !near_world_edge(bbox, buffer) {
+        return ranges_contain(&member_ranges(bbox, zoom, opts), tc);
+    }
+    wrap_shifts(bbox, buffer)
+        .any(|shift| ranges_contain(&member_ranges(&shift_bbox(bbox, shift), zoom, opts), tc))
+}
+
 /// At least as many tiles as [`for_each_member_key`] calls back for: the
 /// same copies, a tile two copies share counted twice. Cheap, so a caller
 /// can bound what it holds per member before it enumerates them.
@@ -1114,9 +1127,7 @@ fn valve_sample_rows(
                         let Some(Some(b)) = bboxes.get(row as usize) else {
                             continue;
                         };
-                        let mut member = false;
-                        for_each_member_key(b, zooms[t.level], opts, |k| member |= k == t.key);
-                        if member {
+                        if is_member_key(b, zooms[t.level], opts, t.key) {
                             rows.push((base + row) as u32);
                             if rows.len() == left {
                                 break;
