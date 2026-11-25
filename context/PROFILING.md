@@ -1199,6 +1199,8 @@ where known `zoom`, `level` (the export's level index), `wave` and `part`
 | `commit_wait` | an encoded wave waiting for earlier waves' writes | wave fields, `queued` (its share of the cap) |
 | `group`, `serial_level` | a level group, and a level on the serial `export_level` path | `levels`, `zooms`, `cap`; `level`, `zoom`, `waves`, `members` |
 | `fill` | a level's one-level store fill, the coverage fill | `kind` (`level_store`, `coverage`), `level`, `zoom`, `early` |
+| `collect` | a band collect (a store fill's, or a wave's own read), on its driving thread | `level`, `zoom`, `groups`; `recv_ns` (blocked on the reader pipe), `join_ns` (in the finish-and-clip joins), of which `inject_ns` (before a worker took the join), `finish_ns` and `clip_ns` (each half's wall), `clip_core_ns` (the clip's bodies on every thread); `serial_ns` (`finish_group` outside a join) |
+| `read` | a parallel ordered read (`read_in_parallel`), on its merge thread | `workers`, `segments`; per worker `read_ns` (open and decode) and `send_ns` (blocked on its full queue); `merge_wait_ns` (the merge blocked on a worker), `deliver_ns` (in the consumer's callback: for a band read, blocked on the pipe) |
 
 How to read them:
 
@@ -1216,7 +1218,8 @@ How to read them:
   waiting in a traced parallel call: busy without spin. It is also the
   `busy` column of the profile's `timeline`.
 - **Wait sites**: `sort` (`encode.rs` member sort), `tiles` (a partition's
-  tiles), `encode_buckets` (a wave's partitions), `geometry_chunks`,
+  tiles), `encode_buckets` (a wave's partitions), `fill_clip` (a collect's
+  finish-and-clip join; bodies are the clip's), `geometry_chunks`,
   `layers`, `quantize`, `part_clean`, `box_pairs`, `pairs_within`.
   `wall_ns` is the caller's time in the call; `core_ns` is its bodies' time
   on every thread. `sort` and `pairs_within` record wall only: a timed body
@@ -1230,7 +1233,9 @@ How to read them:
 `benchmarks/tile_trace.py` prints, per zoom, the wall, the longest tiles
 and their pass stages, and the occupancy timeline; the scheduler holds,
 with each group's idle tail after its last wave spawn while under half the
-pool busy; and each wait site's owner wall against its bodies' core time.
+pool busy; each wait site's owner wall against its bodies' core time; and
+per band collect, its driving thread's split and its readers' busy and
+blocked time.
 
 ## Sampling profilers
 

@@ -87,6 +87,32 @@ pub(crate) fn span(ev: &'static str, start: Option<u64>, fields: impl FnOnce() -
     }
 }
 
+/// The nanoseconds since `start` (a [`mark`]); 0 when `start` is `None`.
+#[inline]
+pub(crate) fn since(start: Option<u64>) -> u64 {
+    start.map_or(0, |start| now_ns().saturating_sub(start))
+}
+
+/// `N` totals that a traced call's threads add into ([`since`]).
+pub(crate) struct Tally<const N: usize>([AtomicU64; N]);
+
+impl<const N: usize> Tally<N> {
+    pub(crate) fn new() -> Self {
+        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+
+    #[inline]
+    pub(crate) fn add(&self, i: usize, n: u64) {
+        if n > 0 {
+            self.0[i].fetch_add(n, Relaxed);
+        }
+    }
+
+    pub(crate) fn get(&self, i: usize) -> u64 {
+        self.0[i].load(Relaxed)
+    }
+}
+
 /// Emit `ev` with `fields`, stamped `t_ns` now, when tracing.
 pub(crate) fn event(ev: &'static str, fields: impl FnOnce() -> Value) {
     if on() {
@@ -614,6 +640,11 @@ static OFF: Site = Site {
 impl Site {
     fn key(&self) -> WaitKey {
         (self.ctx.tile, self.ctx.zoom, self.name)
+    }
+
+    /// The summed wall of this call's bodies so far, on every thread.
+    pub(crate) fn core_ns(&self) -> u64 {
+        self.core_ns.load(Relaxed)
     }
 
     /// Run one closure body of the call, timed into its site on this

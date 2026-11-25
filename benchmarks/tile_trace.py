@@ -16,6 +16,8 @@ Prints, for each export in the trace (one per `start` event):
     last wave spawn to its end while occupancy was under half the pool;
 (d) per nested wait site: the owner's wall in the call and the core time of
     its closure bodies on every thread;
+(e) per band collect (a store fill, or a wave's own read): where its driving
+    thread's wall went, and its reader threads' busy and blocked time;
 
 and with `--json` writes the same as one JSON object. Standard library only.
 `context/PROFILING.md` lists the trace's events and fields.
@@ -164,13 +166,39 @@ def summarize(events, top):
         }
         for name, s in sorted(sites.items(), key=lambda kv: -kv[1]["wall_ns"])
     }
+    collects = []
+    for c in sorted(by["collect"], key=lambda c: c["start_ns"]):
+        c0, c1 = c["start_ns"], c["end_ns"]
+        fill = next((f for f in by["fill"] if f.get("level") == c["level"]
+                     and f["start_ns"] <= c0 and c1 <= f["end_ns"]), None)
+        reads = [r for r in by["read"] if c0 <= r["start_ns"] and r["end_ns"] <= c1]
+        wall = c1 - c0
+        window = occ_between(occ, c0, c1)
+        row = {
+            "kind": "fill" if fill else "wave", "zoom": c["zoom"], "level": c["level"],
+            "start_s": secs(c0), "wall_s": secs(wall),
+            "fill_extra_s": secs(fill["end_ns"] - fill["start_ns"] - wall) if fill else None,
+            "groups": c["groups"], "recv_s": secs(c["recv_ns"]), "join_s": secs(c["join_ns"]),
+            "inject_s": secs(c["inject_ns"]), "clip_wall_s": secs(c["clip_ns"]),
+            "clip_core_s": secs(c["clip_core_ns"]), "finish_s": secs(c["finish_ns"]),
+            "serial_s": secs(c["serial_ns"]),
+            "rest_s": secs(wall - c["recv_ns"] - c["join_ns"] - c["serial_ns"]),
+            "occupancy_mean": round(sum(x for _, x in window) / len(window), 1) if window else None,
+            "readers": sum(r["workers"] for r in reads),
+            "reader_wall_s": secs(sum(r["workers"] * (r["end_ns"] - r["start_ns"]) for r in reads)),
+            "reader_busy_s": secs(sum(sum(r["read_ns"]) for r in reads)),
+            "reader_send_blocked_s": secs(sum(sum(r["send_ns"]) for r in reads)),
+            "merge_wait_s": secs(sum(r["merge_wait_ns"] for r in reads)),
+            "merge_deliver_s": secs(sum(r["deliver_ns"] for r in reads)),
+        }
+        collects.append(row)
     end = by["end"][0]["t_ns"] if by["end"] else max(e.get("t_ns", 0) for e in events)
     levels = [e["t_ns"] for e in by["phase"] if e["phase"] == "levels"]
     return {
         "threads": threads, "export_s": secs(end),
         "levels_start_s": secs(levels[0]) if levels else None,
         "occupancy_mean": round(sum(b for _, b in occ) / len(occ), 2) if occ else None,
-        "zooms": zooms, "holds": holds, "waits": waits,
+        "zooms": zooms, "holds": holds, "waits": waits, "collects": collects,
     }
 
 
@@ -206,6 +234,19 @@ def report(s):
     for name, w in s["waits"].items():
         p(f"{name:>16} {w['calls']:>8} {w['bodies']:>9} {w['owner_wall_s']:>12.3f} "
           f"{w['body_core_s']:>11.3f} {w['max_call_s']:>10.3f}")
+    p("\n(e) band collects (seconds): driving thread = recv + join + serial + rest;"
+      " join = inject + max(finish, clip); readers: busy / blocked in send of their summed wall")
+    p(f"{'kind':>4} {'z':>3} {'start':>6} {'wall':>6} {'xtra':>5} {'grp':>4} {'recv':>6} {'join':>6} "
+      f"{'inject':>6} {'clip':>6} {'core':>7} {'finish':>6} {'serial':>6} {'rest':>5} {'occ':>5} "
+      f"{'rd':>3} {'rd_wall':>7} {'rd_busy':>7} {'rd_send':>7} {'mrg_wait':>8} {'mrg_dlv':>7}")
+    for c in s["collects"]:
+        xtra = "" if c["fill_extra_s"] is None else f"{c['fill_extra_s']:.2f}"
+        p(f"{c['kind']:>4} {c['zoom']:>3} {c['start_s']:>6.2f} {c['wall_s']:>6.2f} {xtra:>5} {c['groups']:>4} "
+          f"{c['recv_s']:>6.2f} {c['join_s']:>6.2f} {c['inject_s']:>6.2f} {c['clip_wall_s']:>6.2f} "
+          f"{c['clip_core_s']:>7.2f} {c['finish_s']:>6.2f} {c['serial_s']:>6.2f} {c['rest_s']:>5.2f} "
+          f"{c['occupancy_mean'] if c['occupancy_mean'] is not None else '-':>5} {c['readers']:>3} "
+          f"{c['reader_wall_s']:>7.2f} {c['reader_busy_s']:>7.2f} {c['reader_send_blocked_s']:>7.2f} "
+          f"{c['merge_wait_s']:>8.2f} {c['merge_deliver_s']:>7.2f}")
 
 
 def main():

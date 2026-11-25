@@ -211,6 +211,8 @@ pub(super) fn collect_into(
     // per wave on this path) plus each `next()` (read + Arrow decode);
     // `clip_group` and `finish_group` charge their own `decode`/`clip`.
     let timers = ctx.timers;
+    let t_collect = crate::tile_trace::mark();
+    let mut tr = CollectTrace::default();
 
     // PERF (#535, #817): the read runs on reader threads ahead of the clip
     // ([`read_band`]), so the pool never waits for a read-then-clip loop.
@@ -240,7 +242,9 @@ pub(super) fn collect_into(
     let mut step = |batches: Vec<RecordBatch>| -> Result<(), ExportError> {
         if !overlap {
             if let Some(c) = clipped.take() {
+                let t = crate::tile_trace::mark();
                 finish_group(ctx, wave, c, rows, sink, diagnostics)?;
+                tr.serial_ns += crate::tile_trace::since(t);
             }
         }
         #[cfg(test)]
@@ -250,18 +254,40 @@ pub(super) fn collect_into(
                 .unwrap_or_else(PoisonError::into_inner)
                 .collect_overlaps += 1;
         }
-        let (finished, next) = rayon::join(
-            || {
-                clipped.take().map_or(Ok(()), |c| {
-                    finish_group(ctx, wave, c, rows, sink, diagnostics)
-                })
-            },
-            || clip_group(ctx, wave, batches, diagnostics),
-        );
+        let t_join = crate::tile_trace::mark();
+        let ((t_finish, finish_ns, finished), (clip_ns, next)) =
+            crate::tile_trace::wait("fill_clip", |site| {
+                let joined = rayon::join(
+                    || {
+                        let t = crate::tile_trace::mark();
+                        let r = clipped.take().map_or(Ok(()), |c| {
+                            finish_group(ctx, wave, c, rows, sink, diagnostics)
+                        });
+                        (t, crate::tile_trace::since(t), r)
+                    },
+                    || {
+                        let t = crate::tile_trace::mark();
+                        let r = clip_group(ctx, wave, batches, site, diagnostics);
+                        (crate::tile_trace::since(t), r)
+                    },
+                );
+                tr.clip_core_ns += site.core_ns();
+                joined
+            });
+        if let (Some(t0), Some(t1)) = (t_join, t_finish) {
+            tr.groups += 1;
+            tr.join_ns += crate::tile_trace::since(t_join);
+            // The join's first half starts when a worker takes the injected join.
+            tr.inject_ns += t1.saturating_sub(t0);
+            tr.finish_ns += finish_ns;
+            tr.clip_ns += clip_ns;
+        }
         finished?;
         clipped = Some(next?);
         Ok(())
     };
+    // #876: the time between batches is this thread blocked on the pipe.
+    let mut last = crate::tile_trace::mark();
     read_band(
         ctx.band,
         &selected,
@@ -269,22 +295,62 @@ pub(super) fn collect_into(
         #[cfg(test)]
         ctx.work,
         |batch| {
+            tr.recv_ns += crate::tile_trace::since(last);
             let bytes = batch.get_array_memory_size();
-            group.push(batch, bytes, &mut step)
+            let r = group.push(batch, bytes, &mut step);
+            last = crate::tile_trace::mark();
+            r
         },
     )?;
+    tr.recv_ns += crate::tile_trace::since(last);
     if !group.batches.is_empty() {
         step(group.batches)?;
     }
     if let Some(c) = clipped.take() {
+        let t = crate::tile_trace::mark();
         finish_group(ctx, wave, c, rows, sink, diagnostics)?;
+        tr.serial_ns += crate::tile_trace::since(t);
     }
+    crate::tile_trace::span("collect", t_collect, || {
+        serde_json::json!({
+            "level": ctx.level_idx,
+            "zoom": ctx.zoom,
+            "groups": tr.groups,
+            "recv_ns": tr.recv_ns,
+            "join_ns": tr.join_ns,
+            "inject_ns": tr.inject_ns,
+            "finish_ns": tr.finish_ns,
+            "clip_ns": tr.clip_ns,
+            "clip_core_ns": tr.clip_core_ns,
+            "serial_ns": tr.serial_ns,
+        })
+    });
     #[cfg(test)]
     {
         let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
         *work.band_rows_read.entry(ctx.level_idx).or_default() += rows.read;
     }
     Ok(rows.read)
+}
+
+/// #876: where a traced [`collect_into`]'s driving thread spent its wall,
+/// for its `collect` trace event. Untouched untraced.
+#[derive(Default)]
+struct CollectTrace {
+    /// Finish-and-clip joins.
+    groups: u64,
+    /// Blocked on the reader pipe.
+    recv_ns: u64,
+    /// In the joins, and of that, before a worker started the injected join.
+    join_ns: u64,
+    inject_ns: u64,
+    /// Inside the joins: `finish_group`'s and `clip_group`'s wall, and the
+    /// clip's closure bodies' core time on every thread.
+    finish_ns: u64,
+    clip_ns: u64,
+    clip_core_ns: u64,
+    /// `finish_group` on this thread, outside a join.
+    serial_ns: u64,
 }
 
 /// The batches [`collect_into`] gathers before one [`clip_group`]: up to
@@ -813,6 +879,7 @@ pub(super) fn clip_group(
     ctx: &LevelCtx<'_>,
     wave: &[Partition],
     batches: Vec<RecordBatch>,
+    site: &crate::tile_trace::Site,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<ClippedGroup, ExportError> {
     let key_lo = wave[0].key_lo;
@@ -825,7 +892,9 @@ pub(super) fn clip_group(
     let geoms: Vec<Vec<Geometry<f64>>> = batches
         .par_iter()
         .zip(&geom_idxs)
-        .map(|(b, &gi)| decode_batch_geometries(b, &b.schema(), gi, ctx.crs, timers, diagnostics))
+        .map(|(b, &gi)| {
+            site.body(|| decode_batch_geometries(b, &b.schema(), gi, ctx.crs, timers, diagnostics))
+        })
         .collect::<Result<_, _>>()?;
     // The canonical level's own zoom, not `ctx.zoom`: a variable-depth probe
     // clips canonical geometry at an ancestor's zoom (#803).
@@ -837,7 +906,7 @@ pub(super) fn clip_group(
     let measure = valve_merges(ctx.opts);
     let rects = geoms
         .par_iter()
-        .map(|geoms| RowGapCursor::rects(measure, geoms))
+        .map(|geoms| site.body(|| RowGapCursor::rects(measure, geoms)))
         .collect();
     let row_members = geoms
         .into_par_iter()
@@ -847,20 +916,22 @@ pub(super) fn clip_group(
                 .map(|g| {
                     // #876: a clip a tile's thread runs is foreign to the tile.
                     let zoom = || crate::tile_trace::Ctx::zoom(ctx.zoom);
-                    crate::tile_trace::job(zoom, || {
-                        ExportTimers::time(&timers.clip, || {
-                            let mut members = shared_tile_members(
-                                MemberSource::Owned(g),
-                                finest_zoom,
-                                ctx.zoom,
-                                ctx.opts,
-                                (key_lo, key_hi),
-                                diagnostics,
-                            );
-                            if let Some(tiles) = ctx.tiles {
-                                members.retain(|(key, _)| tiles.contains_key(key));
-                            }
-                            members
+                    site.body(|| {
+                        crate::tile_trace::job(zoom, || {
+                            ExportTimers::time(&timers.clip, || {
+                                let mut members = shared_tile_members(
+                                    MemberSource::Owned(g),
+                                    finest_zoom,
+                                    ctx.zoom,
+                                    ctx.opts,
+                                    (key_lo, key_hi),
+                                    diagnostics,
+                                );
+                                if let Some(tiles) = ctx.tiles {
+                                    members.retain(|(key, _)| tiles.contains_key(key));
+                                }
+                                members
+                            })
                         })
                     })
                 })
