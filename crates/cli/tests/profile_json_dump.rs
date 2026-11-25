@@ -1436,6 +1436,8 @@ fn tile_trace_has_one_tile_event_per_written_tile_and_changes_no_byte() {
     );
     assert_eq!(of("start").count(), 1);
     assert_eq!(of("end").count(), 1);
+    assert_eq!(events[0]["ev"], "start", "start opens the export's lines");
+    assert_eq!(events[events.len() - 1]["ev"], "end", "end closes them");
     let mut written = std::collections::BTreeMap::<u64, u64>::new();
     let mut seen = std::collections::BTreeSet::new();
     for t in of("tile").filter(|t| t["raw_bytes"].as_u64() > Some(0)) {

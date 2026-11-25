@@ -1169,8 +1169,9 @@ event per tile, valve pass, scheduler step and wait site. It answers what
 their threads did meanwhile, and what the level scheduler held back. Off, it
 costs one relaxed atomic load per event site. On, each thread buffers its
 own lines and the export writes them when it ends, so the file is complete
-only after the export returns. The first export in a process truncates the
-file, later ones append; each begins with a `start` event. One export at a
+only after the export returns. Lines come grouped by thread, not in time
+order, between the export's `start` and `end` lines. The first export in a
+process truncates the file, later ones append. One export at a
 time per process is traced. The output archive is byte-identical with
 tracing on or off.
 

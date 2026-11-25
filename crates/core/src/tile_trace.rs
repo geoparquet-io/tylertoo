@@ -6,7 +6,8 @@
 //! appends JSON lines to a buffer of its own, which the export drains to
 //! the file when it ends ([`Session`]); no tile waits on another's lock.
 //! Every event carries `ev`, the OS thread id `tid`, and nanoseconds since
-//! the export started on one monotonic clock. `context/PROFILING.md` lists
+//! the export started on one monotonic clock. Lines are grouped by thread,
+//! not time, between the export's `start` and `end` lines. `context/PROFILING.md` lists
 //! the events and fields; `benchmarks/tile_trace.py` reads them.
 //!
 //! Each thread keeps a stack of the traced work it is inside: tiles
@@ -384,6 +385,18 @@ fn emit(ev: &'static str, mut v: Value) {
     }
 }
 
+/// Write `ev` straight to the file, stamped now and with this thread's id:
+/// `start` and `end`, which must bracket every line their export writes.
+fn write_direct(ev: &'static str, mut v: Value) {
+    v["ev"] = ev.into();
+    v["tid"] = os_tid().into();
+    v["t_ns"] = now_ns().into();
+    if let Ok(mut line) = serde_json::to_vec(&v) {
+        line.push(b'\n');
+        write_file(&line);
+    }
+}
+
 fn write_file(bytes: &[u8]) {
     if let Some(file) = lock(&FILE).as_mut() {
         if let Err(e) = file.write_all(bytes) {
@@ -442,16 +455,17 @@ impl Session {
         };
         *lock(&FILE) = Some(std::io::BufWriter::new(file));
         T0_NS.store(abs_ns(), Relaxed);
-        ON.store(true, Relaxed);
-        event("start", || {
+        write_direct(
+            "start",
             json!({
                 "pid": std::process::id(),
                 "threads": rayon::current_num_threads(),
                 "unix_secs": std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0.0, |d| d.as_secs_f64()),
-            })
-        });
+            }),
+        );
+        ON.store(true, Relaxed);
         let (stop, rx) = std::sync::mpsc::channel::<()>();
         let sampler = std::thread::spawn(move || loop {
             event("occ", || json!({ "busy": occupancy() }));
@@ -473,7 +487,6 @@ impl Drop for Session {
         if let Some(sampler) = self.sampler.take() {
             let _ = sampler.join();
         }
-        event("end", || json!({}));
         ON.store(false, Relaxed);
         let threads: Vec<Arc<ThreadBuf>> = lock(&THREADS).clone();
         for buf in &threads {
@@ -506,6 +519,7 @@ impl Drop for Session {
             }
         }
         write_file(&out);
+        write_direct("end", json!({}));
         if let Some(mut file) = lock(&FILE).take() {
             if let Err(e) = file.flush() {
                 log::warn!("[tile-trace] flush failed, the trace is incomplete: {e}");
