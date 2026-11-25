@@ -105,19 +105,19 @@ tylertoo overview prepared.parquet preview-ov.parquet \
 ✓ Overview prepared.parquet → preview-ov.parquet  (Duplicating mode)
   943 input features → 7,642 rows across 13 levels in 0.21s
   lvl        gsd(m)    features    vertices         bytes
-    0      39135.76           1           5  4.17 KiB
-    1      19567.88           6          30  5.08 KiB
-    2       9783.94          24         120  7.27 KiB
-    3       4891.97          99         494  15.50 KiB
-    4       2445.98         345       1,699  40.09 KiB
-    5       1222.99         668       3,120  72.90 KiB
-    6        611.50         856       4,219  93.98 KiB
-    7        305.75         929       5,602  110.15 KiB
-    8        152.87         942       7,533  126.08 KiB
-    9         76.44         943      10,088  145.42 KiB
-   10         38.22         943      13,262  169.75 KiB
-   11         19.11         943      17,266  201.00 KiB
-   12          9.55         943      58,321  530.90 KiB
+    0      39135.76           1           5  4.23 KiB
+    1      19567.88           6          30  5.16 KiB
+    2       9783.94          24         120  7.42 KiB
+    3       4891.97          99         494  15.79 KiB
+    4       2445.98         345       1,699  40.93 KiB
+    5       1222.99         668       3,120  74.49 KiB
+    6        611.50         856       4,219  95.98 KiB
+    7        305.75         929       5,602  112.32 KiB
+    8        152.87         942       7,533  128.27 KiB
+    9         76.44         943      10,088  147.61 KiB
+   10         38.22         943      13,262  171.94 KiB
+   11         19.11         943      17,266  203.19 KiB
+   12          9.55         943      58,321  533.09 KiB
 ```
 
 The box contains 943 polygons. `gsd` (ground sample distance) is the size of
@@ -157,16 +157,16 @@ tylertoo validate madagascar-ov.parquet
 ✓ Overview prepared.parquet → madagascar-ov.parquet  (Duplicating mode)
   17,465 input features → 134,717 rows across 10 levels in 0.66s
   lvl        gsd(m)    features    vertices         bytes
-    0      19567.88       1,558       7,763  182.57 KiB
-    1       9783.94       4,691      22,924  527.22 KiB
-    2       4891.97      10,102      48,691  1.09 MiB
-    3       2445.98      14,836      73,412  1.62 MiB
-    4       1222.99      16,572      96,022  1.90 MiB
-    5        611.50      17,174     130,279  2.21 MiB
-    6        305.75      17,393     177,644  2.61 MiB
-    7        152.87      17,461     239,621  3.15 MiB
-    8         76.44      17,465     322,984  3.86 MiB
-    9         38.22      17,465   1,749,880  17.45 MiB
+    0      19567.88       1,558       7,763  186.57 KiB
+    1       9783.94       4,691      22,924  540.24 KiB
+    2       4891.97      10,102      48,691  1.12 MiB
+    3       2445.98      14,836      73,412  1.66 MiB
+    4       1222.99      16,572      96,022  1.95 MiB
+    5        611.50      17,174     130,279  2.26 MiB
+    6        305.75      17,393     177,644  2.67 MiB
+    7        152.87      17,461     239,621  3.20 MiB
+    8         76.44      17,465     322,984  3.91 MiB
+    9         38.22      17,465   1,749,880  17.50 MiB
 Validating madagascar-ov.parquet
 ...
 ✓ valid overview file (12 checks passed)
