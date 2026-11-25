@@ -883,9 +883,9 @@ pub(super) type TileMembers = Vec<(u64, MemberGeom)>;
 pub(super) struct ClippedGroup {
     pub(super) batches: Vec<RecordBatch>,
     pub(super) geom_idxs: Vec<usize>,
-    /// The decoded geometries' bounding rects, kept for the in-order gap
+    /// The decoded geometries' projected bboxes, kept for the in-order gap
     /// walk; the geometries themselves went to their members.
-    pub(super) rects: Vec<Vec<Option<geo::Rect<f64>>>>,
+    pub(super) boxes: Vec<Vec<Option<super::coalesce_valve::RowBox>>>,
     /// Per batch, per row: the row's `(key, clipped geometry)` members.
     pub(super) row_members: Vec<Vec<TileMembers>>,
 }
@@ -921,9 +921,9 @@ pub(super) fn clip_group(
     // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
     // range. #535: `clip` is timed per geometry inside the closure.
     let measure = valve_merges(ctx.opts);
-    let rects = geoms
+    let boxes = geoms
         .par_iter()
-        .map(|geoms| site.body(|| RowGapCursor::rects(measure, geoms)))
+        .map(|geoms| site.body(|| RowGapCursor::boxes(measure, geoms)))
         .collect();
     let row_members = geoms
         .into_par_iter()
@@ -958,7 +958,7 @@ pub(super) fn clip_group(
     Ok(ClippedGroup {
         batches,
         geom_idxs,
-        rects,
+        boxes,
         row_members,
     })
 }
@@ -979,7 +979,7 @@ pub(super) fn finish_group(
     let ClippedGroup {
         batches,
         geom_idxs,
-        rects,
+        boxes,
         mut row_members,
     } = group;
     let batches = &batches;
@@ -991,7 +991,7 @@ pub(super) fn finish_group(
     }
     let t = crate::tile_trace::mark();
     let row_gaps: Vec<Vec<(u64, u16)>> = ExportTimers::time(&timers.decode, || {
-        rects.iter().map(|r| rows.gaps.batch_rects(r)).collect()
+        boxes.iter().map(|b| rows.gaps.batch_boxes(b)).collect()
     });
     tr.gaps_ns += crate::tile_trace::since(t);
 
