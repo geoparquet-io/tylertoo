@@ -757,6 +757,16 @@ admission and drains claimed batches before the closure can drop, on
 return and on unwind. `rayon::scope` cannot replace this, because the
 scope's end also waits by running other rayon jobs.
 
+The store fill's ordered gap walk (`RowGapCursor::batch_boxes`,
+`coalesce_valve.rs`) was a fourth site of the class: its two small
+parallel calls per batch ran inside the finish half of the fill's
+finish-and-clip join, and each waited by running the group's clip work.
+The clip half now projects each row's bbox corners and centre in the pool
+(`RowGapCursor::boxes`), and the walk is one serial loop over them. It
+uses the same `gap_to_world_box` on the same values, so the gaps are bit
+for bit those of before. It is serial rather than `owner_map` because a
+row costs a few sums, less than claiming a batch.
+
 Border duplication is the expected delta between overview level counts and
 export per-zoom feature totals (a feature spanning a tile seam appears in
 every tile it touches): 0% while a level fits one tile, ~7% at z14 on
