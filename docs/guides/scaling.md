@@ -74,7 +74,7 @@ batches processed at once, and the row groups the writer encodes at once.
 | --- | --- | --- |
 | `speed` | RAM | No limit: every knob at its maximum |
 | `bounded` | Temporary Arrow Inter-Process Communication (IPC) files | Fixed initial caps: at most 4 readers 4 batches deep, at most 4 batches in flight through pass 2 whatever `--in-flight-batches` asks for, and 4 encodes. The drain can reuse released batch memory for more encodes |
-| `auto` (default) | RAM when the estimate fits 60% of available RAM, otherwise spill. Measures buffered rows and switches to spilling mid-pass if they outgrow it | Sized to fit the same 60%, priced from the Parquet footers |
+| `auto` (default) | RAM when the estimate fits what is left of 60% of available RAM after the memory other phases reserve or are granted, or 150% of that for an estimate priced from the Parquet footers, which overstates; otherwise spill. Measures buffered rows and switches to spilling mid-pass if they outgrow what is left | Sized to fit the same 60%, priced from the Parquet footers |
 
 `auto` is its own shape, not a switch between the other two: on a large
 machine it holds more than `bounded` and less than `speed`.

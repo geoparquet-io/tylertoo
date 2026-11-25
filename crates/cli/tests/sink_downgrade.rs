@@ -136,9 +136,22 @@ fn run_overview(
     profile: &str,
     mem_limit: Option<&str>,
 ) -> (Vec<u8>, serde_json::Value) {
+    let (bytes, value, _) = run_overview_with(dir, input, profile, mem_limit, "4");
+    (bytes, value)
+}
+
+/// [`run_overview`] on `threads` threads, also returning the log.
+fn run_overview_with(
+    dir: &Path,
+    input: &Path,
+    profile: &str,
+    mem_limit: Option<&str>,
+    threads: &str,
+) -> (Vec<u8>, serde_json::Value, String) {
     let stem = input.file_stem().unwrap().to_string_lossy();
-    let out = dir.join(format!("out-{stem}-{profile}.parquet"));
-    let profile_json = dir.join(format!("profile-{stem}-{profile}.jsonl"));
+    let limit = mem_limit.unwrap_or("none");
+    let out = dir.join(format!("out-{stem}-{profile}-{limit}-{threads}.parquet"));
+    let profile_json = dir.join(format!("profile-{stem}-{profile}-{limit}-{threads}.jsonl"));
     let mut cmd = Command::new(tylertoo_bin());
     cmd.args([
         "overview",
@@ -157,23 +170,87 @@ fn run_overview(
         "--drop-rate",
         "1.65",
     ])
-    .env("RAYON_NUM_THREADS", "4")
+    .env("RAYON_NUM_THREADS", threads)
+    .env("RUST_LOG", "info,tylertoo_core::overview::pipeline=debug")
     .env("TYLERTOO_PROFILE_JSON", &profile_json)
     .env_remove("TYLERTOO_AUTO_MEM_LIMIT_BYTES");
     if let Some(limit) = mem_limit {
         cmd.env("TYLERTOO_AUTO_MEM_LIMIT_BYTES", limit);
     }
     let output = cmd.output().expect("run tylertoo overview");
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
-        "overview --profile {profile} exited with {}: {}",
+        "overview --profile {profile} exited with {}: {log}",
         output.status,
-        String::from_utf8_lossy(&output.stderr)
     );
     let line = std::fs::read_to_string(&profile_json).expect("read profile JSON");
     let value = serde_json::from_str(line.lines().next().expect("one profile line"))
         .expect("valid profile JSON");
-    (std::fs::read(&out).expect("read output"), value)
+    (std::fs::read(&out).expect("read output"), value, log)
+}
+
+/// The number in `log` between the first `before` and the next `after`.
+fn logged(log: &str, before: &str, after: &str) -> u64 {
+    let rest = &log[log
+        .find(before)
+        .unwrap_or_else(|| panic!("no {before:?}:\n{log}"))
+        + before.len()..];
+    rest[..rest.find(after).expect(after)]
+        .trim()
+        .parse()
+        .expect("a number")
+}
+
+/// #876: the footers price this input's dictionary-encoded `name` at a few
+/// bytes a row, so under a 40 MB limit its estimate (5 MiB, 1.33x) passes
+/// the allowance (4 MiB) but not the 150% `auto` admits for a footer-priced
+/// estimate. It starts in RAM, the heavy tail outgrows the budget, the
+/// tuner downgrades mid-pass, and the output matches `bounded` byte for byte.
+#[test]
+fn auto_admitted_past_the_allowance_downgrades_and_matches_bounded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("skewed.parquet");
+    write_points(&input, LIGHT_HEAD_ROWS);
+    let (auto_bytes, auto, log) =
+        run_overview_with(dir.path(), &input, "auto", Some("40000000"), "4");
+    let decision = log
+        .lines()
+        .find(|l| l.contains("pass2 auto + "))
+        .expect("the sink decision");
+    let (estimate, allowance) = (
+        logged(decision, " est ", "MiB vs"),
+        logged(decision, "MiB vs budget ", "MiB, RAM"),
+    );
+    assert!(
+        allowance < estimate && 2 * estimate <= 3 * allowance && log.contains("→ Ram"),
+        "the estimate must pass the allowance by at most half and start in RAM:\n{log}"
+    );
+    assert_eq!(auto["pass2"]["sink"]["downgraded_to_spill"], true, "{auto}");
+    let (bounded_bytes, _) = run_overview(dir.path(), &input, "bounded", None);
+    assert!(
+        auto_bytes == bounded_bytes,
+        "a mid-pass downgrade changed the output"
+    );
+}
+
+/// #876: a run that downgrades mid-pass drains with its whole encode grant,
+/// as one that spilled up front does, not cut to `bounded`'s 4. Under a
+/// 170 MB limit on 8 threads `auto` grants this input 5 encodes, and its
+/// heavier tail (from row 8,000) buffers well past the ~73 MB budget.
+#[test]
+fn auto_downgraded_mid_pass_drains_with_its_encode_grant() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("skewed.parquet");
+    write_points(&input, LIGHT_HEAD_ROWS / 2);
+    let (_, auto, log) = run_overview_with(dir.path(), &input, "auto", Some("170000000"), "8");
+    assert_eq!(auto["pass2"]["sink"]["downgraded_to_spill"], true, "{auto}");
+    let granted = logged(&log, "writer: ", "concurrent");
+    let drained = logged(&log, "pass 2 drain: ", "encode(s)");
+    assert!(
+        granted > 4 && drained >= granted,
+        "{granted} granted, {drained} drained:\n{log}"
+    );
 }
 
 /// A light head over a heavy tail: `auto` starts in RAM, the whole-pass
@@ -260,7 +337,7 @@ fn auto_spilling_up_front_keeps_its_encodes_and_spills_raw() {
             "--profile",
             profile,
             "--row-group-size",
-            "200",
+            "100",
         ])
         .env("RAYON_NUM_THREADS", "8")
         .env("RUST_LOG", "info")
@@ -283,7 +360,9 @@ fn auto_spilling_up_front_keeps_its_encodes_and_spills_raw() {
             .expect("an encode grant");
         (value, encode, log)
     };
-    let (auto, auto_encode, log) = run("auto", Some("250000000"));
+    // Small enough that the footer-priced estimate passes 150% of the
+    // allowance, the most `auto` starts in RAM with (#876).
+    let (auto, auto_encode, log) = run("auto", Some("100000000"));
     assert!(
         log.contains("→ Spill") && auto["pass2"]["sink"]["downgraded_to_spill"] == false,
         "the fixture must make `auto` spill up front:\n{log}"

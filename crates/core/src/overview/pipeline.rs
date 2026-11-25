@@ -120,8 +120,9 @@ pub(super) const fn spill_bytes_per_arrow_byte(codec: IpcCompression) -> f64 {
 
 /// The profile that sizes pass 2's read-ahead and window once the sink
 /// `backing` is known (#815): an `auto` run that spills sizes them as
-/// `bounded` does. Its encodes keep `auto`'s grant: as `bounded`'s they
-/// cost NZ parcels and Mato Grosso 3-4 s of pass 2.
+/// `bounded` does. Its encodes keep `auto`'s grant, also after a mid-pass
+/// downgrade: as `bounded`'s they cost NZ parcels and Mato Grosso 3-4 s of
+/// pass 2, and the grant stays charged beside the sinks the downgrade empties.
 pub(super) fn sizing_profile(profile: MemoryProfile, backing: SinkBacking) -> MemoryProfile {
     match (profile, backing) {
         (MemoryProfile::Auto, SinkBacking::Spill) => MemoryProfile::Bounded,
@@ -143,11 +144,40 @@ pub(super) const fn spill_codec_name(codec: IpcCompression) -> &'static str {
 /// sooner).
 const PARTITIONING_SPILL_ROWS: usize = 2_000_000;
 
+/// How far past the allowance, in percent, a RAM sink estimate priced from
+/// the Parquet footers may go and still start in RAM (#876). That estimate
+/// prices each kept row at its decoded footer bytes (twice them, the worst
+/// ratio measured, `read::DECODED_PER_FOOTER_BYTE`) and every further output
+/// row at the input's full-resolution geometry. How far coarser levels
+/// simplify, and how many cascade steps leave a geometry unchanged for its
+/// levels to share, depend on the data, so neither is taken off. Measured
+/// under a 24 GiB cgroup, the estimate read 2.6x the sink on NZ parcels
+/// (12530 MiB for 4.8 GiB, against a 12415 MiB allowance) and 3.5x on Mato
+/// Grosso (15323 MiB for 4.3 GiB, against 11540 MiB); both spilled, which
+/// cost 25% and 15% of the run's wall. 150% admits both (1.01x and 1.33x)
+/// and stays below the smaller overstatement, so a sink overstated as much
+/// as those fits the allowance. One overstated less starts in RAM and is
+/// spilled mid-pass by the #626 tuner ([`SinkAutoTuner::should_downgrade`]).
+const FOOTER_PRICED_RAM_ADMIT_PERCENT: u64 = 150;
+
+/// What `auto`'s RAM sink estimate may reach and still start in RAM: the
+/// allowance, widened by [`FOOTER_PRICED_RAM_ADMIT_PERCENT`] when the
+/// footers priced the row.
+fn auto_ram_gate(memory: &MemoryBudget, row_bytes: Option<u64>) -> u64 {
+    let allowance = memory.allowance(MemoryProfile::Auto);
+    if row_bytes.is_some_and(|r| r > 0) {
+        allowance.saturating_mul(FOOTER_PRICED_RAM_ADMIT_PERCENT) / 100
+    } else {
+        allowance
+    }
+}
+
 /// Workload-driven backing choice for [`MemoryProfile::Auto`] (#294).
 ///
 /// Chooses [`SinkBacking::Spill`] when the estimated buffered output exceeds
 /// `memory`'s own [`MemoryProfile::Auto`] allowance, after every reservation
-/// and grant already charged to it — a function of `feature_count × level_count ×
+/// and grant already charged to it, widened when the footers priced the row
+/// ([`auto_ram_gate`]) — a function of `feature_count × level_count ×
 /// mode` (captured by `buffered_rows` and the per-mode byte estimate), NOT a
 /// mode-only rule. `shared_from` is the input row count when the RAM sink's
 /// levels share their rows' properties ([`MemoryBudget::ram_sink_estimate`]). Partitioning additionally keeps its historical absolute
@@ -162,7 +192,7 @@ pub(super) fn auto_backing(
 ) -> SinkBacking {
     let estimate =
         memory.ram_sink_estimate(mode, buffered_rows, shared_from, avg_geom_bytes, row_bytes);
-    let ram_gate_spill = estimate > memory.allowance(MemoryProfile::Auto);
+    let ram_gate_spill = estimate > auto_ram_gate(memory, row_bytes);
     let abs_gate_spill =
         matches!(mode, Mode::Partitioning) && buffered_rows > PARTITIONING_SPILL_ROWS;
     if ram_gate_spill || abs_gate_spill {
@@ -740,6 +770,7 @@ pub(super) fn resolve_backing(
     let estimate =
         memory.ram_sink_estimate(mode, buffered_rows, shared_from, avg_geom_bytes, row_bytes);
     let budget = memory.allowance(MemoryProfile::Auto);
+    let gate = auto_ram_gate(&memory, row_bytes);
     let avail_mib = memory.available().map_or_else(
         || "unknown".to_string(),
         |b| format!("{} MiB", b / (1024 * 1024)),
@@ -756,9 +787,10 @@ pub(super) fn resolve_backing(
     // diagnostic for #294 / #295 (paired with the [rss] phase logs).
     log::info!(
         "[convert] pass2 auto + {mode:?}: buffered ~{buffered_rows} rows, \
-         {geom}, est {} MiB vs budget {} MiB (avail {avail_mib}) → {backing:?}",
+         {geom}, est {} MiB vs budget {} MiB, RAM up to {} MiB (avail {avail_mib}) → {backing:?}",
         estimate / (1024 * 1024),
         budget / (1024 * 1024),
+        gate / (1024 * 1024),
     );
     backing
 }
@@ -817,10 +849,23 @@ pub(super) struct SinkMeasurement {
 /// passes the budget it downgrades the Ram sinks to Spill **once**.
 ///
 /// The check never stops. A spatially sorted input can put its sparse rows
-/// first, so no prefix of the input can vouch for the rest; and because the
-/// bytes already buffered are a term of the projection, the downgrade fires
-/// at the latest when what the Ram sinks actually hold reaches the budget,
-/// however light the head was and however wrong the planned row count is.
+/// first, so no prefix of the input can vouch for the rest. It also fires on
+/// what the Ram sinks hold, whatever the sample size and however wrong the
+/// planned row count is: when that plus a window of input batches as heavy
+/// as the heaviest so far passes the budget, since pass 2 builds the next
+/// window's outputs before the next check (#876).
+///
+/// **The bound.** At every check the Ram sinks hold no more than the budget:
+/// 60% of the probed memory less its reservations, less every grant charged
+/// by the time pass 2 starts (encodes, read-ahead, window). Around them sit
+/// the read-ahead and window those grants price, and the 40% nothing prices.
+/// Three things can pass it, briefly: an input batch heavier than every one
+/// before it, by its own outputs, until the check after it; read-ahead and
+/// window batches heavier than the footers' average row prices them; and the
+/// downgrade itself, which rebuilds each level's buffered batches one at a
+/// time into its spill writer's queue ([`SPILL_QUEUE_DEPTH`] plus the one
+/// being written) while the rows the levels share stay until every level
+/// has flushed them. There is no live RSS check.
 ///
 /// One-way and once: a sink that has spilled never comes back, so the engine
 /// cannot oscillate and no batch is ever written twice. `bounded` and `speed`
@@ -856,6 +901,12 @@ struct SinkAutoTuner {
     /// `disk_levels` stops counting once this is set, so `disk_bytes_per_row` is
     /// only meaningful up to the check.
     disk_checked: bool,
+    /// Input batches pass 2 builds at once (its compute window).
+    window: usize,
+    /// `bytes` when the current input batch's outputs began.
+    batch_start: u64,
+    /// The most bytes one input batch's outputs added.
+    step_max: u64,
 }
 
 impl SinkAutoTuner {
@@ -918,6 +969,9 @@ impl SinkAutoTuner {
             armed,
             downgraded: false,
             disk_checked: false,
+            window: 1,
+            batch_start: 0,
+            step_max: 0,
         }
     }
 
@@ -1009,12 +1063,25 @@ impl SinkAutoTuner {
         })
     }
 
-    /// Whether the measurement now says the Ram sinks cannot hold the run.
+    /// Close the current input batch: its outputs are all observed.
+    fn end_input_batch(&mut self) {
+        self.step_max = self.step_max.max(self.bytes - self.batch_start);
+        self.batch_start = self.bytes;
+    }
+
+    /// Whether the measurement now says the Ram sinks cannot hold the run:
+    /// what they hold, plus room for a window of input batches as heavy as
+    /// the heaviest so far (built before the next check), passes the budget;
+    /// or, once the sample is [`SINK_SAMPLE_MIN_ROWS`] rows, the projection
+    /// does.
     fn should_downgrade(&self) -> bool {
+        let next_window = self.step_max.saturating_mul(self.window as u64);
         self.armed
             && !self.downgraded
-            && self.rows >= SINK_SAMPLE_MIN_ROWS
-            && self.projected_bytes() > self.budget_bytes
+            && self.rows > 0
+            && (self.bytes.saturating_add(next_window) > self.budget_bytes
+                || (self.rows >= SINK_SAMPLE_MIN_ROWS
+                    && self.projected_bytes() > self.budget_bytes))
     }
 
     /// The warning a downgrade of `levels` RAM sinks logs.
@@ -1028,17 +1095,6 @@ impl SinkAutoTuner {
             gib(self.projected_bytes()),
             gib(self.budget_bytes),
         )
-    }
-
-    /// Encodes the drain may run: once downgraded to spill, as `bounded`
-    /// (#815).
-    fn encode_cap(&self, units: usize) -> usize {
-        let sized_as = if self.downgraded {
-            MemoryProfile::Bounded
-        } else {
-            MemoryProfile::Auto
-        };
-        MemoryBudget::encode_units_as(sized_as, units)
     }
 
     /// Record that the downgrade happened (and disarm: it is one-way).
@@ -1075,6 +1131,7 @@ fn downgrade_if_due(
     (out_schema, spill_dir): (&Schema, Option<&Path>),
     (diagnostics, share): (&crate::diagnostics::Diagnostics, &atomic::AtomicBool),
 ) -> Result<(), ConvertError> {
+    tuner.end_input_batch();
     if !tuner.should_downgrade() {
         return Ok(());
     }
@@ -1922,7 +1979,10 @@ pub(super) fn run_pass2_buffered(
     let mut spill_bytes = vec![0u64; num_levels];
     // #626: measures what a buffered row really costs and, for `auto`, flips
     // the sinks to spill once if the measured rate projects past the budget.
-    let mut tuner = SinkAutoTuner::new(profile, backing, hints, budget);
+    let mut tuner = SinkAutoTuner {
+        window,
+        ..SinkAutoTuner::new(profile, backing, hints, budget)
+    };
     #[cfg(test)]
     spill_tests::TUNER_ARMING.with(|c| {
         c.set((
@@ -2079,10 +2139,7 @@ pub(super) fn run_pass2_buffered(
     let below_peak = drain_headroom();
     let held = peak_batch.into_inner().saturating_mul(in_flight as u64);
     let (width, mut decode_width, decode_bytes) = MemoryBudget::drain_widths(
-        Grant {
-            units: tuner.encode_cap(encode.units),
-            ..encode
-        },
+        encode,
         slot_bytes,
         held.min(read_granted),
         LevelSink::largest_spill_batch(&sinks),
@@ -2124,7 +2181,7 @@ pub(super) fn run_pass2_buffered(
     }
     // Drains the widened encodes past `writer_units` before the caller
     // releases the read grants they were priced against.
-    writer.set_encode_concurrency(tuner.encode_cap(writer_units))?;
+    writer.set_encode_concurrency(writer_units)?;
 
     tuner.log_projection();
     timers.log_engine_summary(t_engine.elapsed().as_secs_f64(), rows.iter().sum());
@@ -3241,6 +3298,60 @@ mod backing_tests {
             ),
             SinkBacking::Spill
         ));
+    }
+
+    /// #876: NZ parcels and Mato Grosso under a 24 GiB cgroup, at the
+    /// decisions as logged (the encode grant charged): 18.4M buffered rows
+    /// shared from 4.3M input rows at a 1214 B footer row and 461 B of
+    /// geometry estimate 12530 MiB against 12415 MiB; 14.0M from 4.6M at
+    /// 1672 B and 743 B, 15323 MiB against 11540 MiB. Their sinks held 4.8
+    /// and 4.3 GiB, so spilling them cost 25% and 15% of the run's wall. Both
+    /// are within [`FOOTER_PRICED_RAM_ADMIT_PERCENT`] of the allowance and
+    /// start in RAM; half as many rows again (1.77x the allowance) spills up
+    /// front, under the 2x 3a66bc08 admitted. `bounded` spills whatever the
+    /// estimate.
+    #[test]
+    fn auto_starts_the_measured_footer_priced_sinks_in_ram() {
+        use crate::overview::memory::{MemoryPhase, Price, PriceBasis};
+        let mut nz = MemoryBudget::with_available(Some(25_741_537_888));
+        let _encode = nz.fit(
+            MemoryProfile::Speed,
+            MemoryPhase::Encode,
+            Price::new(2_426_057_600, PriceBasis::Model),
+            1,
+            1,
+        );
+        let mt = MemoryBudget::with_available(Some(20_168_485_547));
+        for (memory, rows, input, geom, row, logged) in [
+            (nz, 18_357_543, 4_343_547, 461, 1214, (12_530, 12_415)),
+            (mt, 14_021_104, 4_579_024, 743, 1672, (15_323, 11_540)),
+        ] {
+            let (input, geom, row) = (Some(input), Some(geom), Some(row));
+            let allowance = memory.allowance(MemoryProfile::Auto);
+            let estimate =
+                |rows| memory.ram_sink_estimate(Mode::Duplicating, rows, input, geom, row);
+            assert_eq!((estimate(rows) >> 20, allowance >> 20), logged);
+            let auto = |rows| auto_backing(&memory, Mode::Duplicating, rows, input, geom, row);
+            assert!(matches!(auto(rows), SinkBacking::Ram), "{logged:?}");
+            assert!(matches!(
+                sink_backing(
+                    &memory,
+                    MemoryProfile::Bounded,
+                    Mode::Duplicating,
+                    rows,
+                    input,
+                    geom,
+                    row
+                ),
+                SinkBacking::Spill
+            ));
+            if logged.0 > logged.1 * 13 / 10 {
+                let more = rows * 3 / 2;
+                let ratio = estimate(more) as f64 / allowance as f64;
+                assert!((1.5..2.0).contains(&ratio), "{ratio}");
+                assert!(matches!(auto(more), SinkBacking::Spill), "{ratio}");
+            }
+        }
     }
 
     #[test]
@@ -4534,6 +4645,48 @@ mod sink_sample_tests {
              projection says {} B",
             tuner.projected_bytes(),
         );
+    }
+
+    /// #876 review: a few huge rows can hold more than the budget long
+    /// before [`SINK_SAMPLE_MIN_ROWS`] rows are seen. What the sinks hold
+    /// downgrades them whatever the sample size; only the projection waits
+    /// for it.
+    #[test]
+    fn a_few_huge_rows_past_the_budget_downgrade_before_the_sample_minimum() {
+        use arrow_array::StringArray;
+        let budget = 8 << 20;
+        let huge = || {
+            let name: ArrayRef = Arc::new(StringArray::from(vec!["x".repeat(64 << 10); 3]));
+            LevelBatch::Owned(RecordBatch::try_from_iter([("name", name)]).unwrap())
+        };
+        let mut tuner = SinkAutoTuner::with_budget(true, 900, budget);
+        while tuner.bytes <= budget {
+            assert!(!tuner.should_downgrade(), "{} B held", tuner.bytes);
+            tuner.observe(0, &huge());
+        }
+        assert!(tuner.rows < SINK_SAMPLE_MIN_ROWS, "{} rows", tuner.rows);
+        assert!(tuner.should_downgrade(), "{} B held", tuner.bytes);
+    }
+
+    /// Pass 2 builds a whole window's outputs before it buffers the first
+    /// (`pipe::for_each_window`), so the held-bytes check leaves room for a
+    /// window of input batches as heavy as the heaviest one so far.
+    #[test]
+    fn the_held_bytes_check_leaves_room_for_the_next_window() {
+        let step = {
+            let mut tuner = SinkAutoTuner::with_budget(false, ROWS, 0);
+            tuner.observe(0, &LevelBatch::Owned(sample_batch(20)));
+            tuner.bytes
+        };
+        for (window, due) in [(1, false), (4, true)] {
+            let mut tuner = SinkAutoTuner {
+                window,
+                ..SinkAutoTuner::with_budget(true, ROWS, 3 * step)
+            };
+            tuner.observe(0, &LevelBatch::Owned(sample_batch(20)));
+            tuner.end_input_batch();
+            assert_eq!(tuner.should_downgrade(), due, "window {window}");
+        }
     }
 
     /// The load-bearing safety property (#626 item 2): a downgrade must not

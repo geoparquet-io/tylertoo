@@ -183,11 +183,18 @@ For example, `B = 20M`, `I = 10M`, `p = 1000`, `g = 100` gives
 `min(20 GB, 12.56 + 1 + 0.32 GB)` = 13.88 GB (12.93 GiB).
 
 [`pipeline.rs`](../crates/core/src/overview/pipeline.rs) compares that
-estimate with the allowance left after grants. `auto` also spills
+estimate with the allowance left after grants, and with 150% of it when
+footer prices exist (`FOOTER_PRICED_RAM_ADMIT_PERCENT`, #876): `p` uses the
+worst decoded ratio measured and `g` the input's full-resolution geometry.
+NZ parcels estimated 12.2 GiB for a sink that measured 4.8 GiB, and Mato
+Grosso 15.0 GiB for 4.3 GiB. A sink that does not fit is caught by the
+runtime check below. `auto` also spills
 partitioning output above 2 million buffered rows. During RAM buffering it measures
-Arrow bytes plus a 256 B floor per materialized row. The tuner counts shared source rows once; each level adds its own arrays. The tuner projects
-`held bytes + remaining planned rows × observed bytes/row` after each
-input batch and can switch once to spill. Arrow array accounting can
+Arrow bytes plus a 256 B floor per materialized row. The tuner counts shared source rows once; each level adds its own arrays. After each
+input batch the tuner switches once to spill when `held bytes + window ×
+largest input batch's bytes so far` passes its budget, or, from 1,024
+observed rows, when `held bytes + remaining planned rows × observed
+bytes/row` does. Arrow array accounting can
 count shared buffers more than once, so this remains a sizing estimate.
 
 `bounded` spills LZ4 IPC; an `auto` spill uses raw IPC. The cgroup page-cache

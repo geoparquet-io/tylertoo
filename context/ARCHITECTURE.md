@@ -61,8 +61,14 @@ this, the read-ahead, the compute window and the encodes each took their own
 slice of the same allowance and nothing summed them (#716). Every decision
 reads the one budget's own figures: `auto`'s RAM-or-spill choice for the
 pass-2 sinks and export's fill store compares its estimate with
-`budget.allowance(Auto)` after the grants already charged, the same figure
-the runtime downgrade (#626) checks (`pipeline::auto_backing`).
+`budget.allowance(Auto)` after the grants already charged
+(`pipeline::auto_backing`). The runtime downgrade (#626) checks the same
+budget after pass 2's read-ahead and window grants too, so its figure is
+smaller by them. A sink estimate priced from the footers may pass the
+allowance by half and still start in RAM (`FOOTER_PRICED_RAM_ADMIT_PERCENT`,
+#876): it read 2.6-3.5x the measured sink on NZ parcels and Mato Grosso, and
+the runtime downgrade spills a sink whose held bytes, plus room for the next
+window, pass its budget.
 
 "Once per operation", not once per process. A `tiles` run probes four
 times, through three probes in `pipeline.rs`, each for a reason:

@@ -2421,20 +2421,27 @@ there.
 `auto` estimates `buffered rows × per-row cost` from the average
 encoded-geometry size of the rows pass 1 reads, taken from the uncompressed
 column sizes in the Parquet footer. Geometry dominates buffered rows and
-varies about 400× across datasets. The estimate is conservative, favoring spilling.
+varies about 400× across datasets. When the footers price whole rows, the
+estimate counts the kept property columns too. It is conservative: priced
+from the footers, it read 2.6× the measured buffered rows on NZ parcels and
+3.5× on Mato Grosso, so a footer-priced estimate starts in RAM up to 150% of
+the budget and relies on the check below (#876).
 If pass 1 scanned nothing, it uses about 8 KiB per duplicating row or
 16 KiB per partitioning row. Partitioning always spills above 2M buffered
 rows. The log reports the average, estimate, budget, and decision.
 `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides the detected available RAM.
 
-That estimate counts geometry only, so a run that starts in RAM keeps
-measuring for the whole pass (#626). It sums the Arrow bytes of every
-buffered batch, geometry plus every kept property column, with a 256-byte
-floor per row. After each input batch, it adds the bytes already buffered to
-the rows still to come at the rate so far. If that total passes the budget,
-`auto` moves the buffered rows to spill files once and spills for the rest of
-the pass. Row order and output bytes do not change. The switch happens no
-later than the moment the buffered bytes reach the budget. The log and
+That estimate is a guess, so a run that starts in RAM keeps measuring for
+the whole pass (#626). It sums the Arrow bytes of every buffered batch,
+geometry plus every kept property column, with a 256-byte floor per row.
+After each input batch, `auto` moves the buffered rows to spill files once,
+and spills for the rest of the pass, when either total passes the budget: the
+bytes already buffered plus room for one more window of input batches as
+heavy as the heaviest so far, or, after 1,024 rows, the bytes already
+buffered plus the rows still to come at the rate so far. Row order and output
+bytes do not change. The budget is what the allowance has left after the
+encode, read-ahead and window grants. A single input batch heavier than all
+before it can pass it until the check after that batch. The log and
 `TYLERTOO_PROFILE_JSON` (`pass2.sink`) report the measured bytes per row and
 whether it switched. `speed` and `bounded` never switch.
 
