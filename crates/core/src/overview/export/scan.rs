@@ -815,8 +815,11 @@ pub(super) fn scan_with_floors(
     (timers, vd): (&ExportTimers, Option<&mut variable_depth::VdScan>),
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(Vec<LevelScan>, valve_predict::ValveFloors), ExportError> {
-    let mut predict =
-        valve_predicts(options).then(|| valve_predict::Scan::new(reader.num_levels()));
+    let mut predict = valve_predicts(options).then(|| {
+        let mut p = valve_predict::Scan::new(reader.num_levels());
+        p.set_room(budget.room(options.profile));
+        p
+    });
     let band = BandRead {
         source: reader.source(),
         budget: *budget,
@@ -888,10 +891,13 @@ pub(super) fn shed_over_budget(
         return;
     }
     let held = p.resident_bytes();
-    if budget
-        .require_allowance(profile, MemoryPhase::Scan, held)
-        .is_err()
-    {
+    let over = p.outgrew()
+        || budget
+            .require_allowance(profile, MemoryPhase::Scan, held)
+            .is_err();
+    // The next batch's flushes stop adding dense state past this.
+    p.set_room(budget.room(profile));
+    if over {
         p.shed();
         log::info!("[export] valve predictor state: {held} bytes, over the scan's budget");
         warn_floors_shed(true, opts, diagnostics);

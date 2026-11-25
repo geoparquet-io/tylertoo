@@ -61,6 +61,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
+#[expect(
+    clippy::disallowed_types,
+    reason = "#768: one flush's dense-state charge, shared by its parallel tasks; no diagnostic globals"
+)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use geo::Rect;
 use rayon::prelude::*;
@@ -208,6 +213,11 @@ pub(crate) struct Scan {
     /// The dense state outgrew the scan's budget and was dropped
     /// ([`Self::shed`]): only the counts go on, and nothing is predicted.
     shed: bool,
+    /// What the scan's budget leaves the predictor ([`Self::set_room`]),
+    /// and whether a flush outgrew it: it then stops adding dense state,
+    /// and the scan sheds it ([`Self::outgrew`]).
+    room: u64,
+    over: bool,
     /// The band being read, and its rows already sized.
     band: Option<usize>,
     band_rows: u64,
@@ -274,6 +284,10 @@ fn fan_windows(rows: &[SizedRow], zoom: u8, opts: &ExportOptions) -> Vec<Range<u
     out.push(start..rows.len());
     out
 }
+
+/// Resident bytes a dense tile's price rows and a gap histogram hold.
+const PRICE_ROWS_BYTES: u64 = (PRICE_MEMBERS * std::mem::size_of::<u64>()) as u64;
+const HIST_BYTES: u64 = std::mem::size_of::<[u32; BUCKETS]>() as u64;
 
 /// log2 of one squared pixel at `zoom`, in squared world units.
 fn px2_log2(zoom: u8) -> f64 {
@@ -491,6 +505,8 @@ impl Scan {
                 .map(|_| std::array::from_fn(|_| Part::default()))
                 .collect(),
             shed: false,
+            room: u64::MAX,
+            over: false,
             band: None,
             band_rows: 0,
             pending: Vec::new(),
@@ -504,17 +520,26 @@ impl Scan {
     /// scan's budget after every batch.
     pub(crate) fn resident_bytes(&self) -> u64 {
         let dense = std::mem::size_of::<(u64, Dense)>() as u64 + 1;
-        let rows = (PRICE_MEMBERS * std::mem::size_of::<u64>()) as u64;
-        let hist = std::mem::size_of::<[u32; BUCKETS]>() as u64;
         self.levels
             .iter()
             .flatten()
             .map(|p| {
                 p.dense.capacity() as u64 * dense
-                    + p.dense.len() as u64 * rows
-                    + p.hists as u64 * hist
+                    + p.dense.len() as u64 * PRICE_ROWS_BYTES
+                    + p.hists as u64 * HIST_BYTES
             })
             .sum()
+    }
+
+    /// The bytes the scan's budget leaves the predictor, set before each
+    /// batch: a flush stops adding dense state past it.
+    pub(crate) fn set_room(&mut self, room: u64) {
+        self.room = room;
+    }
+
+    /// A flush outgrew [`Self::set_room`]: the scan sheds the predictor.
+    pub(crate) fn outgrew(&self) -> bool {
+        self.over
     }
 
     /// Drop every tile's dense state, keeping the counts the export scan
@@ -556,9 +581,9 @@ impl Scan {
     /// Forget everything: the scan restarts from the geometry.
     /// A shed scan stays shed: the rescan reads the same rows.
     pub(crate) fn reset(&mut self) {
-        let shed = self.shed;
+        let (shed, room) = (self.shed, self.room);
         *self = Self::new(self.levels.len());
-        self.shed = shed;
+        (self.shed, self.room) = (shed, room);
     }
 
     /// One batch of band `j`'s rows, row-aligned (`None`: no bbox), fanned
@@ -591,6 +616,10 @@ impl Scan {
     /// Size the pending rows into every level they fan to: the levels in
     /// the pool, each level's rows in file order, so a tile's state follows
     /// its own members one by one.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#768: one flush's dense-state charge, shared by its parallel tasks; no diagnostic globals"
+    )]
     pub(crate) fn flush(&mut self, zooms: &[u8], opts: &ExportOptions) {
         if self.pending.is_empty() {
             return;
@@ -621,7 +650,18 @@ impl Scan {
         // in that order. A tile's state depends only on its members' order,
         // not on where runs or windows break.
         let range = self.pending_levels.clone();
-        let shed = self.shed;
+        let shed = self.shed || self.over;
+        // Dense state a flush adds, charged as it is allocated, so it stops
+        // at the budget's room rather than after the flush (superagent, #913).
+        let (base, room) = (self.resident_bytes(), self.room);
+        let added = AtomicU64::new(0);
+        let over = AtomicBool::new(false);
+        let charge = |bytes: u64| {
+            if base + added.fetch_add(bytes, Ordering::Relaxed) + bytes > room {
+                over.store(true, Ordering::Relaxed);
+            }
+        };
+        let dense_bytes = std::mem::size_of::<(u64, Dense)>() as u64 + 1 + PRICE_ROWS_BYTES;
         self.levels[range.clone()]
             .par_iter_mut()
             .zip(&zooms[range])
@@ -658,7 +698,7 @@ impl Scan {
                                 *entry |= NON_POINT;
                             }
                             let (count, lines) = (*entry & !NON_POINT, *entry & NON_POINT != 0);
-                            if shed || count < DENSE_FROM {
+                            if shed || count < DENSE_FROM || over.load(Ordering::Relaxed) {
                                 continue;
                             }
                             if drop && lines {
@@ -670,7 +710,10 @@ impl Scan {
                             // The members before the tile's `DENSE_FROM`th need
                             // only their count.
                             let skip = DENSE_FROM.saturating_sub(before + 1) as u32;
-                            let t = part.dense.entry(key).or_default();
+                            let t = part.dense.entry(key).or_insert_with(|| {
+                                charge(dense_bytes);
+                                Dense::default()
+                            });
                             for (n, i) in (before + 1 + u64::from(skip)..).zip(first + skip..=last)
                             {
                                 let (_, corners, centre, point, row) = &rows[i as usize];
@@ -697,6 +740,7 @@ impl Scan {
                                 t.prev = Some((band, *centre));
                                 if n >= HIST_MIN_MEMBERS && gap != GAP_NONE {
                                     let hist = t.hist.get_or_insert_with(|| {
+                                        charge(HIST_BYTES);
                                         part.hists += 1;
                                         Box::new([0; BUCKETS])
                                     });
@@ -707,6 +751,7 @@ impl Scan {
                     });
                 }
             });
+        self.over |= over.into_inner();
         self.band_rows += self.pending.len() as u64;
         self.pending.clear();
         self.spent += t.elapsed();
@@ -1366,5 +1411,30 @@ mod tests {
                 assert!(n <= bound, "{b:?} z{zoom}: {n} members, bound {bound}");
             }
         }
+    }
+
+    /// World-covering rows make every tile dense at once: a flush stops
+    /// adding dense state at the budget's room, not after (superagent,
+    /// #913), and says so for the scan to shed.
+    #[test]
+    fn a_flush_stops_adding_dense_state_at_its_room() {
+        let (zooms, opts) = ([6u8], ExportOptions::default());
+        let rows = vec![Some(TileBounds::new(-179.0, -80.0, 179.0, 80.0)); 1_100];
+        let held = |room: u64| {
+            let mut scan = Scan::new(1);
+            scan.set_room(room);
+            scan.batch(0, &rows, 0..=0, &zooms, &opts);
+            scan.flush(&zooms, &opts);
+            (scan.outgrew(), scan.resident_bytes())
+        };
+        let (over, all) = held(u64::MAX);
+        assert!(!over);
+        let room = all / 16;
+        let (over, bounded) = held(room);
+        assert!(over, "{all} bytes unbounded, room {room}");
+        assert!(
+            bounded < all / 4,
+            "{bounded} bytes held, room {room} of {all}"
+        );
     }
 }
