@@ -367,7 +367,9 @@ fn collect_ahead(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), ExportError> {
     let group = CollectGroup::new(1);
-    let max_bytes = group.max_bytes.saturating_mul(2);
+    let max_bytes = group
+        .max_bytes
+        .saturating_mul(clip_ahead_override().map_or(2, |_| ahead));
     let clip_ns = crate::tile_trace::Tally::<1>::new();
     // One site for the whole read: its bodies are every group's clip.
     let stats = crate::tile_trace::wait("fill_clip", |site| {
@@ -450,12 +452,25 @@ fn read_groups(
 /// [`collect_joined`] that the clip-ahead ([`collect_ahead`]) reuses. Two
 /// or fewer (16 threads or fewer) keep the joined path.
 pub(super) fn clip_ahead_groups(profile: MemoryProfile) -> usize {
+    if let Some(k) = clip_ahead_override() {
+        return k;
+    }
     match profile {
         MemoryProfile::Bounded => 1,
         MemoryProfile::Auto | MemoryProfile::Speed => collect_group_rows(profile)
             .div_ceil(EXPORT_BATCH_SIZE)
             .saturating_mul(2),
     }
+}
+
+/// shortcut: prototype-only knob for the #876 K sweep. `TYLERTOO_CLIP_AHEAD=<K>`
+/// replaces [`clip_ahead_groups`] (whatever the profile) and lifts the byte
+/// cap to K batches, so the item cap binds; remove before landing.
+fn clip_ahead_override() -> Option<usize> {
+    std::env::var("TYLERTOO_CLIP_AHEAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&k| k > 0)
 }
 
 /// #876: where a traced [`collect_into`]'s driving thread spent its wall,
@@ -1152,34 +1167,39 @@ pub(super) fn finish_group(
         })
         .collect();
     let t = crate::tile_trace::mark();
-    let chunks: Vec<Vec<Result<ChunkMembers, ExportError>>> =
+    // #876: the owner works the chunks too and then blocks, never stealing:
+    // a stolen pending clip doubled each finish's wall when clipping ahead.
+    // One uncontended lock per chunk hands its rows to whichever thread runs it.
+    let work: Vec<(&ChunkInput<'_>, usize, std::sync::Mutex<&mut [TileMembers]>)> = row_members
+        .iter_mut()
+        .zip(&chunk_inputs)
+        .flat_map(|(row_members, chunk)| {
+            let chunk_rows = collect_chunk_rows(chunk.batch.num_rows());
+            row_members
+                .chunks_mut(chunk_rows)
+                .enumerate()
+                .map(move |(i, items)| (chunk, i * chunk_rows, std::sync::Mutex::new(items)))
+        })
+        .collect();
+    let chunks: Vec<Result<ChunkMembers, ExportError>> =
         crate::tile_trace::wait("fill_finish", |site| {
-            let chunks = row_members
-                .par_iter_mut()
-                .zip(&chunk_inputs)
-                .map(|(row_members, chunk)| {
-                    let chunk_rows = collect_chunk_rows(chunk.batch.num_rows());
-                    row_members
-                        .par_chunks_mut(chunk_rows)
-                        .enumerate()
-                        .map(|(i, items)| {
-                            site.body(|| {
-                                ExportTimers::time(&timers.decode, || {
-                                    collect_member_chunk(chunk, i * chunk_rows, items)
-                                })
-                            })
-                        })
-                        .collect()
+            let chunks = crate::owner_map::owner_map(&work, |(chunk, first, items)| {
+                let mut items = items.lock().unwrap_or_else(PoisonError::into_inner);
+                site.body(|| {
+                    ExportTimers::time(&timers.decode, || {
+                        collect_member_chunk(chunk, *first, &mut items)
+                    })
                 })
-                .collect();
+            });
             tr.chunks_core_ns += site.core_ns();
             chunks
         });
+    drop(work);
     tr.chunks_ns += crate::tile_trace::since(t);
     drop(row_members);
     let t = crate::tile_trace::mark();
 
-    for chunk in chunks.into_iter().flatten() {
+    for chunk in chunks {
         let ChunkMembers {
             buckets: chunk_buckets,
             losses,
