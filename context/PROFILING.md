@@ -758,8 +758,9 @@ tick:
     }
   },
   // one row per 250 ms tick:
-  // [t_secs, cpu_secs, rss_bytes, read_bytes, write_bytes, rchar]
-  "timeline": [[0.0, 0.01, 23855104, 0, 0, 1048576], ...]
+  // [t_secs, cpu_secs, rss_bytes, read_bytes, write_bytes, rchar, busy]
+  // busy: threads in traced tile work, null unless TYLERTOO_TILE_TRACE is set
+  "timeline": [[0.0, 0.01, 23855104, 0, 0, 1048576, null], ...]
 }
 ```
 
@@ -1159,6 +1160,76 @@ Merging the two into one object would mean either:
 
 A standalone `export-pmtiles` run writes exactly one `"phase": "export"`
 line, the same shape as the second line of a `tiles` run.
+
+## Per-tile export trace (`TYLERTOO_TILE_TRACE`, #876)
+
+`TYLERTOO_TILE_TRACE=<path>` writes a JSONL timeline of the export: one
+event per tile, valve pass, scheduler step and wait site. It answers what
+`TYLERTOO_PROFILE_JSON`'s totals cannot: which tiles set a zoom's wall, what
+their threads did meanwhile, and what the level scheduler held back. Off, it
+costs one relaxed atomic load per event site. On, each thread buffers its
+own lines and the export writes them when it ends, so the file is complete
+only after the export returns. The first export in a process truncates the
+file, later ones append; each begins with a `start` event. One export at a
+time per process is traced. The output archive is byte-identical with
+tracing on or off.
+
+```bash
+TYLERTOO_TILE_TRACE=/tmp/trace.jsonl tylertoo tiles in.parquet out.pmtiles
+uv run python -I benchmarks/tile_trace.py /tmp/trace.jsonl [--top 10] [--json s.json]
+```
+
+Every event has `ev`, `tid` (the OS thread id) and times in nanoseconds
+since the export started, on one monotonic clock: `t_ns` for a point,
+`start_ns`/`end_ns` for a span. Tile-bound events carry `z`, `x`, `y`, and
+where known `zoom`, `level` (the export's level index), `wave` and `part`
+(the partition's index in its wave); unknown ones are `null`.
+
+| `ev` | When | Fields |
+|---|---|---|
+| `start`, `end` | export start and end | `pid`, `threads` (pool size), `unix_secs` |
+| `phase` | the profile's phase changes (`fill`, `levels`, `finalize`) | `phase` |
+| `occ` | every 50 ms | `busy` |
+| `tile` | each tile encode (`encode_group`) | `members`, `vertices`, `passes`, `merged`, `raw_bytes` (0: an empty carrier, not written), `stolen_ns`, `foreign_ns` |
+| `pass` | each size-valve encode | `kind` (`merge`, `drop`, `halve`, `drop_merged`, `fill`), `pass`, `threshold` (merge gap, features kept, or extent), `groups` (features encoded), `merged`, `raw_bytes`, `gzip_bytes` (`null` with no compressed cap), `core_ns` and `wall_ns` per stage, `union_hits`, `union_misses`, `repaired`, `largest_component_vertices` |
+| `wait` | written at the end, per thread, tile (or zoom) and site | `site`, `calls`, `wall_ns`, `max_wall_ns`, `bodies`, `core_ns` |
+| `wave` | a group wave's `stage`: `collected`, `spawned`, `started`, `encoded`, `written` | `level`, `zoom`, `wave`, `members`, `partitions` |
+| `admit_wait`, `window_wait`, `drain_wait` | the collect waits on the in-flight cap, the two-wave window, the gate draining before a late store fill | wave fields, `held`, `cap` |
+| `commit_wait` | an encoded wave waiting for earlier waves' writes | wave fields, `queued` (its share of the cap) |
+| `group`, `serial_level` | a level group, and a level on the serial `export_level` path | `levels`, `zooms`, `cap`; `level`, `zoom`, `waves`, `members` |
+| `fill` | a level's one-level store fill, the coverage fill | `kind` (`level_store`, `coverage`), `level`, `zoom`, `early` |
+
+How to read them:
+
+- **`stolen_ns` and `foreign_ns`**: time the tile's thread spent, while
+  the tile was open, in another tile (`stolen_ns`) or in other traced work
+  (`foreign_ns`: a wave's encode task, a clip, another tile's parallel
+  bodies), which rayon runs while a thread waits in a join. Each span is
+  charged once, at the outermost foreign frame. A tile's own work is its
+  wall minus both.
+- **Stages** nest: `build` (one valve encode) holds `quantize`, `union`
+  and `finalize`; `coalesce` and `gzip` stand alone. `core_ns` sums every
+  thread's time in a stage; `wall_ns` is the pass's own thread's, which is
+  the part of the stage on the tile's critical path.
+- **`occ.busy`** counts threads inside a traced tile, body or job and not
+  waiting in a traced parallel call: busy without spin. It is also the
+  `busy` column of the profile's `timeline`.
+- **Wait sites**: `sort` (`encode.rs` member sort), `tiles` (a partition's
+  tiles), `encode_buckets` (a wave's partitions), `geometry_chunks`,
+  `layers`, `quantize`, `part_clean`, `box_pairs`, `pairs_within`.
+  `wall_ns` is the caller's time in the call; `core_ns` is its bodies' time
+  on every thread. `sort` and `pairs_within` record wall only: a timed body
+  there would cost more than the work.
+- **Not traced**: the variable-depth probe's tiles (`probe_wave`) have no
+  `tile` events, and the merge's joint-valve tiles have no level or wave.
+  The single-read store fill before the levels is a `phase`, not a `fill`
+  span. The variable-depth levels run the same group schedule and emit the
+  same scheduler events.
+
+`benchmarks/tile_trace.py` prints, per zoom, the wall, the longest tiles
+and their pass stages, and the occupancy timeline; the scheduler holds,
+with each group's idle tail after its last wave spawn while under half the
+pool busy; and each wait site's owner wall against its bodies' core time.
 
 ## Sampling profilers
 
