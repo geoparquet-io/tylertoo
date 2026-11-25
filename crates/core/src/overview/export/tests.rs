@@ -3290,6 +3290,51 @@ fn price_samples_are_chunked_by_the_budget_to_the_same_floors() {
     assert_eq!(tight, roomy);
 }
 
+/// #919: a large polygon sampled by many tiles is clipped once a sample,
+/// not once per tile. Eight z2 tiles each hold 1,100 squares, then four
+/// 40,000-vertex discs cover all eight, so every tile samples every disc.
+/// The two samples clip at most twice the input's vertices; clipped once
+/// per tile, they clipped eight times the discs' vertices twice.
+#[test]
+fn price_samples_clip_a_large_row_once_for_all_its_tiles() {
+    let mut geoms: Vec<Geometry<f64>> = Vec::new();
+    for (x, y) in (0..4).flat_map(|x| [(x, 1.0), (x, -61.0)]) {
+        let west = -180.0 + f64::from(x) * 90.0;
+        geoms.extend((0..1_100).map(|i| {
+            let (x, y) = (
+                west + 5.0 + f64::from(i % 50) * 1.6,
+                y + f64::from(i / 50) * 2.6,
+            );
+            Geometry::Polygon(geo::Rect::new((x, y), (x + 0.5, y + 0.5)).to_polygon())
+        }));
+    }
+    let disc = |r: f64| {
+        let ring: Vec<(f64, f64)> = (0..40_000)
+            .map(|i| {
+                let a = f64::from(i) * std::f64::consts::TAU / 40_000.0;
+                (r * 2.5 * a.cos(), r * a.sin())
+            })
+            .collect();
+        Geometry::Polygon(geo::Polygon::new(LineString::from(ring), vec![]))
+    };
+    geoms.extend([60.0, 58.0, 56.0, 54.0].map(disc));
+    let input_coords: usize = geoms.iter().map(|g| g.coords_count()).sum();
+    let input = tempfile::NamedTempFile::new().unwrap();
+    let n = geoms.len() as i64;
+    write_fixture(input.path(), &[((0..n).collect(), geoms)]);
+    let before = SAMPLE_CLIP_COORDS.with(std::cell::Cell::get);
+    floors_of_file(
+        input.path(),
+        &mut MemoryBudget::with_available(Some(64 << 30)),
+    );
+    let clipped = SAMPLE_CLIP_COORDS.with(std::cell::Cell::get) - before;
+    assert!(clipped >= 160_000, "the discs must be sampled: {clipped}");
+    assert!(
+        clipped <= 2 * input_coords,
+        "{clipped} vertices clipped for {input_coords} in the input"
+    );
+}
+
 /// #768: a predictor over the scan's budget drops its dense state and
 /// says so; the export goes on as under `--valve-scope tile`, with the
 /// same tile counts.
