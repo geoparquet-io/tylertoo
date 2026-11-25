@@ -60,13 +60,15 @@
 //! row is `None`), so a tile's band rows are its rows in the file.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 
 use geo::Rect;
 use rayon::prelude::*;
 
 use super::coalesce_valve::{gap_to_world_box, world_box, world_xy, GAP_NONE};
-use super::{for_each_member_key, key_to_xy, ExportOptions, SizeValve, ValveScope};
+use super::{
+    for_each_member_key, key_to_xy, member_tiles_bound, ExportOptions, SizeValve, ValveScope,
+};
 use crate::tile::TileBounds;
 
 /// Half-octave gap buckets, relative to the tile's pixel: bucket 8 starts at
@@ -246,6 +248,32 @@ const FAN_ROWS: usize = 4096;
 /// (Hilbert-sorted rows stay in a tile for long stretches, so a map lookup
 /// serves many members).
 type Fanned = [Vec<(u64, u32, u32, bool)>; PARTS];
+
+/// Most members one window of [`Scan::flush`] fans out at a level, before
+/// they are folded into the level's maps: 24 bytes each, so about 12 MiB a
+/// level. Without it a flush held every row's members at once, and a few
+/// hundred world-spanning rows are millions of members at z6.
+const FAN_MEMBERS: u64 = 2 * FLUSH_ROWS as u64;
+
+/// `rows` cut into consecutive windows of at most [`FAN_MEMBERS`] members
+/// at `zoom` ([`member_tiles_bound`]), each at least one row.
+fn fan_windows(rows: &[SizedRow], zoom: u8, opts: &ExportOptions) -> Vec<Range<usize>> {
+    let tiles: Vec<u64> = rows
+        .par_iter()
+        .with_min_len(2048)
+        .map(|r| member_tiles_bound(&r.0, zoom, opts))
+        .collect();
+    let (mut out, mut start, mut held) = (Vec::new(), 0, 0);
+    for (i, t) in tiles.into_iter().enumerate() {
+        if i > start && held + t > FAN_MEMBERS {
+            out.push(start..i);
+            (start, held) = (i, 0);
+        }
+        held += t;
+    }
+    out.push(start..rows.len());
+    out
+}
 
 /// log2 of one squared pixel at `zoom`, in squared world units.
 fn px2_log2(zoom: u8) -> f64 {
@@ -588,95 +616,96 @@ impl Scan {
                 Some((b, world_box(&rect), world_xy(c.x, c.y), point, row))
             })
             .collect();
-        // Per level, per run of rows, each map's (key, row) members in file
-        // order; then each map follows its members in that order.
+        // Per level, a window of rows at a time: per run of rows, each map's
+        // (key, row) members in file order; then each map follows its members
+        // in that order. A tile's state depends only on its members' order,
+        // not on where runs or windows break.
         let range = self.pending_levels.clone();
         let shed = self.shed;
-        let fanned: Vec<Vec<Fanned>> = zooms[range.clone()]
-            .par_iter()
-            .map(|&zoom| {
-                rows.par_chunks(FAN_ROWS)
-                    .enumerate()
-                    .map(|(c, run)| {
-                        let mut out: Fanned = std::array::from_fn(|_| Vec::new());
-                        for (i, (b, _, _, point, _)) in run.iter().enumerate() {
-                            let i = (c * FAN_ROWS + i) as u32;
-                            for_each_member_key(b, zoom, opts, |key| {
-                                let runs = &mut out[part(key)];
-                                match runs.last_mut() {
-                                    Some(r) if r.0 == key && r.2 + 1 == i => {
-                                        r.2 = i;
-                                        r.3 |= !point;
-                                    }
-                                    _ => runs.push((key, i, i, !point)),
-                                }
-                            });
-                        }
-                        out
-                    })
-                    .collect()
-            })
-            .collect();
         self.levels[range.clone()]
             .par_iter_mut()
-            .zip(fanned)
             .zip(&zooms[range])
-            .for_each(|((level, fanned), &zoom)| {
-                level.par_iter_mut().enumerate().for_each(|(p, part)| {
-                    for &(key, first, last, lines) in fanned.iter().flat_map(|run| &run[p]) {
-                        let entry = part.counts.entry(key).or_insert(0);
-                        let before = *entry & !NON_POINT;
-                        *entry += u64::from(last - first) + 1;
-                        if lines {
-                            *entry |= NON_POINT;
-                        }
-                        let (count, lines) = (*entry & !NON_POINT, *entry & NON_POINT != 0);
-                        if shed || count < DENSE_FROM {
-                            continue;
-                        }
-                        if drop && lines {
-                            // Under drop a tile that is not all points has
-                            // no need: the drop valve fits it alone.
-                            part.dense.remove(&key);
-                            continue;
-                        }
-                        // The members before the tile's `DENSE_FROM`th need
-                        // only their count.
-                        let skip = DENSE_FROM.saturating_sub(before + 1) as u32;
-                        let t = part.dense.entry(key).or_default();
-                        for (n, i) in (before + 1 + u64::from(skip)..).zip(first + skip..=last) {
-                            let (_, corners, centre, point, row) = &rows[i as usize];
-                            if t.run.0 != band || t.run.1 == 0 {
-                                if t.run.1 > t.best.1 {
-                                    t.best = t.run;
-                                }
-                                t.run = (band, 0, *row, *row);
+            .for_each(|(level, &zoom)| {
+                for window in fan_windows(&rows, zoom, opts) {
+                    let start = window.start;
+                    let fanned: Vec<Fanned> = rows[window]
+                        .par_chunks(FAN_ROWS)
+                        .enumerate()
+                        .map(|(c, run)| {
+                            let mut out: Fanned = std::array::from_fn(|_| Vec::new());
+                            for (i, (b, _, _, point, _)) in run.iter().enumerate() {
+                                let i = (start + c * FAN_ROWS + i) as u32;
+                                for_each_member_key(b, zoom, opts, |key| {
+                                    let runs = &mut out[part(key)];
+                                    match runs.last_mut() {
+                                        Some(r) if r.0 == key && r.2 + 1 == i => {
+                                            r.2 = i;
+                                            r.3 |= !point;
+                                        }
+                                        _ => runs.push((key, i, i, !point)),
+                                    }
+                                });
                             }
-                            t.run.1 += 1;
-                            t.run.3 = *row;
-                            if n >= HIST_MIN_MEMBERS && t.price_rows.len() < PRICE_MEMBERS {
-                                t.price_rows.push(pack_row(band, *row));
+                            out
+                        })
+                        .collect();
+                    level.par_iter_mut().enumerate().for_each(|(p, part)| {
+                        for &(key, first, last, lines) in fanned.iter().flat_map(|run| &run[p]) {
+                            let entry = part.counts.entry(key).or_insert(0);
+                            let before = *entry & !NON_POINT;
+                            *entry += u64::from(last - first) + 1;
+                            if lines {
+                                *entry |= NON_POINT;
                             }
-                            if drop {
+                            let (count, lines) = (*entry & !NON_POINT, *entry & NON_POINT != 0);
+                            if shed || count < DENSE_FROM {
                                 continue;
                             }
-                            let gap = match t.prev {
-                                Some((b, p)) if b == band && !*point => {
-                                    gap_to_world_box(p, corners)
+                            if drop && lines {
+                                // Under drop a tile that is not all points has
+                                // no need: the drop valve fits it alone.
+                                part.dense.remove(&key);
+                                continue;
+                            }
+                            // The members before the tile's `DENSE_FROM`th need
+                            // only their count.
+                            let skip = DENSE_FROM.saturating_sub(before + 1) as u32;
+                            let t = part.dense.entry(key).or_default();
+                            for (n, i) in (before + 1 + u64::from(skip)..).zip(first + skip..=last)
+                            {
+                                let (_, corners, centre, point, row) = &rows[i as usize];
+                                if t.run.0 != band || t.run.1 == 0 {
+                                    if t.run.1 > t.best.1 {
+                                        t.best = t.run;
+                                    }
+                                    t.run = (band, 0, *row, *row);
                                 }
-                                _ => GAP_NONE,
-                            };
-                            t.prev = Some((band, *centre));
-                            if n >= HIST_MIN_MEMBERS && gap != GAP_NONE {
-                                let hist = t.hist.get_or_insert_with(|| {
-                                    part.hists += 1;
-                                    Box::new([0; BUCKETS])
-                                });
-                                hist[bucket(gap, zoom)] += 1;
+                                t.run.1 += 1;
+                                t.run.3 = *row;
+                                if n >= HIST_MIN_MEMBERS && t.price_rows.len() < PRICE_MEMBERS {
+                                    t.price_rows.push(pack_row(band, *row));
+                                }
+                                if drop {
+                                    continue;
+                                }
+                                let gap = match t.prev {
+                                    Some((b, p)) if b == band && !*point => {
+                                        gap_to_world_box(p, corners)
+                                    }
+                                    _ => GAP_NONE,
+                                };
+                                t.prev = Some((band, *centre));
+                                if n >= HIST_MIN_MEMBERS && gap != GAP_NONE {
+                                    let hist = t.hist.get_or_insert_with(|| {
+                                        part.hists += 1;
+                                        Box::new([0; BUCKETS])
+                                    });
+                                    hist[bucket(gap, zoom)] += 1;
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
             });
         self.band_rows += self.pending.len() as u64;
         self.pending.clear();
@@ -1277,5 +1306,65 @@ mod tests {
         assert_eq!(merge.merge.get((7, 11, 10)), unit * 2);
         assert_eq!(merge.merge.get((7, 12, 10)), 0);
         assert!(merge.drop.is_empty());
+    }
+
+    /// A tile's state follows its own members in file order, whether a
+    /// flush fans its rows out in one window or in many (superagent, #913):
+    /// rows spanning thousands of tiles each are cut into windows, and come
+    /// out as if fed one row at a time.
+    #[test]
+    fn wide_rows_fan_out_in_windows_with_the_same_state() {
+        let (zooms, opts) = ([8u8], ExportOptions::default());
+        let rows: Vec<Option<TileBounds>> = (0..2_000u32)
+            .map(|i| {
+                let x = f64::from(i % 7);
+                Some(if i % 2 == 0 {
+                    TileBounds::new(-30.0 + x, -20.0, 30.0 + x, 20.0)
+                } else {
+                    TileBounds::new(x, 1.0, x + 1e-4, 1.0001)
+                })
+            })
+            .collect();
+        let members: u64 = rows
+            .iter()
+            .flatten()
+            .map(|b| member_tiles_bound(b, 8, &opts))
+            .sum();
+        assert!(
+            members > 2 * FAN_MEMBERS,
+            "{members}: the flush must cut windows"
+        );
+        let mut whole = Scan::new(1);
+        whole.batch(0, &rows, 0..=0, &zooms, &opts);
+        whole.flush(&zooms, &opts);
+        let mut by_row = Scan::new(1);
+        for row in rows.chunks(1) {
+            by_row.batch(0, row, 0..=0, &zooms, &opts);
+            by_row.flush(&zooms, &opts);
+        }
+        assert!(!whole.priced().is_empty());
+        assert_eq!(whole.priced(), by_row.priced());
+        assert_eq!(whole.into_tile_counts(), by_row.into_tile_counts());
+    }
+
+    /// The bound a flush windows by never undercounts the members a row
+    /// fans to: inside the world, across the antimeridian, past 180°.
+    #[test]
+    fn member_tiles_bound_covers_every_member() {
+        let opts = ExportOptions::default();
+        for b in [
+            TileBounds::new(10.0, 10.0, 10.0, 10.0),
+            TileBounds::new(-30.0, -20.0, 30.0, 20.0),
+            TileBounds::new(170.0, -5.0, -170.0, 5.0),
+            TileBounds::new(179.9, 0.0, 200.0, 1.0),
+            TileBounds::new(-180.0, -85.0, 180.0, 85.0),
+        ] {
+            for zoom in [0u8, 3, 6, 9] {
+                let mut n = 0u64;
+                for_each_member_key(&b, zoom, &opts, |_| n += 1);
+                let bound = member_tiles_bound(&b, zoom, &opts);
+                assert!(n <= bound, "{b:?} z{zoom}: {n} members, bound {bound}");
+            }
+        }
     }
 }

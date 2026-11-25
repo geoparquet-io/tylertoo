@@ -14,6 +14,8 @@ Diagnostics go to Python's `logging` under the `tylertoo_core` logger: the warni
 
 Input must be sorted in Hilbert order (`gpio sort hilbert`); tylertoo never reorders rows. `overview()` and `convert()` raise a `UserWarning` when the input is not sorted by location.
 
+Advice a caller owes a response to (unsorted input, a disk that may run out, a size valve that fell back to `valve_scope="tile"`) is a `UserWarning`, not a log record: raised as the call returns, whether it succeeds or fails, whatever the logging configuration.
+
 ## `overview`
 
 ```python

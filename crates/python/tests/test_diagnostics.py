@@ -6,6 +6,7 @@ import os
 import struct
 import sys
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -276,6 +277,7 @@ def test_a_shed_valve_prediction_warns_from_every_export(
     tylertoo.overview(str(source), str(overview), min_zoom=0, max_zoom=6)
     monkeypatch.setenv("TYLERTOO_AUTO_MEM_LIMIT_BYTES", str(1 << 10))
     out = str(tmp_path / "dense.pmtiles")
+    run: Callable[[], object]
     if command == "pyramid":
         run = lambda: tylertoo.pyramid(  # noqa: E731
             [f"0-6:{overview}"], out, max_compressed_tile_size=20000

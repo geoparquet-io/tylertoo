@@ -1,4 +1,5 @@
 use super::*;
+use valve_predict::FLUSH_ROWS;
 
 /// Scan **every** level in a single streaming read of the file (issue #233).
 ///
@@ -139,7 +140,7 @@ pub(super) fn scan_all_levels_from(
     timers: &ExportTimers,
     source: &ScanBboxSource,
     mut vd: Option<&mut variable_depth::VdScan>,
-    predict: Option<&mut valve_predict::Scan>,
+    mut predict: Option<&mut valve_predict::Scan>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<Vec<LevelScan>>, ExportError> {
     let num_levels = reader.num_levels();
@@ -208,7 +209,6 @@ pub(super) fn scan_all_levels_from(
     // #768 predict: the gap walk rides in the consumer, fed each batch's
     // row-aligned bboxes in order. Not on a thread of its own: its Rayon
     // work could then wait on the only pool worker, held by this scan.
-    let mut predict = predict;
     // PERF (#768): the predictor counts every tile's members already, so the
     // sizing below keeps only the bounds and takes its counts at the end.
     let count_tiles = predict.is_none();
@@ -216,9 +216,7 @@ pub(super) fn scan_all_levels_from(
     // flush deep keeps the band read going meanwhile. Covering batches are
     // four f64 per row, so it holds a few MiB.
     let depth = match source {
-        ScanBboxSource::Covering { .. } if predict.is_some() => {
-            valve_predict::FLUSH_ROWS / EXPORT_BATCH_SIZE
-        }
+        ScanBboxSource::Covering { .. } if predict.is_some() => FLUSH_ROWS / EXPORT_BATCH_SIZE,
         _ => WAVE_READ_IN_FLIGHT,
     };
     let predict_ref = &mut predict;
@@ -326,8 +324,19 @@ pub(super) fn scan_all_levels_from(
                     };
                     let aligned = || -> Result<Vec<Option<TileBounds>>, ExportError> {
                         match source {
+                            // Row-aligned, `None` for a null row. Every row passed
+                            // `covering_batch_bboxes`' checks, so one that does not
+                            // is an error.
                             ScanBboxSource::Covering { column, names } => {
-                                covering_row_bboxes(&batch, column, names, crs)
+                                covering_rows(&batch, column, names, crs)?
+                                    .collect::<Option<_>>()
+                                    .ok_or_else(|| {
+                                        crate::GeoParquetReadError::decode(
+                                            "bbox covering",
+                                            format!("{column:?} has a malformed row"),
+                                        )
+                                        .into()
+                                    })
                             }
                             ScanBboxSource::Geometry => Ok(geometries()?
                                 .iter()
@@ -350,26 +359,22 @@ pub(super) fn scan_all_levels_from(
                     })?;
                 }
                 if let Some(p) = predict_ref.as_deref_mut() {
-                    // #768 predict: row-aligned, so a tile's sample rows are
-                    // its band rows. A batch with no null row is aligned
-                    // already; a covering one is decoded again only to keep
-                    // its nulls.
+                    // #768 predict: row-aligned, so a tile's sample rows are its band rows.
+                    // A covering batch with a null row, all checked above, is read again.
                     let last = if partitioning { num_levels - 1 } else { j };
-                    match source {
+                    let kept;
+                    let rows = match source {
                         ScanBboxSource::Covering { column, names }
                             if bboxes.len() != batch.num_rows() =>
                         {
-                            let rows = covering_row_bboxes(&batch, column, names, crs)?;
-                            p.batch(j, &rows, j..=last, zooms_ref, opts);
+                            kept = covering_rows(&batch, column, names, crs)?
+                                .map(Option::flatten)
+                                .collect::<Vec<_>>();
+                            &kept[..]
                         }
-                        _ => p.batch(
-                            j,
-                            aligned.as_deref().unwrap_or(&bboxes),
-                            j..=last,
-                            zooms_ref,
-                            opts,
-                        ),
-                    }
+                        _ => aligned.as_deref().unwrap_or(&bboxes),
+                    };
+                    p.batch(j, rows, j..=last, zooms_ref, opts);
                     shed_over_budget(p, (&band.budget, band.profile), opts, diagnostics);
                 }
                 if j != pending_band {
@@ -433,27 +438,6 @@ pub(super) fn covering_batch_bboxes(
     Ok(covering_rows(batch, column, names, crs)?
         .filter(|row| !matches!(row, Some(None)))
         .collect())
-}
-
-/// [`covering_batch_bboxes`] row-aligned: `None` for a null row. Only called
-/// on a batch whose covering rows all passed that function's checks; a row
-/// that does not is an error. Two callers: variable depth and the #768
-/// valve predictor.
-pub(super) fn covering_row_bboxes(
-    batch: &RecordBatch,
-    column: &str,
-    names: &[String; 4],
-    crs: Crs,
-) -> Result<Vec<Option<TileBounds>>, ExportError> {
-    covering_rows(batch, column, names, crs)?
-        .collect::<Option<_>>()
-        .ok_or_else(|| {
-            crate::GeoParquetReadError::decode(
-                "bbox covering",
-                format!("{column:?} has a malformed row"),
-            )
-            .into()
-        })
 }
 
 /// Each row of a bbox covering: `Some(None)` for a null row, `Some(bbox)`
@@ -604,6 +588,24 @@ pub(super) fn for_each_member_key(
             f(tile_key(tc.x, tc.y, zoom));
         }
     }
+}
+
+/// At least as many tiles as [`for_each_member_key`] calls back for: the
+/// same copies, a tile two copies share counted twice. Cheap, so a caller
+/// can bound what it holds per member before it enumerates them.
+pub(super) fn member_tiles_bound(bbox: &TileBounds, zoom: u8, opts: &ExportOptions) -> u64 {
+    let tiles = |b: &TileBounds| {
+        let r = member_ranges(b, zoom, opts);
+        let width = |(lo, hi): (u32, u32)| u64::from(hi - lo) + 1;
+        (width(r.x) + r.x2.map_or(0, width)) * width(r.y)
+    };
+    let buffer = buffer_deg_at_zoom(zoom, opts);
+    if !near_world_edge(bbox, buffer) {
+        return tiles(bbox);
+    }
+    wrap_shifts(bbox, buffer)
+        .map(|shift| tiles(&shift_bbox(bbox, shift)))
+        .sum()
 }
 
 /// Fewest bboxes one [`size_bboxes`] task sizes. Sizing a bbox costs well
