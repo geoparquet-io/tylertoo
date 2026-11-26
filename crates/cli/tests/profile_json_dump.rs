@@ -1461,9 +1461,13 @@ fn tile_trace_has_one_tile_event_per_written_tile_and_changes_no_byte() {
     assert!(of("wait").any(|w| w["site"] == "tiles" && w["calls"].as_u64() > Some(0)));
     assert!(of("occ").count() >= 1);
     assert!(of("phase").any(|p| p["phase"] == "levels"));
-    assert!(
-        of("start").all(|s| s["mono_ns"].as_u64() > Some(0)),
-        "start carries the monotonic anchor for perf"
+    // The anchor lines the trace up with `perf`, which is Linux-only; the
+    // writer records 0 elsewhere.
+    let anchored = |s: &serde_json::Value| s["mono_ns"].as_u64() > Some(0);
+    assert_eq!(
+        of("start").all(anchored),
+        cfg!(target_os = "linux"),
+        "start carries the monotonic anchor for perf on Linux only"
     );
     let quantized: Vec<_> = of("pass")
         .filter(|p| p["core_ns"]["quantize"].as_u64() > Some(0))

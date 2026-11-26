@@ -1195,7 +1195,7 @@ where known `zoom`, `level` (the export's level index), `wave` and `part`
 
 | `ev` | When | Fields |
 |---|---|---|
-| `start`, `end` | export start and end | `pid`, `threads` (pool size), `unix_secs` |
+| `start`, `end` | export start and end | `pid`, `threads` (pool size), `unix_secs`; `start` also has `mono_ns`, the `CLOCK_MONOTONIC` time for lining the trace up with `perf record -k CLOCK_MONOTONIC` (Linux only, 0 elsewhere) |
 | `phase` | the profile's phase changes (`fill`, `levels`, `finalize`) | `phase` |
 | `occ` | every 50 ms | `busy` |
 | `tile` | each tile encode (`encode_group`) | `members`, `vertices`, `passes`, `merged`, `raw_bytes` (0: an empty carrier, not written), `stolen_ns`, `foreign_ns` |
