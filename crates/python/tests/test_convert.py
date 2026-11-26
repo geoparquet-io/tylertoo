@@ -462,7 +462,9 @@ class TestConvertSpillDir:
             assert "nope" in str(exc_info.value), str(exc_info.value)
 
 
-@pytest.mark.parametrize(("env_threads", "workers"), [(None, None), ("48", None), ("48", 3)])
+@pytest.mark.parametrize(
+    ("env_threads", "workers"), [(None, None), ("48", None), ("48", 3)]
+)
 def test_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set(
     tmp_path, env_threads, workers
 ):

@@ -5165,6 +5165,7 @@ mod cgroup_tests {
     const GIB: u64 = 1024 * 1024 * 1024;
 
     /// This process's `RssAnon`, in bytes.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn rss_anon_bytes() -> u64 {
         let status = fs::read_to_string("/proc/self/status").unwrap();
         let kib = status
