@@ -45,6 +45,7 @@ fn run_tiles_with_profile(
     min_zoom: &str,
     max_zoom: &str,
     rayon_threads: Option<&str>,
+    extra_args: &[&str],
 ) -> (
     tempfile::TempDir,
     serde_json::Value,
@@ -71,6 +72,7 @@ fn run_tiles_with_profile(
             "--report",
             report_json.to_str().unwrap(),
         ])
+        .args(extra_args)
         // Set only in the child's environment: no in-process global state is
         // touched, so this test cannot race any other test in the suite.
         .env("TYLERTOO_PROFILE_JSON", &profile_json)
@@ -118,7 +120,7 @@ fn profile_json_written_and_parses() {
         return;
     };
 
-    let (dir, report, convert, export) = run_tiles_with_profile(&fixture, "0", "6", None);
+    let (dir, report, convert, export) = run_tiles_with_profile(&fixture, "0", "6", None, &[]);
 
     // --- Pairing: both lines of one `tiles` process share a `run_id` and
     // say which phase they are. ---
@@ -158,7 +160,7 @@ fn profile_json_written_and_parses() {
 fn profile_json_saturation_fields_on_a_committed_fixture() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
-    let (_dir, _report, convert, export) = run_tiles_with_profile(&fixture, "0", "6", None);
+    let (_dir, _report, convert, export) = run_tiles_with_profile(&fixture, "0", "6", None, &[]);
     check_saturation(&convert, &convert, &CONVERT_PHASES);
     assert!(
         convert["pass2"]["writer_busy_secs"]
@@ -1374,16 +1376,22 @@ fn profile_json_reports_cascade_identical_steps() {
     );
 }
 
-/// The CLI sizes the worker pool from core's `resolve_worker_threads`: the
-/// cores capped at 40 by default, an explicit `RAYON_NUM_THREADS` verbatim.
+/// The CLI sizes the worker pool from core's `resolve_worker_threads` for
+/// the command's profile (#876): `bounded` the cores capped at 40, `auto`
+/// every core, an explicit `RAYON_NUM_THREADS` verbatim.
 #[test]
 fn cli_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let threads = |env| run_tiles_with_profile(&fixture, "0", "2", env).2["threads"].as_u64();
-    assert_eq!(threads(None), Some(cores.min(40) as u64));
-    assert_eq!(threads(Some("48")), Some(48));
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get) as u64;
+    let threads = |env, args: &[&str]| {
+        run_tiles_with_profile(&fixture, "0", "2", env, args).2["threads"]
+            .as_u64()
+            .expect("threads")
+    };
+    assert_eq!(threads(None, &[]), cores);
+    assert_eq!(threads(None, &["--profile", "bounded"]), cores.min(40));
+    assert_eq!(threads(Some("48"), &[]), 48);
 }
 
 /// #876: `TYLERTOO_TILE_TRACE` writes one JSONL event per line, one `tile`

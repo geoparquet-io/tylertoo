@@ -1083,32 +1083,44 @@ pub(super) fn resolve_in_flight_batches_with_cores(requested: usize, cores: usiz
     }
 }
 
-/// Default ceiling on the worker pool a conversion runs on.
+/// `bounded`'s worker-pool width on a machine with more cores.
 ///
 /// Measured by sweeping `RAYON_NUM_THREADS` (merged perf/memory-batch build,
 /// quiet host, archives byte-identical at every width). At 40 workers wall is
 /// flat on all 16 cells against 64, and RSS is 9-21% lower (Moldova auto
-/// 3103 -> 2747 MiB, 3.36 -> 3.44 s). 32 saved more (Moldova auto 2453 MiB)
-/// but cost Moldova auto 6-8% wall; at 16, wall rose 25-37% on Moldova and
-/// wideprops. Past 40 the extra workers only add allocator memory each keeps
-/// for itself.
+/// 3103 -> 2747 MiB, 3.36 -> 3.44 s). Under `bounded` on the #876 build,
+/// 64 workers against 40 cost 13-26% more peak memory for 0-4% speed, so
+/// `bounded` keeps the cap; `auto` and `speed` take every core, since each
+/// extra worker costs them only 15-35 MB.
 ///
 /// shortcut: measured on one 64-core aarch64 host; re-sweep on other core
 /// counts and architectures before trusting the knee elsewhere.
 pub const WORKER_THREADS_MAX: usize = 40;
 
-/// Workers the global Rayon pool gets.
+/// Workers the global Rayon pool gets under `profile`.
 ///
-/// An explicit positive `RAYON_NUM_THREADS` wins, else the available cores
-/// capped at [`WORKER_THREADS_MAX`]. The CLI and the Python module size the pool with
-/// it ([`init_worker_pool`]). Only the pool: knobs that read
+/// An explicit positive `RAYON_NUM_THREADS` wins, else
+/// [`default_worker_threads`] on the cores this process may use
+/// (`available_parallelism`, which honours affinity and a cgroup CPU
+/// quota). The CLI, the Python module and the core entry points size the
+/// pool with it ([`init_worker_pool`]). Only the pool: knobs that read
 /// `available_parallelism()` (read workers, in-flight batches, partition
-/// wave) keep the core count, as the sweep ran them.
-pub fn resolve_worker_threads() -> usize {
+/// wave) keep the core count.
+pub fn resolve_worker_threads(profile: MemoryProfile) -> usize {
     resolve_worker_threads_with(
         std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        profile,
     )
+}
+
+/// The pool width rule (#876): `auto` and `speed` every core, `bounded` at
+/// most [`WORKER_THREADS_MAX`].
+pub(super) fn default_worker_threads(profile: MemoryProfile, cores: usize) -> usize {
+    match profile {
+        MemoryProfile::Bounded => cores.min(WORKER_THREADS_MAX),
+        MemoryProfile::Auto | MemoryProfile::Speed => cores,
+    }
 }
 
 /// [`resolve_worker_threads`] on a given `RAYON_NUM_THREADS` value and core
@@ -1116,24 +1128,46 @@ pub fn resolve_worker_threads() -> usize {
 ///
 /// A value Rayon would ignore (unset, `0`, not a number)
 /// leaves the default.
-pub(super) fn resolve_worker_threads_with(env: Option<&str>, cores: usize) -> usize {
+pub(super) fn resolve_worker_threads_with(
+    env: Option<&str>,
+    cores: usize,
+    profile: MemoryProfile,
+) -> usize {
     match env.and_then(|v| v.trim().parse::<usize>().ok()) {
         Some(n) if n > 0 => n,
-        _ => cores.min(WORKER_THREADS_MAX),
+        _ => default_worker_threads(profile, cores),
     }
 }
 
-/// Build the global Rayon pool at [`resolve_worker_threads`] workers, before
-/// any parallel work.
+/// Build the global Rayon pool at [`resolve_worker_threads`] workers for
+/// `profile`, before any parallel work.
 ///
 /// # Errors
 ///
 /// When the pool was already built (a host process such as Python may own
 /// it); callers may ignore it.
-pub fn init_worker_pool() -> Result<(), rayon::ThreadPoolBuildError> {
+pub fn init_worker_pool(profile: MemoryProfile) -> Result<(), rayon::ThreadPoolBuildError> {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(resolve_worker_threads())
+        .num_threads(resolve_worker_threads(profile))
         .build_global()
+}
+
+/// [`init_worker_pool`] for the core entry points, so a library caller gets
+/// the profile's pool as the CLI and Python do (#876): each run validates its
+/// options first, and validation calls this. Only the first call off any
+/// Rayon pool tries; a pool a host or an earlier call built is kept, and a
+/// caller already on a pool's worker uses that pool.
+pub(super) fn ensure_worker_pool(profile: MemoryProfile) {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#876: the global pool is process-wide, so its one build attempt is too"
+    )]
+    static TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if rayon::current_thread_index().is_none()
+        && !TRIED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        let _ = init_worker_pool(profile);
+    }
 }
 
 /// Sentinel for [`ConvertOptions::read_workers`] requesting automatic sizing
@@ -1248,7 +1282,9 @@ impl ConvertOptions {
     /// Validate these options and return the immutable engine configuration.
     #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConvertError> {
-        super::config::validate_convert(self)
+        let config = super::config::validate_convert(self)?;
+        ensure_worker_pool(self.profile);
+        Ok(config)
     }
 
     pub(super) fn check_finite_numbers(&self) -> Result<(), ConvertError> {
@@ -13015,16 +13051,22 @@ mod tests {
         }
     }
 
-    /// The worker pool defaults to the cores capped at 40; an explicit
+    /// The worker pool defaults to every core under `auto` and `speed` and
+    /// to the cores capped at 40 under `bounded` (#876); an explicit
     /// `RAYON_NUM_THREADS` wins, and one Rayon ignores leaves the default.
     #[test]
     fn worker_threads_cap_the_cores_unless_rayon_num_threads_is_set() {
-        assert_eq!(resolve_worker_threads_with(None, 64), 40);
-        assert_eq!(resolve_worker_threads_with(None, 8), 8);
-        assert_eq!(resolve_worker_threads_with(Some("64"), 64), 64);
-        assert_eq!(resolve_worker_threads_with(Some("4"), 64), 4);
-        assert_eq!(resolve_worker_threads_with(Some("0"), 64), 40);
-        assert_eq!(resolve_worker_threads_with(Some("x"), 8), 8);
+        use MemoryProfile::{Auto, Bounded, Speed};
+        let w = resolve_worker_threads_with;
+        assert_eq!(w(None, 64, Bounded), 40);
+        assert_eq!(w(None, 8, Bounded), 8);
+        assert_eq!(w(None, 64, Auto), 64);
+        assert_eq!(w(None, 96, Speed), 96);
+        assert_eq!(w(None, 1, Auto), 1);
+        assert_eq!(w(Some("64"), 64, Bounded), 64);
+        assert_eq!(w(Some("4"), 64, Auto), 4);
+        assert_eq!(w(Some("0"), 64, Bounded), 40);
+        assert_eq!(w(Some("x"), 8, Auto), 8);
     }
 
     #[test]

@@ -168,9 +168,10 @@ fn detached<T: pyo3::marker::Ungil>(
 /// the log bridge. The pool starts here, not at import: a process forked
 /// after `import tylertoo` would inherit a started pool without its threads
 /// and wait forever on its first parallel job. A host that already owns the
-/// global pool keeps its size.
-fn enter(py: Python<'_>) {
-    let _ = tylertoo_core::internal::overview::convert::init_worker_pool();
+/// global pool keeps its size. The pool's width follows `profile` (#876).
+fn enter(py: Python<'_>, profile: tylertoo_core::MemoryProfile) {
+    // shortcut: the pool is process-wide, so the first call's profile sizes it for every later call; upgrade to a per-run scoped pool when callers mix profiles in one process.
+    let _ = tylertoo_core::internal::overview::convert::init_worker_pool(profile);
     refresh_log_levels(py);
 }
 
@@ -401,7 +402,7 @@ fn convert(
     values.extend(keywords(Some(&positional))?);
     let options = tiles_config(values)?;
     let _allocator = tylertoo_cli::apply_memory_profile_allocator(options.convert.profile);
-    enter(py);
+    enter(py, options.convert.profile);
     // #709/#779: core's whole preflight, before anything is read; the
     // facade runs it again, then resolves `max_zoom="auto"` over the source
     // it converts (#444, #788).
@@ -485,7 +486,7 @@ fn overview(
 ) -> PyResult<Py<PyDict>> {
     let options = overview_config(keywords(kwargs)?)?;
     let _allocator = tylertoo_cli::apply_memory_profile_allocator(options.profile);
-    enter(py);
+    enter(py, options.profile);
     // #779: every rule that needs no input, before anything is read.
     options.validate().map_err(convert_error_to_py)?;
 
@@ -537,7 +538,7 @@ fn export_pmtiles(
 ) -> PyResult<Py<PyDict>> {
     let options = export_config(keywords(kwargs)?)?;
     let _allocator = tylertoo_cli::apply_memory_profile_allocator(options.profile);
-    enter(py);
+    enter(py, options.profile);
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
 
@@ -553,7 +554,7 @@ fn export_pmtiles(
 
 signature_validate! {
 fn validate(py: Python<'_>, file: &str) -> PyResult<Py<PyDict>> {
-    enter(py);
+    enter(py, tylertoo_core::MemoryProfile::default());
     let path = Path::new(file).to_path_buf();
     let report = py.detach(|| validate_file(&path)).map_err(|e| {
         let kind = tylertoo_core::internal::error::kind_of(&e).unwrap_or(ErrorKind::Runtime);
@@ -582,7 +583,7 @@ fn decode(
     output: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    enter(py);
+    enter(py, tylertoo_core::MemoryProfile::default());
     let values = keywords(kwargs)?;
     let mut defaults = config_keywords::command_defaults("decode");
     for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }
@@ -609,7 +610,7 @@ fn stats(
     archive: &str,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
-    enter(py);
+    enter(py, tylertoo_core::MemoryProfile::default());
     let values = keywords(kwargs)?;
     let mut defaults = config_keywords::command_defaults("stats");
     for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }
@@ -642,7 +643,7 @@ fn pyramid(
     // shared with the CLI's `--band` (#445).
     let options = pyramid_config(keywords(kwargs)?)?;
     let _allocator = tylertoo_cli::apply_memory_profile_allocator(options.export.profile);
-    enter(py);
+    enter(py, options.export.profile);
     options.validate().map_err(pyramid_error_to_py)?;
     let bands = parse_bands(&bands).map_err(config_err)?;
     let output_path = PathBuf::from(output);
@@ -660,7 +661,7 @@ fn serve(
     archive: &Bound<'_, PyAny>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<()> {
-    enter(py);
+    enter(py, tylertoo_core::MemoryProfile::default());
     let values = keywords(kwargs)?;
     let mut defaults = config_keywords::command_defaults("serve");
     for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }

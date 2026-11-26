@@ -116,7 +116,7 @@ fn run_tiles(
 }
 
 /// #423: the PMTiles archive and the kept overview must be byte-identical
-/// at `RAYON_NUM_THREADS` 1, 2 and 8.
+/// at `RAYON_NUM_THREADS` 1, 2, 8 and 64 (past the 40-worker floor, #876).
 #[test]
 fn pmtiles_output_is_byte_identical_across_thread_counts_streaming() {
     let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
@@ -127,7 +127,7 @@ fn pmtiles_output_is_byte_identical_across_thread_counts_streaming() {
     let engine = "streaming";
     let mut baseline: Option<(u32, Vec<u8>, Vec<u8>)> = None;
 
-    for threads in [1u32, 2, 8] {
+    for threads in [1u32, 2, 8, 64] {
         let out = dir.path().join(format!("{engine}-t{threads}.pmtiles"));
         let overview_out = dir
             .path()

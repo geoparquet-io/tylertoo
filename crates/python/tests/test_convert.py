@@ -466,8 +466,9 @@ class TestConvertSpillDir:
 def test_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set(
     tmp_path, env_threads
 ):
-    """Importing the module sizes the worker pool as the CLI does: the cores
-    capped at 40, an explicit RAYON_NUM_THREADS verbatim. A subprocess, since
+    """Importing the module sizes the worker pool as the CLI does: the
+    memory budget's width for the profile (#876), an explicit
+    RAYON_NUM_THREADS verbatim. A subprocess, since
     the pool is process-wide and sized once."""
     fixture = FIXTURES_DIR / "streaming" / "multi-rowgroup-small.parquet"
     profile = tmp_path / "profile.jsonl"
@@ -489,5 +490,5 @@ def test_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set(
         assert threads == int(env_threads)
     else:
         # Exact sizing is pinned in Rust; os.cpu_count() ignores affinity and
-        # cgroup quotas, which Rust's core count honours.
-        assert 1 <= threads <= 40
+        # cgroup quotas, which Rust's core count honours, so it only bounds.
+        assert 1 <= threads <= os.cpu_count()

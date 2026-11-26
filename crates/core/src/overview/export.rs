@@ -881,7 +881,9 @@ impl ExportOptions {
     /// Validate these options and return the immutable engine configuration.
     #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConfigError> {
-        super::config::validate_export(self)
+        let config = super::config::validate_export(self)?;
+        super::convert::ensure_worker_pool(self.profile);
+        Ok(config)
     }
 
     pub(crate) fn check(&self) -> Result<(), ConfigError> {

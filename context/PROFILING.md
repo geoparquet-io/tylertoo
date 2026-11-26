@@ -889,8 +889,8 @@ ended (64-core Neoverse-V1 host, figures from the PR or commit named):
   byte-identical. Two pieces remain, both measured in #876: a few giant
   tiles hold the in-flight cap, so levels has work for only 2–16 cores for
   most of its window; and the fixed default cap of 40 workers, past which
-  more workers added memory but no speed. Until #876 lands, both stay as
-  the limits below.
+  more workers added memory but no speed. The giant tiles stay as a limit
+  below; the cap is now `bounded`'s width only (next list).
 - **Export finalize: fixed by #878.** The stall was one `fdatasync` of the
   whole archive after export's compute (#813 saw 3.2 s on Oregon roads; #818
   measured 0.22–0.25 s there and blamed a slow volume). A writer thread now
@@ -932,7 +932,14 @@ These limits stay as they are:
   places' peak RSS rose a median 18 MiB (lines 73 MiB, FTW Brazil MT 88 MiB),
   and with `MIMALLOC_PURGE_DELAY=0` pass 2's peak was lower than without the
   split. `MemoryBudget` charges it, and `bounded` keeps one thread per reader.
-  The default worker cap of 40 stays.
+- The worker pool takes every core the process may use under `auto` and
+  `speed`, and at most 40 (`WORKER_THREADS_MAX`) under `bounded`
+  (`default_worker_threads`, #876). Under `bounded` with a 24 GB limit, 64
+  workers against 40 raised peak RSS by 13–26% for 0–4% less wall, so
+  `bounded` keeps 40. An explicit `RAYON_NUM_THREADS` wins over the rule.
+  The pool is process-wide, so the first run sizes it: the CLI at startup,
+  the Python bindings at their first call, and a library caller at its
+  first options validation.
 
 ### Export phase (#535)
 

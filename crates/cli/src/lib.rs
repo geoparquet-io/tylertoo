@@ -419,7 +419,9 @@ where
 
     let _allocator = command_profile(&cli.command).map(apply_memory_profile_allocator);
     // Set the allocator policy before starting workers or pipeline work.
-    let _ = tylertoo_core::internal::overview::convert::init_worker_pool();
+    let _ = tylertoo_core::internal::overview::convert::init_worker_pool(
+        command_profile(&cli.command).unwrap_or_default(),
+    );
 
     // Checked here, not with clap's `conflicts_with`: `quiet` is a global
     // arg that only `tiles` has a `verbose` to conflict with, and clap's
