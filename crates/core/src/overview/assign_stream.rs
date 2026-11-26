@@ -1,6 +1,6 @@
-//! Streaming level assignment (#928 prototype).
+//! Streaming level assignment (#928).
 //!
-//! Today's assignment holds the pass-1 [`FeatureTable`] (33–42 B/row) for the
+//! The table assignment holds the pass-1 [`FeatureTable`] (33–42 B/row) for the
 //! whole input and runs the cell-winner passes over it afterwards. For a run
 //! where every row's level is local — polygons that never contest a cell, and
 //! lines that contest cells only against each other — the same answer can be
@@ -14,8 +14,8 @@
 //! - the fold takes the coarsest level a row wins, as `fold_wave_winners`;
 //! - the accumulator is the same [`LevelAccumulator`], fed in row order.
 //!
-//! The path is chosen before the scan ([`stream_path`]) and never switched:
-//! rows already folded into `min_levels` cannot be recovered.
+//! The path is chosen in the preflight ([`AssignPath::decide`]) and never
+//! switched: rows already folded into `min_levels` cannot be recovered.
 
 use std::collections::hash_map::Entry;
 
@@ -24,7 +24,7 @@ use rayon::prelude::*;
 use rstar::primitives::{GeomWithData, Rectangle};
 use rstar::{RTree, AABB};
 
-use super::accumulate::{log_floored_zooms, CarrierRow, LevelAccumulator};
+use super::accumulate::{carrier_rows_fit, log_floored_zooms, CarrierRow, LevelAccumulator};
 use super::assign::{
     gsd_to_coord_units, place_feature, AssignConfig, CellKey, FeatureKind, FeatureRow,
     FeatureTable, Placement, Priority, SortDirection,
@@ -33,18 +33,16 @@ use super::convert::{ConvertError, ConvertOptions};
 use super::level::Crs;
 use super::simplify::Representation;
 
-/// The hidden prototype switch: `TYLERTOO_STREAM_ASSIGN=1`.
-pub(super) const STREAM_ASSIGN_ENV: &str = "TYLERTOO_STREAM_ASSIGN";
-
 #[cfg(test)]
 thread_local! {
-    /// Test seam: force the switch on this thread (`None` = read the env).
+    /// Test seam: `Some(false)` forces the table path on this thread.
     static FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Test seam: the path the last pass 1 on this thread took.
     static LAST_PATH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// Run `f` with the switch forced to `on` on this thread.
+/// Run `f` with the streamed path allowed (`on`) or forced off on this
+/// thread: the equivalence tests reach both paths through it.
 #[cfg(test)]
 pub(super) fn with_stream_assign<R>(on: bool, f: impl FnOnce() -> R) -> R {
     struct Reset(Option<bool>);
@@ -70,13 +68,13 @@ pub(super) fn record_path(streamed: bool) {
 #[cfg(not(test))]
 pub(super) fn record_path(_streamed: bool) {}
 
-/// Whether the switch is on.
-pub(super) fn requested() -> bool {
+/// Whether a test forced the table path.
+fn table_forced() -> bool {
     #[cfg(test)]
-    if let Some(on) = FORCE.get() {
-        return on;
+    if FORCE.get() == Some(false) {
+        return true;
     }
-    std::env::var(STREAM_ASSIGN_ENV).is_ok_and(|v| v == "1")
+    false
 }
 
 /// The geometry kinds the footers declare, when they are polygons and/or
@@ -135,6 +133,9 @@ pub(super) struct StreamGate<'a> {
     /// Whether pass 1 collects shared-node pins (#802).
     pub(super) shared_nodes: bool,
     pub(super) level_reprs: &'a [Representation],
+    /// Whether any level accumulates tiny polygons (#384), which keeps
+    /// carrier rows.
+    pub(super) accumulates: bool,
 }
 
 /// The v1 scope: the declared kinds when every row's level can be decided
@@ -172,6 +173,77 @@ pub(super) fn stream_path(gate: &StreamGate<'_>) -> Result<KindSet, &'static str
         return Err("the density budget applies to polygons or lines");
     }
     Ok(kinds)
+}
+
+/// Which level assignment a run takes. Decided once, in the preflight,
+/// before any row is read; pass 1 and the #543 memory preflight both read
+/// it.
+#[derive(Debug, Clone)]
+pub(super) enum AssignPath {
+    /// The table path, and why the streamed one does not apply.
+    Table(&'static str),
+    Streamed {
+        kinds: KindSet,
+        /// The stream's row groups, in read order, for the eviction.
+        spans: Vec<GroupSpan>,
+        /// What the path keeps resident per input row
+        /// ([`streamed_bytes_per_row`]).
+        bytes_per_row: u64,
+    },
+}
+
+impl AssignPath {
+    /// The path for `gate` over `rows` input rows, read as `spans`.
+    pub(super) fn decide(gate: &StreamGate<'_>, rows: u64, spans: Vec<GroupSpan>) -> Self {
+        if table_forced() {
+            return Self::Table("a test forced the table path");
+        }
+        let kinds = match stream_path(gate) {
+            Ok(kinds) => kinds,
+            Err(reason) => return Self::Table(reason),
+        };
+        let rows = usize::try_from(rows).unwrap_or(usize::MAX);
+        if !carrier_rows_fit(rows) {
+            return Self::Table("the stream has more rows than a u32 carrier row holds");
+        }
+        let evicts = Eviction::usable(&spans, rows);
+        // Unevicted line grids hold every cell to the end: 160-213 B/row on
+        // Overture segments, far over the table path.
+        if kinds.lines && !evicts {
+            return Self::Table("no row group has footer bounds, which lines need to evict cells");
+        }
+        let want_kinds = gate.options.coalesce_lines || gate.options.save_plan.is_some();
+        Self::Streamed {
+            kinds,
+            spans,
+            bytes_per_row: streamed_bytes_per_row(
+                kinds,
+                want_kinds,
+                gate.accumulates && kinds.polygons,
+                evicts,
+            ),
+        }
+    }
+}
+
+/// The streamed path's resident bytes per input row, from the scan through
+/// pass 2, for the #543 preflight: `min_levels` (1), the kinds when a plan
+/// or coalescing reads them (1), the carriers when polygons accumulate (one
+/// `u32` per row, over the 2.1-2.7 B/row measured), and an allowance for the
+/// working maps over their measured peaks: evicted polygon maps 0.6-1.2
+/// B/row (NZ parcels, NL buildings), evicted line maps 7.5 B/row (Overture
+/// segments), unevicted polygon maps 5.9 B/row (NL buildings).
+pub(super) fn streamed_bytes_per_row(
+    kinds: KindSet,
+    want_kinds: bool,
+    carriers: bool,
+    evicts: bool,
+) -> u64 {
+    let maps = match (evicts, kinds.lines) {
+        (true, false) => 2,
+        (true, true) | (false, _) => 8,
+    };
+    1 + u64::from(want_kinds) + if carriers { 4 } else { 0 } + maps
 }
 
 /// A line grid's incumbent. Its sort key is always missing: the gate
@@ -276,17 +348,16 @@ impl Eviction {
     /// has bounds (the eviction then stays off and every cell closes at the
     /// end).
     fn new(spans: &[GroupSpan], rows: usize) -> Option<Self> {
-        let mut ends = Vec::with_capacity(spans.len());
-        let mut end = 0usize;
-        for s in spans {
-            end += s.rows;
-            ends.push(end);
-        }
-        // With no bounds anywhere nothing could close before the end, and
-        // the schedule would be pure cost.
-        if end != rows || spans.iter().all(|s| s.bounds.is_none()) {
+        if !Self::usable(spans, rows) {
             return None;
         }
+        let ends: Vec<usize> = spans
+            .iter()
+            .scan(0usize, |end, s| {
+                *end += s.rows;
+                Some(*end)
+            })
+            .collect();
         // Covering bboxes are often f32, rounded either way: grow by a
         // relative 1e-6 so a correct footer never trips the check.
         let grow = |v: f64| 1e-6 * v.abs().max(1.0);
@@ -329,6 +400,14 @@ impl Eviction {
             live_cap: 0,
             peak_cap: 0,
         })
+    }
+
+    /// Whether `spans` can drive an eviction over `rows` rows: they cover
+    /// exactly the stream, and some group has bounds (with none, nothing
+    /// could close before the end and the schedule would be pure cost).
+    fn usable(spans: &[GroupSpan], rows: usize) -> bool {
+        spans.iter().map(|s| s.rows).sum::<usize>() == rows
+            && spans.iter().any(|s| s.bounds.is_some())
     }
 
     /// Move to `row`'s group, returning the groups finished on the way.
@@ -883,25 +962,26 @@ fn grown_cell(ix: i64, iy: i64, w: f64) -> [f64; 4] {
     [x - w, y - w, x + 2.0 * w, y + 2.0 * w]
 }
 
+// Both are corrupt-input errors (`ErrorKind::Runtime`): the footers
+// contradict the rows, and rows already folded cannot move to the table path.
 fn outside_bounds(row: usize) -> ConvertError {
     ConvertError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         format!(
-            "{STREAM_ASSIGN_ENV}: row {row}'s bbox centre lies outside its row group's \
-             footer bounds, so streamed assignment cannot evict safely; rerun without \
-             {STREAM_ASSIGN_ENV}"
+            "row {row}'s bbox centre lies outside its row group's footer bounds: the \
+             input's bbox covering statistics do not match its rows. Rewrite the input with \
+             `gpio add bbox --force <input> <output>` to recompute them"
         ),
     ))
 }
 
 fn undeclared(row: usize, kind: FeatureKind) -> ConvertError {
-    // shortcut: an I/O-classed error, not a ConvertError variant of its own;
-    // a merge would add one with its ErrorKind.
     ConvertError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         format!(
-            "{STREAM_ASSIGN_ENV}: row {row} is a {kind:?}, which the input's \
-             geometry_types do not allow for streamed assignment; rerun without {STREAM_ASSIGN_ENV}"
+            "row {row} is a {kind:?}, but the input's GeoParquet metadata declares \
+             `geometry_types` without it. Fix the `geo` metadata so `geometry_types` lists \
+             every kind the file holds (an empty list allows any kind)"
         ),
     ))
 }
@@ -925,6 +1005,7 @@ mod tests {
             accumulate_columns: false,
             shared_nodes: false,
             level_reprs: &[],
+            accumulates: false,
         })
     }
 
@@ -993,6 +1074,49 @@ mod tests {
         );
     }
 
+    /// #928: lines stream only when the footers give the eviction bounds;
+    /// unevicted line grids would outgrow the table path.
+    #[test]
+    fn lines_without_footer_bounds_take_the_table_path() {
+        let options = eligible();
+        let decide = |declared, bounds: Option<[f64; 4]>| {
+            let gate = StreamGate {
+                options: &options,
+                declared: Some(declared),
+                size_fallback_ranking: true,
+                accumulate_columns: false,
+                shared_nodes: false,
+                level_reprs: &[],
+                accumulates: true,
+            };
+            AssignPath::decide(&gate, 10, vec![GroupSpan { rows: 10, bounds }])
+        };
+        let bounds = Some([0.0, 0.0, 1.0, 1.0]);
+        assert!(matches!(decide(BOTH, None), AssignPath::Table(_)));
+        assert!(matches!(
+            decide(BOTH, bounds),
+            AssignPath::Streamed {
+                bytes_per_row: 13,
+                ..
+            }
+        ));
+        // Polygons stream either way, priced by whether their maps evict.
+        assert!(matches!(
+            decide(POLYS, None),
+            AssignPath::Streamed {
+                bytes_per_row: 13,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decide(POLYS, bounds),
+            AssignPath::Streamed {
+                bytes_per_row: 7,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn the_eligible_config_streams() {
         assert_eq!(gate(&eligible(), Some(BOTH)), Ok(BOTH));
@@ -1050,6 +1174,7 @@ mod tests {
                 accumulate_columns: false,
                 shared_nodes: false,
                 level_reprs: &[],
+                accumulates: false,
             };
             f(&mut g);
             stream_path(&g)

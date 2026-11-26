@@ -43,7 +43,7 @@ use super::accumulate::{
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
 };
-use super::assign_stream::{ChunkRef, StreamAssigned, StreamAssigner};
+use super::assign_stream::{AssignPath, ChunkRef, StreamAssigned, StreamAssigner};
 use super::cluster::{ClusterEntry, ClusterTables};
 use super::coalesce::{
     chain_stage_resident_bytes, collected_line_bytes, CoalesceInput, ExactChains,
@@ -2938,6 +2938,9 @@ struct Preflight {
     /// The #543 pass-1 memory verdict this preflight reached, carried to the
     /// `TYLERTOO_PROFILE_JSON` dump (#626 item 4).
     pass1_memory: super::convert::Pass1MemoryReport,
+    /// The level assignment path (#928), decided before pass 1 so the memory
+    /// verdict prices the path that runs.
+    assign: AssignPath,
     /// What pass 0 staged (#788), for the dump's `pass0` record; filled by
     /// `run_front_half` after the preflight.
     pass0: Option<Pass0Record>,
@@ -3140,17 +3143,39 @@ fn preflight_with_memory_limit(
     // memory floor this checks does not apply to it. With a per-feature
     // `--bbox`/`--filter` the pruned count is only an upper bound (rows that
     // fail either never become an `AssignFeature`), so it can only warn.
-    let pass1_memory = if options.plan.is_none() {
-        let selected_rows = source.selected_row_count(selected_row_groups.as_ref())?;
-        super::convert::preflight_pass1_memory(
-            selected_rows.max(0) as u64,
+    // Clustering schema checks + accumulate column resolution (Q4).
+    let acc_cols = validate_cluster_schema(&descriptor, options)?;
+    let (assign, pass1_memory) = if options.plan.is_none() {
+        let selected_rows = source
+            .selected_row_count(selected_row_groups.as_ref())?
+            .max(0) as u64;
+        let assign = decide_assign_path(
+            source,
+            &descriptor,
+            options,
+            &acc_cols,
+            (selected_row_groups.as_ref(), selected_rows),
+        )?;
+        let price = match &assign {
+            AssignPath::Table(_) => super::convert::Pass1Price::TABLE,
+            AssignPath::Streamed { bytes_per_row, .. } => {
+                super::convert::Pass1Price::streamed(*bytes_per_row)
+            }
+        };
+        let report = super::convert::preflight_pass1_memory(
+            price,
+            selected_rows,
             memory_limit,
             skip_memory_preflight,
             bbox_query.is_some() || mask.is_some() || bound_filter.is_some(),
             diagnostics,
-        )?
+        )?;
+        (assign, report)
     } else {
-        super::convert::Pass1MemoryReport::default()
+        (
+            AssignPath::Table("a --plan run has no pass 1"),
+            super::convert::Pass1MemoryReport::default(),
+        )
     };
     // #267: nudge toward --bbox / download-first for a large whole-file remote
     // convert (quiet for local inputs and effective bbox extracts).
@@ -3181,8 +3206,6 @@ fn preflight_with_memory_limit(
     // columns. `geom_idx` / `geom_field` were found above, before row-group
     // selection, for the #563 preflight.)
 
-    // Clustering schema checks + accumulate column resolution (Q4).
-    let acc_cols = validate_cluster_schema(&descriptor, options)?;
     // Coalescing schema check (Q3).
     validate_coalesce_schema(&descriptor, options)?;
 
@@ -3204,6 +3227,7 @@ fn preflight_with_memory_limit(
         crs_assumed_wgs84,
         geo_version,
         pass1_memory,
+        assign,
         pass0: None,
     })
 }
@@ -3244,6 +3268,8 @@ struct Pass1Ctx<'a> {
     mask: Option<&'a super::mask::MaskIndex>,
     bound_filter: Option<&'a super::filter::BoundFilter>,
     crs: Crs,
+    /// The level assignment path the preflight chose (#928).
+    assign: &'a AssignPath,
 }
 
 /// Everything the rest of the driver consumes from pass 1 and the level
@@ -3359,6 +3385,7 @@ fn run_front_half(
             mask: preflight.mask.as_ref(),
             bound_filter: preflight.bound_filter.as_ref(),
             crs: preflight.crs,
+            assign: &preflight.assign,
         },
         rss,
     )?;
@@ -3967,6 +3994,7 @@ pub(crate) fn run_stages(
         geo_version,
         pass1_memory: preflight_report,
         pass0,
+        assign: _,
     } = preflight;
     let options = &resolved_options;
     let PlanState {
@@ -6642,7 +6670,7 @@ fn run_pass1_with_chunk_rows(
     log::debug!("[profile] pass1 chunk_rows={chunk_rows}");
 
     // #928: the assignment path, decided before the first row is read.
-    let (mut features, mut stream) = pass1_tables(ctx, &plan, selected_rows)?;
+    let (mut features, mut stream) = pass1_tables(ctx, selected_rows)?;
     // #188/#429 bbox tallies, folded chunk by chunk as the scan produces
     // features (#543 — see `super::convert::BboxTally`).
     let mut bbox_tally = super::convert::BboxTally::default();
@@ -6867,15 +6895,13 @@ fn run_pass1_with_chunk_rows(
 }
 
 /// Pass 1's feature table and streamed assigner (#928): exactly one of them
-/// fills. The path is decided here, before the first row is read, and never
-/// switched.
+/// fills, as the preflight decided ([`Pass1Ctx::assign`]).
 fn pass1_tables(
     ctx: &Pass1Ctx<'_>,
-    plan: &RankPlan,
     selected_rows: u64,
 ) -> Result<(FeatureTable, Option<StreamAssigner>), ConvertError> {
     let mut features = FeatureTable::new();
-    let stream = stream_assigner(ctx, plan, selected_rows)?;
+    let stream = stream_assigner(ctx, selected_rows)?;
     // #543 review: pre-size the feature table when its final length is known
     // from the footers — i.e. no per-feature `--bbox`/`--filter` can drop
     // rows (only null/unusable geometries, a small overshoot). Growing by
@@ -6893,25 +6919,68 @@ fn pass1_tables(
     Ok((features, stream))
 }
 
-/// #928: the streamed assigner when `TYLERTOO_STREAM_ASSIGN=1` and the run
-/// is inside the v1 scope ([`super::assign_stream::stream_path`]); `None`
-/// keeps the table path. Logs the path taken, once.
-fn stream_assigner(
-    ctx: &Pass1Ctx<'_>,
-    plan: &RankPlan,
-    rows: u64,
-) -> Result<Option<StreamAssigner>, ConvertError> {
+/// #928: the streamed assigner when the preflight chose the streamed path
+/// ([`AssignPath::decide`]); `None` keeps the table path. Logs the path
+/// taken, once.
+fn stream_assigner(ctx: &Pass1Ctx<'_>, rows: u64) -> Result<Option<StreamAssigner>, ConvertError> {
     use super::assign_stream as sa;
+    let (kinds, spans) = match ctx.assign {
+        AssignPath::Table(reason) => {
+            sa::record_path(false);
+            log::info!("[assign] level assignment path: table ({reason})");
+            return Ok(None);
+        }
+        AssignPath::Streamed { kinds, spans, .. } => (*kinds, spans),
+    };
     let options = ctx.config.options();
-    if !sa::requested() {
-        sa::record_path(false);
-        log::info!("[assign] level assignment path: table");
-        return Ok(None);
+    let level_specs = options.levels.resolve(options.gsd_base)?;
+    let level_reprs = super::convert::level_representations(&level_specs, &options.representation);
+    sa::record_path(true);
+    log::info!(
+        "[assign] level assignment path: streamed ({kinds:?}, {} level(s))",
+        level_specs.len()
+    );
+    let assigner = StreamAssigner::new(
+        kinds,
+        options,
+        &level_specs,
+        &level_reprs,
+        ctx.crs,
+        (usize::try_from(rows).unwrap_or(0), spans),
+    );
+    let bounded = spans.iter().filter(|s| s.bounds.is_some()).count();
+    if assigner.evicts() {
+        log::info!(
+            "[assign] streamed assignment eviction: on ({} row group(s), {bounded} with usable \
+             bounds)",
+            spans.len()
+        );
+    } else {
+        log::info!(
+            "[assign] streamed assignment eviction: off ({} row group(s), {bounded} with usable \
+             bounds): the tiny-polygon patch maps stay resident to the end of pass 1. Write the \
+             input with `gpio add bbox --force <input> <output>` so every row group has footer \
+             bounds",
+            spans.len()
+        );
     }
+    Ok(Some(assigner))
+}
+
+/// #928: the path [`AssignPath::decide`] picks for this input, from the
+/// footers and options alone. `None` rows (`--plan`) never run pass 1.
+fn decide_assign_path(
+    source: &ConvertSource,
+    descriptor: &ResolvedSchema,
+    options: &ConvertOptions,
+    acc_cols: &[usize],
+    (selected, rows): (Option<&RowGroupSelection>, u64),
+) -> Result<AssignPath, ConvertError> {
+    use super::assign_stream as sa;
     let level_specs = options.levels.resolve(options.gsd_base)?;
     let level_reprs = super::convert::level_representations(&level_specs, &options.representation);
     let declared = sa::declared_kinds(
-        ctx.source
+        source
             .resolved_schemas()?
             .into_iter()
             .map(ResolvedSchema::declared_geometry_types),
@@ -6919,61 +6988,37 @@ fn stream_assigner(
     let gate = sa::StreamGate {
         options,
         declared,
-        size_fallback_ranking: matches!(plan, RankPlan::SizeFallback),
-        accumulate_columns: !ctx.acc_cols.is_empty(),
+        size_fallback_ranking: matches!(
+            build_rank_plan(descriptor, options)?,
+            RankPlan::SizeFallback
+        ),
+        accumulate_columns: !acc_cols.is_empty(),
         shared_nodes: wants_pins(options),
         level_reprs: &level_reprs,
+        accumulates: accumulate_levels(options, &level_specs, &level_reprs)
+            .iter()
+            .any(|l| l.enabled),
     };
-    let fits = carrier_rows_fit(usize::try_from(rows).unwrap_or(usize::MAX));
-    let allowed = match sa::stream_path(&gate).and_then(|k| {
-        fits.then_some(k)
-            .ok_or("the stream has more rows than a u32 carrier row holds")
-    }) {
-        Ok(kinds) => kinds,
-        Err(reason) => {
-            sa::record_path(false);
-            log::info!(
-                "[assign] level assignment path: table ({}=1 set, but {reason})",
-                sa::STREAM_ASSIGN_ENV
-            );
-            return Ok(None);
-        }
-    };
-    sa::record_path(true);
-    log::info!(
-        "[assign] level assignment path: streamed (#928; {allowed:?}, {} level(s))",
-        level_specs.len()
-    );
-    let spans = stream_group_spans(ctx)?;
-    let assigner = StreamAssigner::new(
-        allowed,
-        options,
-        &level_specs,
-        &level_reprs,
-        ctx.crs,
-        (usize::try_from(rows).unwrap_or(0), &spans),
-    );
-    log::info!(
-        "[assign] streamed assignment eviction: {} ({} row group(s), {} with usable bounds)",
-        if assigner.evicts() { "on" } else { "off" },
-        spans.len(),
-        spans.iter().filter(|s| s.bounds.is_some()).count()
-    );
-    Ok(Some(assigner))
+    Ok(AssignPath::decide(
+        &gate,
+        rows,
+        stream_group_spans(source, selected)?,
+    ))
 }
 
 /// #928: the read stream's row groups, in read order, with the footer
 /// bounds the eviction may trust: none for a reprojected part (its bounds
 /// are a transformed box, not a hull) or for wrapped bounds.
 fn stream_group_spans(
-    ctx: &Pass1Ctx<'_>,
+    source: &ConvertSource,
+    selected: Option<&RowGroupSelection>,
 ) -> Result<Vec<super::assign_stream::GroupSpan>, ConvertError> {
-    let counts = ctx.source.part_row_group_row_counts()?;
-    let schemas = ctx.source.resolved_schemas()?;
+    let counts = source.part_row_group_row_counts()?;
+    let schemas = source.resolved_schemas()?;
     let mut spans = Vec::new();
     for (part, rows) in counts.iter().enumerate() {
         let all: Vec<usize>;
-        let groups = match ctx.selected_row_groups {
+        let groups = match selected {
             Some(sel) => &sel.parts()[part],
             None => {
                 all = (0..rows.len()).collect();
@@ -8721,6 +8766,7 @@ pub(super) mod tests {
                 mask: pre.mask.as_ref(),
                 bound_filter: pre.bound_filter.as_ref(),
                 crs: pre.crs,
+                assign: &pre.assign,
             },
             chunk_rows,
         )
@@ -11334,6 +11380,7 @@ pub(super) mod tests {
             mask: None,
             bound_filter: None,
             crs: Crs::Epsg3857,
+            assign: &AssignPath::Table("a test context"),
         };
         f(&ctx)
     }
@@ -12368,6 +12415,7 @@ pub(super) mod tests {
             mask: None,
             bound_filter: None,
             crs,
+            assign: &AssignPath::Table("a test context"),
         };
         scan_chunk(
             &ctx,

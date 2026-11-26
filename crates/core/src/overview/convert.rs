@@ -5521,6 +5521,48 @@ pub(super) const PASS1_BYTES_PER_ROW: u64 = FeatureTable::MAX_BYTES_PER_ROW;
 /// warns needs a fresh billion-row run, not arithmetic.)
 const PASS1_RECOMMENDED_FACTOR: f64 = 3.3;
 
+/// What the #543 preflight prices an input row at: the per-row floor the
+/// level assignment path keeps resident, the whole-job multiple over it, and
+/// what the floor holds (for the messages).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Pass1Price {
+    pub(super) bytes_per_row: u64,
+    pub(super) factor: f64,
+    pub(super) holds: &'static str,
+}
+
+impl Pass1Price {
+    /// The table path: the pass-1 feature table, × [`PASS1_RECOMMENDED_FACTOR`].
+    pub(super) const TABLE: Self = Self {
+        bytes_per_row: PASS1_BYTES_PER_ROW,
+        factor: PASS1_RECOMMENDED_FACTOR,
+        holds: "the pass-1 feature table",
+    };
+
+    /// The streamed path (#928) at its per-row floor
+    /// (`assign_stream::streamed_bytes_per_row`). The table path's multiple
+    /// covers the winner grids and the per-row scan vectors on top of the
+    /// table; the streamed path keeps neither, and pass 2's buffers are
+    /// bounded by the memory budget rather than by the row count. Its
+    /// multiple is headroom only: no billion-row run has calibrated it.
+    pub(super) fn streamed(bytes_per_row: u64) -> Self {
+        Self {
+            bytes_per_row,
+            factor: 1.5,
+            holds: "the streamed level assignment's row tables and working maps",
+        }
+    }
+
+    fn floor(self, rows: u64) -> u64 {
+        rows.saturating_mul(self.bytes_per_row)
+    }
+
+    /// The realistic "this input needs ≳X GiB" total.
+    fn recommended_total_gib(self, rows: u64) -> f64 {
+        gib(self.floor(rows)) * self.factor
+    }
+}
+
 /// Escape hatch (#543): downgrades the pass-1 memory-floor hard error to a
 /// warning, for setups where the estimate or the probe is known to be wrong
 /// for this box. On for `1`, `true`, `yes` or `on` (trimmed,
@@ -5588,16 +5630,6 @@ const PASS1_MEMORY_REMEDIATION: &str = "A sharded build does not avoid this: its
      runs this same full pass 1. Only a `--plan` replay skips pass 1, and that plan must first \
      be cut on a big-enough machine.";
 
-/// The realistic "this input needs ≳X GiB" total: the floor ×
-/// [`PASS1_RECOMMENDED_FACTOR`].
-fn recommended_total_gib(rows: u64) -> f64 {
-    gib(super::memory::MemoryBudget::with_available(None).estimate(
-        super::memory::MemoryPhase::Scan,
-        rows,
-        None,
-    )) * PASS1_RECOMMENDED_FACTOR
-}
-
 /// #543 decision (pure). `limit = None` (nothing could be probed, e.g.
 /// non-Linux without the override) always fits: a preflight must never turn
 /// "unknown" into a wrong failure.
@@ -5621,6 +5653,7 @@ enum Pass1MemoryVerdict {
 }
 
 fn pass1_memory_verdict(
+    price: Pass1Price,
     rows: u64,
     limit: Option<MemoryLimit>,
     per_feature_filter_active: bool,
@@ -5628,17 +5661,13 @@ fn pass1_memory_verdict(
     let Some(limit) = limit else {
         return Pass1MemoryVerdict::Fits;
     };
-    let estimated_bytes = super::memory::MemoryBudget::with_available(None).estimate(
-        super::memory::MemoryPhase::Scan,
-        rows,
-        None,
-    );
+    let estimated_bytes = price.floor(rows);
     if estimated_bytes > limit.bytes && limit.source.is_hard() && !per_feature_filter_active {
         Pass1MemoryVerdict::Exceeds {
             estimated_bytes,
             limit_bytes: limit.bytes,
         }
-    } else if estimated_bytes as f64 * PASS1_RECOMMENDED_FACTOR > limit.bytes as f64 {
+    } else if estimated_bytes as f64 * price.factor > limit.bytes as f64 {
         Pass1MemoryVerdict::Warn {
             estimated_bytes,
             limit,
@@ -5650,13 +5679,14 @@ fn pass1_memory_verdict(
 
 /// The #543 warning body (pure, so its wording is unit-testable).
 fn pass1_memory_warn_message(
+    price: Pass1Price,
     rows: u64,
     estimated_bytes: u64,
     limit: MemoryLimit,
     per_feature_filter_active: bool,
 ) -> String {
     let floor_over = if estimated_bytes > limit.bytes {
-        " The feature table alone is over it."
+        " The floor alone is over it."
     } else {
         ""
     };
@@ -5667,16 +5697,18 @@ fn pass1_memory_warn_message(
         ""
     };
     format!(
-        "[convert] {rows} input row(s) need an estimated {:.1} GiB for the pass-1 feature table \
-         alone ({PASS1_BYTES_PER_ROW} bytes/row, a lower bound) and ≳{:.1} GiB for the whole \
-         job (×{PASS1_RECOMMENDED_FACTOR}) — more than the {:.1} GiB {}; the run may be \
-         OOM-killed.{floor_over}{upper_bound} Remedy: a bigger box (≳{:.1} GiB). \
-         {PASS1_MEMORY_REMEDIATION} See {MEMORY_SIZING_DOC}.",
+        "[convert] {rows} input row(s) need an estimated {:.1} GiB for {} alone ({} \
+         bytes/row, a lower bound) and ≳{:.1} GiB for the whole job (×{}) — more than the \
+         {:.1} GiB {}; the run may be OOM-killed.{floor_over}{upper_bound} Remedy: a bigger box \
+         (≳{:.1} GiB). {PASS1_MEMORY_REMEDIATION} See {MEMORY_SIZING_DOC}.",
         gib(estimated_bytes),
-        recommended_total_gib(rows),
+        price.holds,
+        price.bytes_per_row,
+        price.recommended_total_gib(rows),
+        price.factor,
         gib(limit.bytes),
         limit.source.describe(),
-        recommended_total_gib(rows),
+        price.recommended_total_gib(rows),
     )
 }
 
@@ -5692,17 +5724,23 @@ fn skip_preflight_hint(phase: &str) -> &'static str {
 }
 
 /// The message body of [`ConvertError::BudgetExceeded`].
-fn pass1_memory_floor_message(rows: &u64, estimated_bytes: &u64, limit_bytes: &u64) -> String {
+fn pass1_memory_floor_message(
+    price: Pass1Price,
+    rows: &u64,
+    estimated_bytes: &u64,
+    limit_bytes: &u64,
+) -> String {
     format!(
-        "{rows} input row(s) need an estimated {:.1} GiB for the pass-1 feature table alone \
-         ({PASS1_BYTES_PER_ROW} bytes/row) — over the {:.1} GiB {}, so the run would be \
-         OOM-killed. This input needs ≳{:.1} GiB: use a bigger box. {PASS1_MEMORY_REMEDIATION} \
-         See {MEMORY_SIZING_DOC}. Set {SKIP_MEMORY_PREFLIGHT_ENV}=1 to downgrade this to a \
-         warning and attempt the run anyway.",
+        "{rows} input row(s) need an estimated {:.1} GiB for {} alone ({} bytes/row) — over \
+         the {:.1} GiB {}, so the run would be OOM-killed. This input needs ≳{:.1} GiB: use a \
+         bigger box. {PASS1_MEMORY_REMEDIATION} See {MEMORY_SIZING_DOC}. Set \
+         {SKIP_MEMORY_PREFLIGHT_ENV}=1 to downgrade this to a warning and attempt the run anyway.",
         gib(*estimated_bytes),
+        price.holds,
+        price.bytes_per_row,
         gib(*limit_bytes),
         MemoryLimitSource::CgroupMax.describe(),
-        recommended_total_gib(*rows),
+        price.recommended_total_gib(*rows),
     )
 }
 
@@ -5717,6 +5755,7 @@ fn pass1_memory_floor_message(rows: &u64, estimated_bytes: &u64, limit_bytes: &u
 /// that was warned about and then OOM-killed anyway leaves the warning in the
 /// machine-readable record and not only in a log nobody kept.
 pub(super) fn preflight_pass1_memory(
+    price: Pass1Price,
     rows: u64,
     limit: Option<MemoryLimit>,
     skip_on_exceed: bool,
@@ -5730,20 +5769,14 @@ pub(super) fn preflight_pass1_memory(
         limit_bytes: limit.map(|l| l.bytes),
         limit_source: limit.map(|l| l.source.describe()),
     };
-    match pass1_memory_verdict(rows, limit, per_feature_filter_active) {
-        Pass1MemoryVerdict::Fits => Ok(report(
-            Pass1MemoryOutcome::Fits,
-            super::memory::MemoryBudget::with_available(None).estimate(
-                super::memory::MemoryPhase::Scan,
-                rows,
-                None,
-            ),
-        )),
+    match pass1_memory_verdict(price, rows, limit, per_feature_filter_active) {
+        Pass1MemoryVerdict::Fits => Ok(report(Pass1MemoryOutcome::Fits, price.floor(rows))),
         Pass1MemoryVerdict::Warn {
             estimated_bytes,
             limit,
         } => {
             diagnostics.warn(pass1_memory_warn_message(
+                price,
                 rows,
                 estimated_bytes,
                 limit,
@@ -5759,7 +5792,7 @@ pub(super) fn preflight_pass1_memory(
                 diagnostics.warn(format!(
                     "[convert] {SKIP_MEMORY_PREFLIGHT_ENV} set: downgrading the pass-1 \
                      memory-floor error to a warning — {}",
-                    pass1_memory_floor_message(&rows, &estimated_bytes, &limit_bytes),
+                    pass1_memory_floor_message(price, &rows, &estimated_bytes, &limit_bytes),
                 ));
                 Ok(report(
                     Pass1MemoryOutcome::ExceededButForced,
@@ -8659,6 +8692,49 @@ mod tests {
         Some(MemoryLimit { bytes, source })
     }
 
+    /// #928: a planet buildings plan (2.54B polygon rows, bounded row groups,
+    /// `--save-plan`, the accumulator on) on the streamed path fits a 32 GiB
+    /// host; the table path's 42 B/row floor does not.
+    #[test]
+    fn streamed_planet_buildings_pass_the_preflight_at_32_gib() {
+        use super::super::assign_stream::{streamed_bytes_per_row, KindSet};
+        let rows = 2_540_000_000u64;
+        let polygons = KindSet {
+            polygons: true,
+            lines: false,
+        };
+        let streamed = Pass1Price::streamed(streamed_bytes_per_row(polygons, true, true, true));
+        for source in [
+            MemoryLimitSource::CgroupMax,
+            MemoryLimitSource::MemAvailable,
+        ] {
+            let limit = mem_limit(32 << 30, source);
+            assert_eq!(
+                pass1_memory_verdict(streamed, rows, limit, false),
+                Pass1MemoryVerdict::Fits
+            );
+        }
+        // The table path warns on an advisory figure and refuses a hard one.
+        assert!(matches!(
+            pass1_memory_verdict(
+                Pass1Price::TABLE,
+                rows,
+                mem_limit(32 << 30, MemoryLimitSource::MemAvailable),
+                false
+            ),
+            Pass1MemoryVerdict::Warn { .. }
+        ));
+        assert!(matches!(
+            pass1_memory_verdict(
+                Pass1Price::TABLE,
+                rows,
+                mem_limit(32 << 30, MemoryLimitSource::CgroupMax),
+                false
+            ),
+            Pass1MemoryVerdict::Exceeds { .. }
+        ));
+    }
+
     /// #543: the verdict's boundaries — the realistic need
     /// (floor × [`PASS1_RECOMMENDED_FACTOR`]) over the figure warns; the floor
     /// strictly over a HARD limit errors; an unknown limit never fails.
@@ -8671,11 +8747,11 @@ mod tests {
         let floor = 10 * PASS1_BYTES_PER_ROW;
         let need = (floor as f64 * PASS1_RECOMMENDED_FACTOR).ceil() as u64;
         assert_eq!(
-            pass1_memory_verdict(10, hard(need), false),
+            pass1_memory_verdict(Pass1Price::TABLE, 10, hard(need), false),
             Pass1MemoryVerdict::Fits
         );
         assert_eq!(
-            pass1_memory_verdict(10, hard(need - 1), false),
+            pass1_memory_verdict(Pass1Price::TABLE, 10, hard(need - 1), false),
             Pass1MemoryVerdict::Warn {
                 estimated_bytes: floor,
                 limit: hard(need - 1).unwrap(),
@@ -8683,7 +8759,7 @@ mod tests {
         );
         // Floor exactly at the hard limit: still only warns.
         assert_eq!(
-            pass1_memory_verdict(10, hard(floor), false),
+            pass1_memory_verdict(Pass1Price::TABLE, 10, hard(floor), false),
             Pass1MemoryVerdict::Warn {
                 estimated_bytes: floor,
                 limit: hard(floor).unwrap(),
@@ -8691,14 +8767,14 @@ mod tests {
         );
         // Strictly over the hard limit: errors.
         assert_eq!(
-            pass1_memory_verdict(10, hard(floor - 1), false),
+            pass1_memory_verdict(Pass1Price::TABLE, 10, hard(floor - 1), false),
             Pass1MemoryVerdict::Exceeds {
                 estimated_bytes: floor,
                 limit_bytes: floor - 1,
             }
         );
         assert_eq!(
-            pass1_memory_verdict(u64::MAX, None, false),
+            pass1_memory_verdict(Pass1Price::TABLE, u64::MAX, None, false),
             Pass1MemoryVerdict::Fits
         );
     }
@@ -8714,7 +8790,7 @@ mod tests {
             MemoryLimitSource::CgroupHigh,
         ] {
             assert_eq!(
-                pass1_memory_verdict(1_000, mem_limit(1, source), false),
+                pass1_memory_verdict(Pass1Price::TABLE, 1_000, mem_limit(1, source), false),
                 Pass1MemoryVerdict::Warn {
                     estimated_bytes: 1_000 * PASS1_BYTES_PER_ROW,
                     limit: mem_limit(1, source).unwrap(),
@@ -8723,7 +8799,12 @@ mod tests {
             );
         }
         assert!(matches!(
-            pass1_memory_verdict(1_000, mem_limit(1, MemoryLimitSource::CgroupMax), false),
+            pass1_memory_verdict(
+                Pass1Price::TABLE,
+                1_000,
+                mem_limit(1, MemoryLimitSource::CgroupMax),
+                false
+            ),
             Pass1MemoryVerdict::Exceeds { .. }
         ));
     }
@@ -8734,10 +8815,11 @@ mod tests {
     fn pass1_memory_verdict_never_hard_errors_under_a_per_feature_filter() {
         let limit = mem_limit(1, MemoryLimitSource::CgroupMax);
         assert!(matches!(
-            pass1_memory_verdict(1_000, limit, true),
+            pass1_memory_verdict(Pass1Price::TABLE, 1_000, limit, true),
             Pass1MemoryVerdict::Warn { .. }
         ));
         assert!(preflight_pass1_memory(
+            Pass1Price::TABLE,
             1_000,
             limit,
             false,
@@ -8761,13 +8843,14 @@ mod tests {
         let rows = 1_580_000_000u64;
         let limit = mem_limit(192 << 30, MemoryLimitSource::CgroupMax);
         assert_eq!(
-            pass1_memory_verdict(rows, limit, false),
+            pass1_memory_verdict(Pass1Price::TABLE, rows, limit, false),
             Pass1MemoryVerdict::Warn {
                 estimated_bytes: rows * PASS1_BYTES_PER_ROW,
                 limit: limit.unwrap(),
             }
         );
         assert!(preflight_pass1_memory(
+            Pass1Price::TABLE,
             rows,
             limit,
             false,
@@ -8777,6 +8860,7 @@ mod tests {
         .is_ok());
         assert_eq!(
             pass1_memory_verdict(
+                Pass1Price::TABLE,
                 rows,
                 mem_limit(360 << 30, MemoryLimitSource::CgroupMax),
                 false
@@ -8795,7 +8879,13 @@ mod tests {
             bytes: 192 << 30,
             source: MemoryLimitSource::MemAvailable,
         };
-        let msg = pass1_memory_warn_message(rows, rows * PASS1_BYTES_PER_ROW, limit, false);
+        let msg = pass1_memory_warn_message(
+            Pass1Price::TABLE,
+            rows,
+            rows * PASS1_BYTES_PER_ROW,
+            limit,
+            false,
+        );
         for want in [
             "1580000000 input row(s)",
             "61.8 GiB",
@@ -8812,6 +8902,7 @@ mod tests {
         assert!(!msg.contains("alone is over it"), "{msg}");
 
         let filtered = pass1_memory_warn_message(
+            Pass1Price::TABLE,
             rows,
             rows * PASS1_BYTES_PER_ROW,
             MemoryLimit {
@@ -8835,7 +8926,12 @@ mod tests {
     #[test]
     fn pass1_memory_floor_message_names_numbers_doc_and_escape_hatch() {
         let rows = 1_580_000_000u64;
-        let msg = pass1_memory_floor_message(&rows, &(rows * PASS1_BYTES_PER_ROW), &(64 << 30));
+        let msg = pass1_memory_floor_message(
+            Pass1Price::TABLE,
+            &rows,
+            &(rows * PASS1_BYTES_PER_ROW),
+            &(64 << 30),
+        );
         for want in [
             "1580000000 input row(s)",
             "61.8 GiB",
@@ -8858,6 +8954,7 @@ mod tests {
     fn preflight_pass1_memory_fits_and_fails() {
         let hard = |b| mem_limit(b, MemoryLimitSource::CgroupMax);
         assert!(preflight_pass1_memory(
+            Pass1Price::TABLE,
             1_000,
             hard(1 << 30),
             false,
@@ -8866,6 +8963,7 @@ mod tests {
         )
         .is_ok());
         let err = preflight_pass1_memory(
+            Pass1Price::TABLE,
             1_580_000_000,
             hard(1_000),
             false,
@@ -8891,6 +8989,7 @@ mod tests {
     fn preflight_pass1_memory_skip_hatch_downgrades_error_to_ok() {
         let hard = mem_limit(1_000, MemoryLimitSource::CgroupMax);
         assert!(preflight_pass1_memory(
+            Pass1Price::TABLE,
             1_580_000_000,
             hard,
             false,
@@ -8899,6 +8998,7 @@ mod tests {
         )
         .is_err());
         assert!(preflight_pass1_memory(
+            Pass1Price::TABLE,
             1_580_000_000,
             hard,
             true,
@@ -8916,6 +9016,7 @@ mod tests {
     fn preflight_pass1_memory_reports_its_verdict() {
         let hard = |b| mem_limit(b, MemoryLimitSource::CgroupMax);
         let fits = preflight_pass1_memory(
+            Pass1Price::TABLE,
             1_000,
             hard(1 << 30),
             false,
@@ -8936,6 +9037,7 @@ mod tests {
         // not failed.
         let need = (10.0 * PASS1_BYTES_PER_ROW as f64 * PASS1_RECOMMENDED_FACTOR).ceil() as u64;
         let warned = preflight_pass1_memory(
+            Pass1Price::TABLE,
             10,
             hard(need - 1),
             false,
@@ -8947,6 +9049,7 @@ mod tests {
 
         // Over a hard limit, but the hatch is set.
         let forced = preflight_pass1_memory(
+            Pass1Price::TABLE,
             1_580_000_000,
             hard(1_000),
             true,
@@ -8959,6 +9062,7 @@ mod tests {
 
         // Nothing probed: the preflight never invents a limit.
         let unknown = preflight_pass1_memory(
+            Pass1Price::TABLE,
             1_580_000_000,
             None,
             false,
