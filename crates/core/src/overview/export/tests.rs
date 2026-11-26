@@ -3290,6 +3290,178 @@ fn price_samples_are_chunked_by_the_budget_to_the_same_floors() {
     assert_eq!(tight, roomy);
 }
 
+/// #919: a large polygon sampled by many tiles is clipped once a sample,
+/// not once per tile. Eight z2 tiles each hold 1,100 squares, then four
+/// 40,000-vertex discs cover all eight, so every tile samples every disc.
+/// The two samples clip at most twice the input's vertices; clipped once
+/// per tile, they clipped eight times the discs' vertices twice.
+#[test]
+fn price_samples_clip_a_large_row_once_for_all_its_tiles() {
+    let mut geoms: Vec<Geometry<f64>> = Vec::new();
+    for (x, y) in (0..4).flat_map(|x| [(x, 1.0), (x, -61.0)]) {
+        let west = -180.0 + f64::from(x) * 90.0;
+        geoms.extend((0..1_100).map(|i| {
+            let (x, y) = (
+                west + 5.0 + f64::from(i % 50) * 1.6,
+                y + f64::from(i / 50) * 2.6,
+            );
+            Geometry::Polygon(geo::Rect::new((x, y), (x + 0.5, y + 0.5)).to_polygon())
+        }));
+    }
+    let disc = |r: f64| {
+        let ring: Vec<(f64, f64)> = (0..40_000)
+            .map(|i| {
+                let a = f64::from(i) * std::f64::consts::TAU / 40_000.0;
+                (r * 2.5 * a.cos(), r * a.sin())
+            })
+            .collect();
+        Geometry::Polygon(geo::Polygon::new(LineString::from(ring), vec![]))
+    };
+    geoms.extend([60.0, 58.0, 56.0, 54.0].map(disc));
+    let input_coords: usize = geoms.iter().map(|g| g.coords_count()).sum();
+    let input = tempfile::NamedTempFile::new().unwrap();
+    let n = geoms.len() as i64;
+    write_fixture(input.path(), &[((0..n).collect(), geoms)]);
+    let before = SAMPLE_CLIP_COORDS.with(std::cell::Cell::get);
+    floors_of_file(
+        input.path(),
+        &mut MemoryBudget::with_available(Some(64 << 30)),
+    );
+    let clipped = SAMPLE_CLIP_COORDS.with(std::cell::Cell::get) - before;
+    assert!(clipped >= 160_000, "the discs must be sampled: {clipped}");
+    assert!(
+        clipped <= 2 * input_coords,
+        "{clipped} vertices clipped for {input_coords} in the input"
+    );
+}
+
+/// #919: the sampler clips a row once into the tiles that sample it, and
+/// each tile takes its own piece. That piece must be the one a clip into
+/// that tile alone gives, for every tile the row's bbox reaches (a piece or
+/// none), and no other tile may be clipped or held, so the floors are those
+/// of the per-tile clip it replaced: across the cascade and direct paths,
+/// the world-edge wrap, holes, several parts and a self-intersecting ring.
+#[test]
+fn a_range_clip_gives_each_tile_the_piece_of_its_own_clip() {
+    let opts = ExportOptions::default();
+    let d = crate::diagnostics::Diagnostics::default();
+    let ring = |cx: f64, cy: f64, r: f64, n: u32| -> LineString<f64> {
+        LineString::from(
+            (0..=n)
+                .map(|i| {
+                    let a = f64::from(i % n) * std::f64::consts::TAU / f64::from(n);
+                    (cx + r * 1.5 * a.cos(), cy + r * a.sin())
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let poly = |rings: Vec<LineString<f64>>| {
+        let mut rings = rings.into_iter();
+        geo::Polygon::new(rings.next().unwrap(), rings.collect())
+    };
+    let mut corpus = equivalence_corpus();
+    corpus.extend([
+        // 5,000 vertices: the direct loop at z3, the cascade at z4-5.
+        (
+            "disc",
+            Geometry::Polygon(poly(vec![ring(10.0, 5.0, 40.0, 5_000)])),
+            vec![3, 4, 5],
+        ),
+        // The hole's tiles are reached by the bbox, not the geometry.
+        (
+            "annulus",
+            Geometry::Polygon(poly(vec![
+                ring(-60.0, 20.0, 30.0, 3_000),
+                ring(-60.0, 20.0, 25.0, 3_000),
+            ])),
+            vec![4, 5],
+        ),
+        (
+            "two_parts",
+            Geometry::MultiPolygon(geo::MultiPolygon(vec![
+                poly(vec![ring(-120.0, -30.0, 8.0, 400)]),
+                poly(vec![ring(100.0, 40.0, 8.0, 400)]),
+            ])),
+            vec![3, 5],
+        ),
+        (
+            "bowtie",
+            Geometry::Polygon(poly(vec![LineString::from(vec![
+                (-30.0, -30.0),
+                (30.0, 30.0),
+                (30.0, -30.0),
+                (-30.0, 30.0),
+                (-30.0, -30.0),
+            ])])),
+            vec![3, 5],
+        ),
+        // Stored past +180: its overhang is drawn at the west edge.
+        (
+            "over_the_antimeridian",
+            Geometry::Polygon(poly(vec![ring(178.0, -10.0, 12.0, 2_000)])),
+            vec![3, 5],
+        ),
+    ]);
+    for (name, geom, zooms) in corpus {
+        let r = geom.bounding_rect().expect("bbox");
+        let bbox = TileBounds::new(r.min().x, r.min().y, r.max().x, r.max().y);
+        for z in zooms {
+            // The tiles the sampler can ask for: the scan's, by bbox.
+            let (_, counts) = size_bboxes(&[Some(bbox)], z, &opts, true);
+            let mut keys: Vec<u64> = counts.into_keys().collect();
+            keys.sort_unstable();
+            let ends = vec![keys[0], keys[keys.len() - 1]];
+            let alternate: Vec<u64> = keys.iter().step_by(2).copied().collect();
+            for wanted in [&keys, &alternate, &ends] {
+                let shared = members_by_key(feature_tile_members_of(&geom, z, &opts, wanted, &d));
+                let mut own = HashMap::new();
+                for &k in wanted {
+                    own.extend(feature_tile_members(&geom, z, &opts, k, k, &d));
+                }
+                assert_eq!(
+                    shared,
+                    own,
+                    "'{name}' z{z}, {} of {} tiles",
+                    wanted.len(),
+                    keys.len()
+                );
+            }
+        }
+    }
+}
+
+/// #919: the cascade prunes a subtree that holds no wanted tile, not only
+/// one outside the key window, so the sampler's clip into a few distant
+/// tiles does not clip the tiles between them.
+#[test]
+fn the_cascade_prunes_a_subtree_without_a_wanted_tile() {
+    let opts = ExportOptions::default();
+    let d = crate::diagnostics::Diagnostics::default();
+    let geom = Geometry::Point(Point::new(0.0, 0.0));
+    let (node, zoom) = (TileCoord::new(1, 0, 1), 4);
+    let ids = crate::tile::node_id_range(node, zoom);
+    let (first, last) = (*ids.start(), *ids.end());
+    let wants = |wanted: Option<&[u64]>| {
+        let target = TileTarget {
+            zoom,
+            opts: &opts,
+            key_lo: 0,
+            key_hi: u64::MAX,
+            assume_simple: true,
+            diagnostics: &d,
+            source: &geom,
+            wanted,
+        };
+        node_key_overlaps(node, &target)
+    };
+    assert!(wants(None));
+    assert!(wants(Some(&[first])));
+    assert!(wants(Some(&[0, last])));
+    assert!(wants(Some(&[first + 1, u64::MAX])));
+    assert!(!wants(Some(&[first - 1, last + 1])));
+    assert!(!wants(Some(&[])));
+}
+
 /// #768: a predictor over the scan's budget drops its dense state and
 /// says so; the export goes on as under `--valve-scope tile`, with the
 /// same tile counts.

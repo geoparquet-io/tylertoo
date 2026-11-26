@@ -28,13 +28,13 @@ fixture = "madagascar-adm4"
 settings = "sf0"
 zoom = 4
 invariant = "monotone"
-issue = 768
-reason = "the per-tile merge valve thins z5 below z4; C2 valve design removes the row"
+issue = 925
+reason = "the merge valve still thins z5 below z4 after #913; the fix for #925 removes the row"
 
 [[exemption]]
 fixture = "ftw-moldova-z10"
 settings = "sf0"
 zoom = 9
 invariant = "monotone"
-issue = 768
-reason = "the per-tile merge valve thins z10 below z9; C2 valve design removes the row"
+issue = 925
+reason = "the merge valve still thins z10 below z9 after #913; the fix for #925 removes the row"
