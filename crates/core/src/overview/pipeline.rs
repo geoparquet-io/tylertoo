@@ -5185,6 +5185,13 @@ mod cgroup_tests {
     #[test]
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn the_probe_returns_freed_heap_pages_before_it_reads() {
+        // RSS is per process: a parallel test's allocation would hide the release.
+        if !crate::overview::stream::tests::run_alone_in(
+            module_path!(),
+            "the_probe_returns_freed_heap_pages_before_it_reads",
+        ) {
+            return;
+        }
         const TOTAL: u64 = 128 << 20;
         let base = rss_anon_bytes();
         let mut kept = Vec::new();

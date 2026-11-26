@@ -7803,7 +7803,7 @@ pub(super) fn process_batch_cascade(
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     /// #852: a geometry several levels keep unchanged (one `Arc`, #499) is
     /// pooled once, and each level indexes its own geometries in order.
     #[test]
@@ -9258,11 +9258,17 @@ mod tests {
     /// `effective_cores` (#810). nextest already
     /// gives each test its own process; the re-exec is harmless there.
     fn run_alone(test: &str) -> bool {
+        run_alone_in(module_path!(), test)
+    }
+
+    /// [`run_alone`] for a test of another module: `module` is its
+    /// `module_path!()`.
+    pub(in crate::overview) fn run_alone_in(module: &str, test: &str) -> bool {
         const CHILD: &str = "TYLERTOO_RSS_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
             return true;
         }
-        let (_, module) = module_path!().split_once("::").expect("crate::module path");
+        let (_, module) = module.split_once("::").expect("crate::module path");
         let name = format!("{module}::{test}");
         let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
             .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
