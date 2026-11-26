@@ -74,7 +74,7 @@ batches processed at once, and the row groups the writer encodes at once.
 | --- | --- | --- |
 | `speed` | RAM | No limit: every knob at its maximum |
 | `bounded` | Temporary Arrow Inter-Process Communication (IPC) files | Fixed initial caps: at most 4 readers 4 batches deep, at most 4 batches in flight through pass 2 whatever `--in-flight-batches` asks for, and 4 encodes. The drain can reuse released batch memory for more encodes |
-| `auto` (default) | RAM when the estimate fits 60% of available RAM, otherwise spill. Measures buffered rows and switches to spilling mid-pass if they outgrow it | Sized to fit the same 60%, priced from the Parquet footers |
+| `auto` (default) | RAM when the estimate fits what is left of 60% of available RAM after the memory other phases reserve or are granted, or 150% of that for an estimate priced from the Parquet footers, which overstates; otherwise spill. Measures buffered rows and switches to spilling mid-pass if they outgrow what is left | Sized to fit the same 60%, priced from the Parquet footers |
 
 `auto` is its own shape, not a switch between the other two: on a large
 machine it holds more than `bounded` and less than `speed`.
@@ -111,14 +111,80 @@ can still add memory overhead. A build with `--no-default-features` uses the
 system allocator, except on musl targets, which always use mimalloc.
 
 tylertoo reads cgroup v2 `memory.max` and `memory.high` or the cgroup v1 limit,
-subtracting memory the cgroup cannot reclaim. Slurm, Docker, and Kubernetes
-jobs use this limit to size buffers. `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides
-both `MemAvailable` and the cgroup figure. Use it to reserve headroom, but
-avoid setting it cluster-wide to the node's RAM: it disables the cgroup check.
+subtracting memory the cgroup cannot reclaim. On Linux, before export first
+probes it, tylertoo asks the allocator to return freed pages to the OS, so
+most of the memory the convert has already freed is not counted against the
+export. This happens once per process, and covers the calling thread's heap
+and the shared allocator arenas; pages a worker thread still holds can
+stay counted, and in Python only the first call in a process does it. Slurm, Docker, and Kubernetes
+jobs use this limit to size buffers. `--memory-limit` (Python
+`memory_limit`) and the `TYLERTOO_AUTO_MEM_LIMIT_BYTES` environment variable
+override both `MemAvailable` and the cgroup figure; see
+[Memory limit](#memory-limit).
 
 Spills go to the temp directory. On many Slurm and Kubernetes nodes, `/tmp`
 is tmpfs and uses RAM charged to the same cgroup. Point `TMPDIR` or
 `--spill-dir` at real disk to avoid running out of memory while spilling.
+
+### Memory limit
+
+`--memory-limit SIZE`, such as `--memory-limit 24G` (Python
+`memory_limit=24 * 2**30`, in bytes), sets the memory a run sizes its buffers
+to, in place of the detected figure. It takes precedence over
+`TYLERTOO_AUTO_MEM_LIMIT_BYTES`, which takes precedence over the cgroup limit
+and `MemAvailable`. Both convert and export read it. `tiles`, `overview`,
+`export-pmtiles` and `pyramid` take the flag; `0` and sizes that do not
+parse are errors. Use it to reserve headroom on a shared machine, but avoid
+setting it to the node's RAM: it replaces the cgroup check, so export only
+warns about a tile that cannot fit instead of refusing it. In Python the
+limit is process-wide: it stays in force for later calls until another call
+sets one.
+
+### Worker threads
+
+`--workers N` (Python `workers=N`) sets the size of the worker pool for the
+whole run. Without it, a positive `RAYON_NUM_THREADS` sets it; otherwise
+`auto` and `speed` use every core the process may use (CPU affinity and a
+cgroup CPU quota count), and `bounded` uses at most 40. `0` is an error. The
+pool is process-wide: in Python the first call sets it, and later calls keep
+it. A count you set (`--workers` or `RAYON_NUM_THREADS`) also caps the core
+count that the read workers, in-flight batches, and partition wave are sized
+from, so `--workers 12` on a 64-core host sizes them as a 12-core host would.
+`bounded`'s own limit of 40 caps only the pool.
+
+Measured on a 64-core, 123 GB aarch64 host with an EBS disk, with N cores
+given N workers, one run each; the output was byte-identical at every width.
+Wall time in seconds under `auto` with a 24 GB limit:
+
+| Cores | 12 | 24 | 36 | 40 | 48 | 64 |
+| --- | --- | --- | --- | --- | --- | --- |
+| NZ parcels | 52.2 | 33.4 | 31.8 | 30.7 | 30.6 | 31.0 |
+| Brazil (Mato Grosso) | 41.7 | 25.5 | 22.1 | 21.6 | 21.6 | 20.3 |
+| Moldova, factor 0 | 18.4 | 10.6 | 9.3 | 9.2 | 7.8 | 7.7 |
+| Lines | 5.05 | 3.68 | 3.31 | 3.30 | 3.26 | 3.17 |
+| Moldova | 4.94 | 3.23 | 2.83 | 2.77 | 2.70 | 2.64 |
+
+With a 100 GB limit:
+
+| Cores | 12 | 24 | 36 | 40 | 48 | 64 |
+| --- | --- | --- | --- | --- | --- | --- |
+| NZ parcels | 53.7 | 32.7 | 28.0 | 27.4 | 25.9 | 24.4 |
+| Brazil (Mato Grosso) | 41.8 | 25.0 | 20.4 | 19.7 | 18.4 | 17.2 |
+| Moldova, factor 0 | 18.1 | 11.4 | 8.2 | 8.6 | 7.5 | 7.5 |
+
+Peak RSS in GB under `auto` with a 24 GB limit, at 12, 40 and 64 cores: NZ
+parcels 4.8, 6.1, 6.9; Brazil 5.8, 6.5, 7.7; Moldova factor 0 2.2, 4.1, 4.9;
+lines 1.3, 2.4, 2.9. Each added worker costs about 15–35 MB.
+
+Under `bounded` with a 24 GB limit, 64 workers against 40 took NZ parcels
+from 64.5 to 62.7 s and Brazil from 64.6 to 62.7 s, but raised peak RSS by
+13–26%. That is why `bounded` stops at 40.
+
+Speed levels off around 24–36 cores. Past that, the export's final sync
+waits on the disk, and that wait grows with the core count and under a
+tight memory limit: on NZ parcels 2.2 s at 40 cores and 6.0 s at 64 under
+24 GB, 2.0 s at 64 under 100 GB, and none on a RAM disk. On a machine
+shared with other jobs, `--workers` below the core count gives up little.
 
 ### Read concurrency
 

@@ -2083,13 +2083,27 @@ impl PyramidOptions {
     }
 
     pub(crate) fn check(&self) -> Result<(), PyramidError> {
+        // #876: the pure resource rules before `check_work_dir`'s probe
+        // file. The export's resources are the run's; each band's convert
+        // takes them (`tile_source_band`), so convert's own must stay unset.
+        crate::overview::config::check_run_resources(
+            self.export.workers,
+            self.export.memory_limit,
+        )?;
+        if self.convert.workers.is_some() || self.convert.memory_limit.is_some() {
+            return Err(crate::overview::config::ConfigError::InvalidSpec {
+                option: "convert.workers / convert.memory_limit",
+                message: "a pyramid's worker count and memory limit are \
+                          PyramidOptions::export's workers and memory_limit; leave the \
+                          convert's unset"
+                    .to_string(),
+            }
+            .into());
+        }
         crate::overview::config::check_work_dir(self.work_dir.as_deref())?;
         self.metadata
             .check_size()
             .map_err(crate::overview::config::ConfigError::MetadataTooLarge)?;
-        self.convert.validate().map_err(|e| {
-            PyramidError::InvalidConfig(crate::InvalidConfigError::BandConvertOptions(Box::new(e)))
-        })?;
         // Before the export's own checks, which would name an export option
         // the bands' verbatim defaults turn off.
         if self.export.variable_depth {
@@ -2100,7 +2114,10 @@ impl PyramidOptions {
                 .into(),
             );
         }
-        self.export.validate()?;
+        self.export.check()?;
+        self.convert.check().map_err(|e| {
+            PyramidError::InvalidConfig(crate::InvalidConfigError::BandConvertOptions(Box::new(e)))
+        })?;
         check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
         crate::overview::cells::check_rollup_columns(CellRollup {
             accumulate: &self.accumulate,
@@ -2418,6 +2435,8 @@ fn cell_resources(opts: &PyramidOptions) -> ConvertOptions {
     ConvertOptions {
         // #801: one memory profile governs the band, as in `tile_source_band`.
         profile: opts.export.profile,
+        workers: opts.export.workers,
+        memory_limit: opts.export.memory_limit,
         in_flight_batches: c.in_flight_batches,
         read_workers: c.read_workers,
         spill_dir: c.spill_dir.clone(),
@@ -2453,8 +2472,11 @@ fn tile_source_band(
             min_zoom: lo,
             max_zoom: hi,
         },
-        // #801: one memory profile governs the band's convert and export.
+        // #801: one memory profile governs the band's convert and export,
+        // and #876 one worker count and memory limit.
         profile: opts.export.profile,
+        workers: opts.export.workers,
+        memory_limit: opts.export.memory_limit,
         ..convert.clone()
     };
     let report = convert_to_overviews_for_archive(input, &overview, &convert, &archive).map_err(

@@ -4,6 +4,37 @@ use super::*;
 /// before it writes the tile without one.
 pub(super) const MAX_FILL_PASSES: u32 = 4;
 
+use crate::tile_trace::{pass as trace_pass, Stage};
+
+/// #876: close a traced valve pass on the tile it encoded.
+fn end_pass(pass: crate::tile_trace::PassSpan, groups: usize, merged: usize, mvt: &TileMvt) {
+    pass.end(
+        groups,
+        merged,
+        mvt.data.len(),
+        mvt.data.gzip.as_ref().map(Vec::len),
+    );
+}
+
+/// #876: one traced valve encode, timed as the pass's build stage.
+fn build_stage(build: impl FnOnce() -> TileMvt) -> TileMvt {
+    crate::tile_trace::stage(Stage::Build, build)
+}
+
+/// #876: a valve pass's encode and fit check, closing the traced `pass` on
+/// its `groups` features and `merged` members.
+fn fit_pass(
+    pass: crate::tile_trace::PassSpan,
+    opts: &ExportOptions,
+    (groups, merged): (usize, usize),
+    build: impl FnOnce() -> TileMvt,
+) -> (TileMvt, f64) {
+    let mut mvt = build_stage(build);
+    let fit = tile_fit(&mut mvt, opts).unwrap_or(f64::INFINITY);
+    end_pass(pass, groups, merged, &mvt);
+    (mvt, fit)
+}
+
 /// The tile the size valve fitted (`fitted`) with as much of its #750 fill
 /// as fits in the room left, re-encoding the same features with a subset of
 /// the fill through `encode` (the merge valve's cached encode, so a heavily
@@ -66,7 +97,8 @@ pub(super) fn with_fill(
         let mut kept: Vec<usize> = by_area[..keep].to_vec();
         kept.sort_unstable();
         let subset: Vec<&FillFeature> = kept.iter().map(|&i| &fill[i]).collect();
-        let mut mvt = encode(&subset);
+        let traced = trace_pass("fill", fitted.valve.passes + pass, keep as u64);
+        let mut mvt = build_stage(|| encode(&subset));
 
         #[cfg(test)]
         coverage_fill::cost_probe::update(|c| {
@@ -75,6 +107,7 @@ pub(super) fn with_fill(
         #[cfg(test)]
         let gzip_before = mvt.gzip.as_ref().map(|g| g.as_ptr());
         let fit = tile_fit(&mut mvt, opts).unwrap_or(f64::INFINITY);
+        end_pass(traced, subset.len(), 0, &mvt);
         #[cfg(test)]
         note_gzip(gzip_before, &mvt);
         if fit >= 1.0 {
@@ -279,8 +312,10 @@ pub(super) fn drop_members_to_fit<M: TileFeature + std::borrow::Borrow<Member>>(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> TileMvt {
     let layers = opts.layers;
-    let mut full = build_tile_layers(gzip_cache, layers, members, tb, opts, &[], diagnostics);
-    let mut fit = tile_fit(&mut full, opts).unwrap_or(f64::INFINITY);
+    let traced = trace_pass("drop", 1, members.len() as u64);
+    let (full, mut fit) = fit_pass(traced, opts, (members.len(), 0), || {
+        build_tile_layers(gzip_cache, layers, members, tb, opts, &[], diagnostics)
+    });
     if fit >= 1.0 || members.len() <= 1 {
         // One encode, as the merge valve counts a tile that fits at once.
         let fitted = TileMvt {
@@ -303,9 +338,12 @@ pub(super) fn drop_members_to_fit<M: TileFeature + std::borrow::Borrow<Member>>(
     loop {
         passes += 1;
         keep = drop_keep(keep, fit, passes - 2).clamp(1, keep.saturating_sub(1).max(1));
+        let traced = trace_pass("drop", passes, keep as u64);
         let kept = shed_to_fit(members, keep, opts);
-        let mut shed = build_tile_layers(gzip_cache, layers, &kept, tb, opts, &[], diagnostics);
-        fit = tile_fit(&mut shed, opts).unwrap_or(f64::INFINITY);
+        let (shed, shed_fit) = fit_pass(traced, opts, (kept.len(), 0), || {
+            build_tile_layers(gzip_cache, layers, &kept, tb, opts, &[], diagnostics)
+        });
+        fit = shed_fit;
         if fit >= 1.0 || keep <= 1 || passes >= MAX_DROP_PASSES {
             log::debug!(target: LOG_TARGET,
                 "oversized tile ({} bytes): dropped {} of {} features ({passes} encodes){}",
@@ -434,11 +472,13 @@ pub(super) fn merge_to_fit(
             return build_tile_layers(gzip_cache, layers, feats, tb, opts, fill, diagnostics);
         }
         let cached = quantized.get_or_insert_with(|| {
-            crate::mvt::QuantizedPolygons::new(
-                ordered.iter().map(|m| (&*m.geom, u64::from(m.band))),
-                tb,
-                opts.extent,
-            )
+            crate::tile_trace::stage(Stage::Quantize, || {
+                crate::mvt::QuantizedPolygons::new(
+                    ordered.iter().map(|m| (&*m.geom, u64::from(m.band))),
+                    tb,
+                    opts.extent,
+                )
+            })
         });
         let Some(q) = cached.as_mut() else {
             return build_tile_layers(gzip_cache, layers, feats, tb, opts, fill, diagnostics);
@@ -460,12 +500,16 @@ pub(super) fn merge_to_fit(
     let mut passes = 0u32;
     loop {
         passes += 1;
-        let merged = coalesce_valve::coalesce_members(&ordered, mingap);
+        let traced = trace_pass("merge", passes, mingap);
+        let merged = crate::tile_trace::stage(Stage::Coalesce, || {
+            coalesce_valve::coalesce_members(&ordered, mingap)
+        });
         let absorbed: usize = merged.iter().map(|m| m.absorbed).sum();
         let mut feats: Vec<&coalesce_valve::Merged<'_>> = merged.iter().collect();
         draw_order(&mut feats);
-        let mut mvt = build(&feats, passes, &[]);
-        let fit = tile_fit(&mut mvt, opts).unwrap_or(f64::INFINITY);
+        let (mvt, fit) = fit_pass(traced, opts, (feats.len(), absorbed), || {
+            build(&feats, passes, &[])
+        });
         let tally = ValveTally {
             merged: absorbed,
             dropped: 0,
@@ -548,11 +592,11 @@ pub(super) fn merge_to_fit(
                 }
                 draw_order(&mut kept);
                 passes += 1;
+                let traced = trace_pass("drop", passes, keep as u64);
                 // The previous bytes cannot be returned after dropping more
                 // features. Release them before building their replacement.
                 drop(out);
-                out = build(&kept, passes, &[]);
-                fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
+                (out, fit) = fit_pass(traced, opts, (kept.len(), 0), || build(&kept, passes, &[]));
                 if fit >= 1.0 || keep == 0 {
                     break;
                 }
@@ -563,9 +607,9 @@ pub(super) fn merge_to_fit(
                 kept = whole.clone();
                 draw_order(&mut kept);
                 passes += 1;
+                let traced = trace_pass("drop", passes, kept.len() as u64);
                 drop(out);
-                out = build(&kept, passes, &[]);
-                fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
+                (out, fit) = fit_pass(traced, opts, (kept.len(), 0), || build(&kept, passes, &[]));
             }
             dropped = single.len() - (kept.len() - whole.len());
         }
@@ -640,11 +684,13 @@ pub(super) fn reduce_merged_to_fit(
     while fit < 1.0 && reduced.extent > MIN_VALVE_EXTENT && !points_only {
         reduced.extent = (reduced.extent >> 1).max(MIN_VALVE_EXTENT);
         tally.passes += 1;
+        let traced = trace_pass("halve", tally.passes, u64::from(reduced.extent));
         drop(out);
         // Plain encode quantizes, unions and cleans geometry on this grid.
         // Never reuse the original grid's QuantizedPolygons or fill.
-        out = build_tile_layers(gzip_cache, layers, kept, tb, &reduced, &[], diagnostics);
-        fit = tile_fit(&mut out, &reduced).unwrap_or(f64::INFINITY);
+        (out, fit) = fit_pass(traced, &reduced, (kept.len(), 0), || {
+            build_tile_layers(gzip_cache, layers, kept, tb, &reduced, &[], diagnostics)
+        });
     }
     while fit < 1.0 && kept.len() > 1 {
         let keep = drop_keep(kept.len(), fit, 1).clamp(1, kept.len() - 1);
@@ -668,9 +714,11 @@ pub(super) fn reduce_merged_to_fit(
             false
         });
         tally.passes += 1;
+        let traced = trace_pass("drop_merged", tally.passes, kept.len() as u64);
         drop(out);
-        out = build_tile_layers(gzip_cache, layers, kept, tb, &reduced, &[], diagnostics);
-        fit = tile_fit(&mut out, &reduced).unwrap_or(f64::INFINITY);
+        (out, fit) = fit_pass(traced, &reduced, (kept.len(), 0), || {
+            build_tile_layers(gzip_cache, layers, kept, tb, &reduced, &[], diagnostics)
+        });
     }
     tally.over_limit = usize::from(fit < 1.0);
     tally.over_limit_merged = fit < 1.0 && kept.len() == 1 && kept[0].absorbed > 0;

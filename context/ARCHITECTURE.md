@@ -61,8 +61,14 @@ this, the read-ahead, the compute window and the encodes each took their own
 slice of the same allowance and nothing summed them (#716). Every decision
 reads the one budget's own figures: `auto`'s RAM-or-spill choice for the
 pass-2 sinks and export's fill store compares its estimate with
-`budget.allowance(Auto)` after the grants already charged, the same figure
-the runtime downgrade (#626) checks (`pipeline::auto_backing`).
+`budget.allowance(Auto)` after the grants already charged
+(`pipeline::auto_backing`). The runtime downgrade (#626) checks the same
+budget after pass 2's read-ahead and window grants too, so its figure is
+smaller by them. A sink estimate priced from the footers may pass the
+allowance by half and still start in RAM (`FOOTER_PRICED_RAM_ADMIT_PERCENT`,
+#876): it read 2.6-3.5x the measured sink on NZ parcels and Mato Grosso, and
+the runtime downgrade spills a sink whose held bytes, plus room for the next
+window, pass its budget.
 
 "Once per operation", not once per process. A `tiles` run probes four
 times, through three probes in `pipeline.rs`, each for a reason:
@@ -70,14 +76,49 @@ times, through three probes in `pipeline.rs`, each for a reason:
 - **convert:** `MemoryBudget::probe()` in `preflight()`, uncached, before
   pass 1 reads anything;
 - **export:** `export_budget()`, from `available_memory_bytes()`. That
-  figure is cached process-wide on its first call after convert's pass 1,
-  so it is the cgroup's headroom with pass 1's usage already charged
-  (#485). The widths of export's waves have used it since #303;
+  figure is cached process-wide on its first call, which export makes
+  before its work starts; convert never reads it, so in a `tiles` run it is
+  the cgroup's headroom after the convert returned (#485). The widths of
+  export's waves have used it since #303. On Linux that first call first
+  returns the allocator's freed pages to the OS (`release_retained_memory`):
+  one `mi_collect(true)` on the calling thread, which frees that thread's
+  heap and purges the shared arenas' purgeable pages, and glibc's
+  `malloc_trim`. Pages still owned by a live pool worker's heap can stay.
+  mimalloc purges freed pages only after its 1 s purge delay under `auto`
+  and `speed`: on Mato Grosso under a 24 GiB cgroup the probe otherwise
+  counted 1-1.8 GiB the convert had just freed, and the z13 level store
+  spilled 2 GiB in 5 of 10 runs. The release costs every run ~50 ms, as the
+  export re-faults the pages (#876);
 - **export's dense-tile refusal** (`check_levels_fit`, #665): it uses
   `probe_oom_memory_limit()`, fresh and without `memory.high`, because that
   check measures what would kill the process, not what the run may hold;
 - **export's diagnostics:** the cap on the Python loss list comes from its
   own `MemoryBudget::probe()`. It sizes a report, never the archive.
+
+Every probe above reads one override first (`auto_mem_limit_override`):
+the `memory_limit` option (`--memory-limit`), else
+`TYLERTOO_AUTO_MEM_LIMIT_BYTES` (#876). The option reaches the probes as a
+process-wide value that the top-level validations (`config::validate_*`
+for convert, export, tiles and pyramid) set once the whole configuration
+passed and before any I/O (`apply_run_resources`); the nested `check()`s
+apply nothing, so a refused call leaves no limit or pool behind. A run has
+one owner of these fields: `tiles` takes convert's and refuses export's,
+and `pyramid` takes export's, refuses convert's and hands them to each
+band's convert. Not
+through the budgets: export's budget readers (the join's fits,
+`resolve_partition_wave`) take no options. An unset option leaves the value
+alone, so a run's internal default options cannot clear it, and in Python a
+later call without `memory_limit` keeps an earlier call's.
+
+The same validation builds the global Rayon pool on a library caller's
+first run (#876): `workers` when set, else a positive `RAYON_NUM_THREADS`,
+else every core under `auto` and `speed` and `min(cores, 40)` under
+`bounded` (`resolve_worker_threads`). The CLI and Python reach it through
+the same validation. A count the caller chose (`workers` or
+`RAYON_NUM_THREADS`) also caps the cores every core-derived width is sized
+from (`run_cores`: read workers, in-flight batches, the partition wave, the
+read's decode plan); `bounded`'s own 40 caps only the pool, so default
+widths are unchanged.
 
 `--max-zoom auto` also stages its sample through a throwaway
 `MemoryBudget::probe()` (`auto_zoom.rs`), before `preflight()` builds the
@@ -732,6 +773,54 @@ member. Tag interning stays serial in member order, so the key and value
 tables, and so the bytes, do not change. The gzip of one tile stays
 single-threaded, because a parallel deflate would change the compressed
 bytes.
+
+**The in-tile maps do not use nested `par_iter` (#876).** The member
+geometry encode (`geometry_chunks` in `build_mvt_within`) and the ring
+quantization in `QuantizedPolygons::new` (`mvt.rs`) run inside the
+per-tile parallel section, so they are nested rayon calls. A nested
+`par_iter` caller that waits for a stolen piece runs whatever rayon hands
+it, and a worker holding a stolen piece can do the same. Either way, the
+map ends only after an unrelated job, often another tile's whole encode,
+finishes. Traced on Moldova at `--simplify-factor 0`, the longest tiles
+spent 85–95% of their wall in that wait.
+
+Both sites call `owner_map` (`crates/core/src/owner_map.rs`) instead. The
+calling thread claims short batches from a shared counter, and the helpers
+it spawns onto the same pool claim from that counter too. When none are
+left, the caller blocks on a condvar until the batches already claimed
+finish. It never runs other rayon jobs while it waits. A helper that
+starts after the map closed finds nothing to claim and returns. Results
+keep input order, so tile bytes are unchanged. On Moldova
+`--simplify-factor 0` the worst tile fell from 7.2 s to 2.35 s and the
+whole run from 10.3 s to 8.5 s. The closure is borrowed, so the helpers
+reach it through a lifetime-erased pointer (`unsafe`). The caller closes
+admission and drains claimed batches before the closure can drop, on
+return and on unwind. `rayon::scope` cannot replace this, because the
+scope's end also waits by running other rayon jobs.
+
+The store fill's ordered gap walk (`RowGapCursor::batch_boxes`,
+`coalesce_valve.rs`) was a fourth site of the class: its two small
+parallel calls per batch ran inside the finish half of the fill's
+finish-and-clip join, and each waited by running the group's clip work.
+The clip half now projects each row's bbox corners and centre in the pool
+(`RowGapCursor::boxes`), and the walk is one serial loop over them. It
+uses the same `gap_to_world_box` on the same values, so the gaps are bit
+for bit those of before. It is serial rather than `owner_map` because a
+row costs a few sums, less than claiming a batch.
+
+The fill's groups can be 4x #817's (2,048 rows per pool thread, 4 batch
+byte caps), as fewer joins and ordered finishes took FTW Brazil MT's export
+7.7% faster for +0.25 GB peak RSS. `speed` takes that size. `auto` starts at
+#817's and grows one step per finished group while two groups at the next
+size fit its read share, priced at the bytes per row the last group
+measured: its Arrow batches plus its clipped members (the store's
+`member_bytes_estimate`). A polygon spanning many tiles holds many times its
+Arrow bytes in members, so such an input stays at #817's size on a small
+budget. The bound is measured, so it is late: a heavier group is caught
+when it finishes, after the next group is built, and the size then drops at
+once (`CollectGroup::rescale`). The read share is a query on the levels'
+starting budget, not a grant, and #817's size itself is not priced. Under
+`auto` the band read-ahead stays at #817's depth.
 
 Border duplication is the expected delta between overview level counts and
 export per-zoom feature totals (a feature spanning a tile seam appears in

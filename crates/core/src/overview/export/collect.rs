@@ -211,6 +211,8 @@ pub(super) fn collect_into(
     // per wave on this path) plus each `next()` (read + Arrow decode);
     // `clip_group` and `finish_group` charge their own `decode`/`clip`.
     let timers = ctx.timers;
+    let t_collect = crate::tile_trace::mark();
+    let mut tr = CollectTrace::default();
 
     // PERF (#535, #817): the read runs on reader threads ahead of the clip
     // ([`read_band`]), so the pool never waits for a read-then-clip loop.
@@ -231,16 +233,29 @@ pub(super) fn collect_into(
     // PERF (#817): a group's ordered finish (the gap walk, member routing
     // and the sink appends) runs alongside the next group's decode and clip,
     // so the pool is not idle while this thread walks the rows.
-    let mut group = CollectGroup::new(collect_group_rows(ctx.band.profile));
+    let mut group = CollectGroup::sized(ctx.band.profile, &ctx.band.budget);
     let mut clipped: Option<ClippedGroup> = None;
     let rows = &mut rows;
     // `bounded` finishes each group before clipping the next, so it never
-    // holds two groups' geometry and members: that overlap is not budgeted.
+    // holds two groups' geometry and members ([`COLLECT_GROUPS_HELD`]).
     let overlap = !matches!(ctx.band.profile, MemoryProfile::Bounded);
-    let mut step = |batches: Vec<RecordBatch>| -> Result<(), ExportError> {
+    // Returns what the group finished alongside held (#876), for `group`
+    // to resize by.
+    let mut step = |batches: Vec<RecordBatch>| -> Result<Option<GroupResidency>, ExportError> {
+        let mut serial = None;
         if !overlap {
             if let Some(c) = clipped.take() {
-                finish_group(ctx, wave, c, rows, sink, diagnostics)?;
+                let t = crate::tile_trace::mark();
+                serial = Some(finish_group(
+                    ctx,
+                    wave,
+                    c,
+                    rows,
+                    sink,
+                    &mut tr.finish,
+                    diagnostics,
+                )?);
+                tr.serial_ns += crate::tile_trace::since(t);
             }
         }
         #[cfg(test)]
@@ -250,18 +265,41 @@ pub(super) fn collect_into(
                 .unwrap_or_else(PoisonError::into_inner)
                 .collect_overlaps += 1;
         }
-        let (finished, next) = rayon::join(
-            || {
-                clipped.take().map_or(Ok(()), |c| {
-                    finish_group(ctx, wave, c, rows, sink, diagnostics)
-                })
-            },
-            || clip_group(ctx, wave, batches, diagnostics),
-        );
-        finished?;
+        let t_join = crate::tile_trace::mark();
+        let ((t_finish, finish_ns, finished), (clip_ns, next)) =
+            crate::tile_trace::wait("fill_clip", |site| {
+                let joined = rayon::join(
+                    || {
+                        let t = crate::tile_trace::mark();
+                        let r = clipped.take().map_or(Ok(None), |c| {
+                            finish_group(ctx, wave, c, rows, sink, &mut tr.finish, diagnostics)
+                                .map(Some)
+                        });
+                        (t, crate::tile_trace::since(t), r)
+                    },
+                    || {
+                        let t = crate::tile_trace::mark();
+                        let r = clip_group(ctx, wave, batches, site, diagnostics);
+                        (crate::tile_trace::since(t), r)
+                    },
+                );
+                tr.clip_core_ns += site.core_ns();
+                joined
+            });
+        if let (Some(t0), Some(t1)) = (t_join, t_finish) {
+            tr.groups += 1;
+            tr.join_ns += crate::tile_trace::since(t_join);
+            // The join's first half starts when a worker takes the injected join.
+            tr.inject_ns += t1.saturating_sub(t0);
+            tr.finish_ns += finish_ns;
+            tr.clip_ns += clip_ns;
+        }
+        let finished = finished?.or(serial);
         clipped = Some(next?);
-        Ok(())
+        Ok(finished)
     };
+    // #876: the time between batches is this thread blocked on the pipe.
+    let mut last = crate::tile_trace::mark();
     read_band(
         ctx.band,
         &selected,
@@ -269,57 +307,233 @@ pub(super) fn collect_into(
         #[cfg(test)]
         ctx.work,
         |batch| {
+            tr.recv_ns += crate::tile_trace::since(last);
             let bytes = batch.get_array_memory_size();
-            group.push(batch, bytes, &mut step)
+            let r = group.push(batch, bytes, &mut step);
+            last = crate::tile_trace::mark();
+            r
         },
     )?;
+    tr.recv_ns += crate::tile_trace::since(last);
     if !group.batches.is_empty() {
-        step(group.batches)?;
+        group.flush(&mut step)?;
     }
     if let Some(c) = clipped.take() {
-        finish_group(ctx, wave, c, rows, sink, diagnostics)?;
+        let t = crate::tile_trace::mark();
+        // It resizes nothing, but counts in the peaks.
+        let m = finish_group(ctx, wave, c, rows, sink, &mut tr.finish, diagnostics)?;
+        group.rescale(m);
+        tr.serial_ns += crate::tile_trace::since(t);
     }
+    crate::tile_trace::span("collect", t_collect, || {
+        serde_json::json!({
+            "level": ctx.level_idx,
+            "zoom": ctx.zoom,
+            "groups": tr.groups,
+            "recv_ns": tr.recv_ns,
+            "join_ns": tr.join_ns,
+            "inject_ns": tr.inject_ns,
+            "finish_ns": tr.finish_ns,
+            "clip_ns": tr.clip_ns,
+            "clip_core_ns": tr.clip_core_ns,
+            "serial_ns": tr.serial_ns,
+            "finish_gaps_ns": tr.finish.gaps_ns,
+            "finish_chunks_ns": tr.finish.chunks_ns,
+            "finish_chunks_core_ns": tr.finish.chunks_core_ns,
+            "finish_append_ns": tr.finish.append_ns,
+        })
+    });
     #[cfg(test)]
     {
         let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
         *work.band_rows_read.entry(ctx.level_idx).or_default() += rows.read;
+        work.collect_peak_scale = work.collect_peak_scale.max(group.peak_scale);
+        work.collect_peak_arrow = work.collect_peak_arrow.max(group.peak_arrow as u64);
+        work.collect_peak_members = work.collect_peak_members.max(group.peak_members as u64);
     }
     Ok(rows.read)
 }
 
-/// The batches [`collect_into`] gathers before one [`clip_group`]: up to
-/// `max_rows` rows, and never past one reader batch's decoded-byte cap
-/// ([`tylertoo_io::decoded_batch_limit`]) unless a single batch is that
-/// large on its own, so grouping holds no more than the reader allows.
+/// #876: where a traced [`collect_into`]'s driving thread spent its wall,
+/// for its `collect` trace event. Untouched untraced.
+#[derive(Default)]
+struct CollectTrace {
+    /// Finish-and-clip joins.
+    groups: u64,
+    /// Blocked on the reader pipe.
+    recv_ns: u64,
+    /// In the joins, and of that, before a worker started the injected join.
+    join_ns: u64,
+    inject_ns: u64,
+    /// Inside the joins: `finish_group`'s and `clip_group`'s wall, and the
+    /// clip's closure bodies' core time on every thread.
+    finish_ns: u64,
+    clip_ns: u64,
+    clip_core_ns: u64,
+    /// `finish_group` on this thread, outside a join.
+    serial_ns: u64,
+    /// Every `finish_group`'s stages.
+    finish: FinishTrace,
+}
+
+/// #876: where a traced [`finish_group`]'s wall went: the ordered gap
+/// walk, the parallel member chunks (wall, and their bodies' core time),
+/// and the ordered appends to the sink.
+#[derive(Default)]
+pub(super) struct FinishTrace {
+    gaps_ns: u64,
+    chunks_ns: u64,
+    chunks_core_ns: u64,
+    append_ns: u64,
+}
+
+/// The batches [`collect_into`] gathers before one [`clip_group`]: never
+/// past `max_rows` rows or `max_bytes` decoded, unless a single batch is
+/// that large on its own ([`Self::sized`], [`Self::rescale`]).
 pub(super) struct CollectGroup {
     pub(super) batches: Vec<RecordBatch>,
     pub(super) rows: usize,
     pub(super) bytes: usize,
     pub(super) max_rows: usize,
     pub(super) max_bytes: usize,
+    /// Steps of [`COLLECT_GROUP_SCALE`] the caps are at, from 1.
+    pub(super) scale: usize,
+    /// The read share `auto` resizes the group within, in bytes; `None`
+    /// for a fixed size.
+    pub(super) share: Option<usize>,
+    /// The largest scale a group was gathered at, and the most one
+    /// finished group held ([`GroupResidency`]).
+    pub(super) peak_scale: usize,
+    pub(super) peak_arrow: usize,
+    pub(super) peak_members: usize,
+    pub(super) peak_resident: usize,
+}
+
+/// What one finished group held while it was clipped and finished: its
+/// read batches' Arrow bytes and its clipped members' bytes
+/// ([`member_bytes_estimate`], the store's own accounting), over `rows`
+/// rows in batches of at most `max_batch_rows`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GroupResidency {
+    pub(super) arrow: usize,
+    pub(super) members: usize,
+    pub(super) rows: usize,
+    pub(super) max_batch_rows: usize,
 }
 
 impl CollectGroup {
-    pub(super) fn new(max_rows: usize) -> Self {
-        Self {
+    /// The empty group [`collect_into`] gathers under `profile`. At scale
+    /// `s` a group is `s / 4` of [`COLLECT_GROUP_ROWS_PER_THREAD`] rows per
+    /// pool thread under `s` reader batch byte caps
+    /// ([`tylertoo_io::decoded_batch_limit`]). `speed` takes scale 4,
+    /// `bounded` one read batch a group. `auto` starts at scale 1 (the
+    /// group before #876) and [`Self::rescale`]s by what each finished
+    /// group measured against the read share of `budget`'s allowance
+    /// ([`MemoryPhase::Read`]).
+    ///
+    /// The bound (#876): under `auto`, once a group is measured, the next
+    /// groups are sized so that [`COLLECT_GROUPS_HELD`] of them (one
+    /// clipped, one gathering) at their measured bytes per row, Arrow
+    /// plus clipped members, fit the read share. It is measured, so it is
+    /// late: a group is measured when it finishes, while the next one is
+    /// already gathered and clipping, so a group heavier than the share
+    /// is caught after two groups of the size before it were built. The
+    /// first groups are scale 1, as before #876. Each reader's read-ahead
+    /// stays at the scale-1 group under `auto` ([`read_band`]).
+    ///
+    /// shortcut: the share is a query on the band's budget as the levels
+    /// start, not a grant, so later level-store grants do not shrink it;
+    /// scale 1 itself (two of #817's groups and their members) is not
+    /// priced, and neither is a group's transient decoded geometry beyond
+    /// its members. Charge a fill grant if a profile shows the fill's peak
+    /// past its share.
+    pub(super) fn sized(profile: MemoryProfile, budget: &MemoryBudget) -> Self {
+        let (scale, share) = match profile {
+            MemoryProfile::Bounded => (1, None),
+            MemoryProfile::Speed => (COLLECT_GROUP_SCALE, None),
+            MemoryProfile::Auto => (
+                1,
+                Some(budget.affordable(profile, MemoryPhase::Read, Price::model(1))),
+            ),
+        };
+        let mut group = Self {
             batches: Vec::new(),
             rows: 0,
             bytes: 0,
-            max_rows,
-            max_bytes: usize::try_from(tylertoo_io::decoded_batch_limit()).unwrap_or(usize::MAX),
+            max_rows: 1,
+            max_bytes: 0,
+            scale,
+            share,
+            peak_scale: 0,
+            peak_arrow: 0,
+            peak_members: 0,
+            peak_resident: 0,
+        };
+        group.set_scale(scale);
+        if matches!(profile, MemoryProfile::Bounded) {
+            group.max_rows = 1;
         }
+        group
+    }
+
+    /// Rows a group gathers at `scale`.
+    fn rows_at(scale: usize) -> usize {
+        (COLLECT_GROUP_ROWS_PER_THREAD / COLLECT_GROUP_SCALE)
+            .saturating_mul(scale)
+            .saturating_mul(rayon::current_num_threads())
+    }
+
+    fn set_scale(&mut self, scale: usize) {
+        self.scale = scale;
+        self.max_rows = Self::rows_at(scale);
+        self.max_bytes = usize::try_from(tylertoo_io::decoded_batch_limit())
+            .unwrap_or(usize::MAX)
+            .saturating_mul(scale);
+    }
+
+    /// Size the next groups by what a finished one held (`auto` only):
+    /// the largest scale at which [`COLLECT_GROUPS_HELD`] groups, at `m`'s
+    /// bytes per row and never smaller than one of its batches, fit the
+    /// read share, at most one step above the current scale and never
+    /// below 1. Called between groups, when none is gathering.
+    pub(super) fn rescale(&mut self, m: GroupResidency) {
+        let resident = m.arrow.saturating_add(m.members);
+        self.peak_arrow = self.peak_arrow.max(m.arrow);
+        self.peak_members = self.peak_members.max(m.members);
+        self.peak_resident = self.peak_resident.max(resident);
+        let Some(share) = self.share else {
+            return;
+        };
+        let per_row = resident.div_ceil(m.rows.max(1));
+        let fits = |scale: usize| {
+            per_row
+                .saturating_mul(Self::rows_at(scale).max(m.max_batch_rows))
+                .saturating_mul(COLLECT_GROUPS_HELD)
+                <= share
+        };
+        let target = (1..=COLLECT_GROUP_SCALE)
+            .rev()
+            .find(|&s| fits(s))
+            .unwrap_or(1);
+        self.set_scale(target.min(self.scale + 1));
     }
 
     /// Add `batch` (`bytes` decoded), handing each full group to `flush`:
-    /// the gathered batches first when `batch` would take them past the
-    /// byte cap, then the group once it reaches either cap.
+    /// the gathered batches first when `batch` would take them past either
+    /// cap, then the group once it reaches one. What `flush`
+    /// measured of an earlier group resizes the next ([`Self::rescale`]).
     pub(super) fn push(
         &mut self,
         batch: RecordBatch,
         bytes: usize,
-        flush: &mut impl FnMut(Vec<RecordBatch>) -> Result<(), ExportError>,
+        flush: &mut impl FnMut(Vec<RecordBatch>) -> Result<Option<GroupResidency>, ExportError>,
     ) -> Result<(), ExportError> {
-        if !self.batches.is_empty() && self.bytes.saturating_add(bytes) > self.max_bytes {
+        // Either cap closes the group before a batch would pass it, so a
+        // group holds no more than `rescale` priced (or one batch alone).
+        if !self.batches.is_empty()
+            && (self.bytes.saturating_add(bytes) > self.max_bytes
+                || self.rows.saturating_add(batch.num_rows()) > self.max_rows)
+        {
             self.flush(flush)?;
         }
         self.rows += batch.num_rows();
@@ -333,11 +547,15 @@ impl CollectGroup {
 
     pub(super) fn flush(
         &mut self,
-        flush: &mut impl FnMut(Vec<RecordBatch>) -> Result<(), ExportError>,
+        flush: &mut impl FnMut(Vec<RecordBatch>) -> Result<Option<GroupResidency>, ExportError>,
     ) -> Result<(), ExportError> {
         self.rows = 0;
         self.bytes = 0;
-        flush(std::mem::take(&mut self.batches))
+        self.peak_scale = self.peak_scale.max(self.scale);
+        if let Some(m) = flush(std::mem::take(&mut self.batches))? {
+            self.rescale(m);
+        }
+        Ok(())
     }
 }
 
@@ -369,7 +587,12 @@ pub(super) fn read_band(
 ) -> Result<(), ExportError> {
     // The collect takes a group at a time, so each reader needs about one
     // group queued, not the budget's depth: concurrent levels each read.
-    let ahead = collect_group_rows(band.profile).div_ceil(EXPORT_BATCH_SIZE);
+    // shortcut: the depth is fixed at the read's start, so under `auto` it
+    // is the scale-1 group's even after the group grows; follow the scale
+    // if a profile shows the larger groups waiting on the read.
+    let ahead = CollectGroup::sized(band.profile, &band.budget)
+        .max_rows
+        .div_ceil(EXPORT_BATCH_SIZE);
     #[cfg(test)]
     let consumer = std::thread::current().id();
     // The read runs on its own thread: with one reader (few cores, a tight
@@ -536,22 +759,31 @@ pub(super) fn read_error(e: ConvertError) -> ExportError {
 }
 
 /// Rows per pool thread that [`collect_into`] gathers, in whole batches,
-/// before one [`clip_group`] and [`finish_group`]: 64 threads collect four
-/// 8,192-row batches at a time, 16 threads one. Each group holds its
-/// batches and their members until it is merged.
-pub(super) const COLLECT_GROUP_ROWS_PER_THREAD: usize = 512;
+/// before one [`clip_group`] and [`finish_group`], at full size
+/// ([`CollectGroup::sized`]): 64 threads collect sixteen 8,192-row batches
+/// at a time, 4 threads one. Each group holds its batches and their
+/// members until it is merged.
+///
+/// PERF (#876): 4x the 512 rows (and [`COLLECT_GROUP_SCALE`] byte caps)
+/// of #817, as fewer, larger groups cut the joins and ordered finishes
+/// per row. Swept at 40 threads under a 100 GiB limit, 4 balanced pairs,
+/// output byte-identical in every run: x4 took FTW Brazil MT 21.13 ->
+/// 19.56 s (-7.7%) and NZ parcels -1.8% for +0.25 / +0.35 GB peak RSS;
+/// x8 gained -8.1% / -2.6% for +0.6 / +0.4 GB and x16 -6.9% / -2.2% for
+/// +1.3 / +0.9 GB, so x4. `speed` takes it outright; `auto` grows to it
+/// only while the groups' measured members fit its read share.
+pub(super) const COLLECT_GROUP_ROWS_PER_THREAD: usize = 2_048;
 
-/// The rows [`collect_into`] gathers per group on this pool. `bounded`
-/// takes each read batch on its own: the groups' decoded and clipped rows
-/// are not priced in the budget.
-pub(super) fn collect_group_rows(profile: MemoryProfile) -> usize {
-    match profile {
-        MemoryProfile::Bounded => 1,
-        MemoryProfile::Auto | MemoryProfile::Speed => {
-            COLLECT_GROUP_ROWS_PER_THREAD.saturating_mul(rayon::current_num_threads())
-        }
-    }
-}
+/// Reader batch byte caps ([`tylertoo_io::decoded_batch_limit`]) a
+/// full-size group may hold: 4, raised with
+/// [`COLLECT_GROUP_ROWS_PER_THREAD`] (#876) so the bytes do not close a
+/// group of wide rows first. Also the steps `auto` resizes a group in
+/// ([`CollectGroup::rescale`]).
+const COLLECT_GROUP_SCALE: usize = 4;
+
+/// Groups a non-`bounded` [`collect_into`] holds at once: the clipped one
+/// it finishes and the one it gathers and clips meanwhile.
+const COLLECT_GROUPS_HELD: usize = 2;
 
 /// The wave partition owning `key`. The wave's partitions are contiguous,
 /// disjoint, ascending `[key_lo, key_hi]` ranges, and every emitted key was
@@ -793,16 +1025,16 @@ pub(super) type TileMembers = Vec<(u64, MemberGeom)>;
 /// merged in row order, so every bucket holds the same members in the same
 /// order as the serial loop gave.
 ///
-/// PERF (#817): the batches of a group ([`COLLECT_GROUP_ROWS_PER_THREAD`])
+/// PERF (#817): the batches of a group ([`CollectGroup::sized`])
 /// share each parallel step, so a 64-thread pool joins once per group, not
 /// once per 8,192-row batch, whose joins would leave the pool spinning.
 /// Batches and their chunks are still merged in row order.
 pub(super) struct ClippedGroup {
     pub(super) batches: Vec<RecordBatch>,
     pub(super) geom_idxs: Vec<usize>,
-    /// The decoded geometries' bounding rects, kept for the in-order gap
+    /// The decoded geometries' projected bboxes, kept for the in-order gap
     /// walk; the geometries themselves went to their members.
-    pub(super) rects: Vec<Vec<Option<geo::Rect<f64>>>>,
+    pub(super) boxes: Vec<Vec<Option<super::coalesce_valve::RowBox>>>,
     /// Per batch, per row: the row's `(key, clipped geometry)` members.
     pub(super) row_members: Vec<Vec<TileMembers>>,
 }
@@ -813,6 +1045,7 @@ pub(super) fn clip_group(
     ctx: &LevelCtx<'_>,
     wave: &[Partition],
     batches: Vec<RecordBatch>,
+    site: &crate::tile_trace::Site,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<ClippedGroup, ExportError> {
     let key_lo = wave[0].key_lo;
@@ -825,7 +1058,9 @@ pub(super) fn clip_group(
     let geoms: Vec<Vec<Geometry<f64>>> = batches
         .par_iter()
         .zip(&geom_idxs)
-        .map(|(b, &gi)| decode_batch_geometries(b, &b.schema(), gi, ctx.crs, timers, diagnostics))
+        .map(|(b, &gi)| {
+            site.body(|| decode_batch_geometries(b, &b.schema(), gi, ctx.crs, timers, diagnostics))
+        })
         .collect::<Result<_, _>>()?;
     // The canonical level's own zoom, not `ctx.zoom`: a variable-depth probe
     // clips canonical geometry at an ancestor's zoom (#803).
@@ -835,9 +1070,9 @@ pub(super) fn clip_group(
     // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
     // range. #535: `clip` is timed per geometry inside the closure.
     let measure = valve_merges(ctx.opts);
-    let rects = geoms
+    let boxes = geoms
         .par_iter()
-        .map(|geoms| RowGapCursor::rects(measure, geoms))
+        .map(|geoms| site.body(|| RowGapCursor::boxes(measure, geoms)))
         .collect();
     let row_members = geoms
         .into_par_iter()
@@ -845,19 +1080,25 @@ pub(super) fn clip_group(
             geoms
                 .into_par_iter()
                 .map(|g| {
-                    ExportTimers::time(&timers.clip, || {
-                        let mut members = shared_tile_members(
-                            MemberSource::Owned(g),
-                            finest_zoom,
-                            ctx.zoom,
-                            ctx.opts,
-                            (key_lo, key_hi),
-                            diagnostics,
-                        );
-                        if let Some(tiles) = ctx.tiles {
-                            members.retain(|(key, _)| tiles.contains_key(key));
-                        }
-                        members
+                    // #876: a clip a tile's thread runs is foreign to the tile.
+                    let zoom = || crate::tile_trace::Ctx::zoom(ctx.zoom);
+                    site.body(|| {
+                        crate::tile_trace::job(zoom, || {
+                            ExportTimers::time(&timers.clip, || {
+                                let mut members = shared_tile_members(
+                                    MemberSource::Owned(g),
+                                    finest_zoom,
+                                    ctx.zoom,
+                                    ctx.opts,
+                                    (key_lo, key_hi),
+                                    diagnostics,
+                                );
+                                if let Some(tiles) = ctx.tiles {
+                                    members.retain(|(key, _)| tiles.contains_key(key));
+                                }
+                                members
+                            })
+                        })
                     })
                 })
                 .collect()
@@ -866,39 +1107,50 @@ pub(super) fn clip_group(
     Ok(ClippedGroup {
         batches,
         geom_idxs,
-        rects,
+        boxes,
         row_members,
     })
 }
 
 /// The ordered half of a group's collect ([`clip_group`] is the other): walk the group's rows for
 /// their gaps, in read order, then materialize and route their members and
-/// append them to `sink` in row order.
+/// append them to `sink` in row order. Returns what the group held; its
+/// members' bytes only under `auto`, the one profile that resizes by them.
 pub(super) fn finish_group(
     ctx: &LevelCtx<'_>,
     wave: &[Partition],
     group: ClippedGroup,
     rows: &mut WaveRows,
     sink: &mut dyn MemberSink,
+    tr: &mut FinishTrace,
     diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<(), ExportError> {
+) -> Result<GroupResidency, ExportError> {
     let timers = ctx.timers;
     let ClippedGroup {
         batches,
         geom_idxs,
-        rects,
+        boxes,
         mut row_members,
     } = group;
     let batches = &batches;
+    let measure = matches!(ctx.band.profile, MemoryProfile::Auto);
+    let mut held = GroupResidency {
+        arrow: batches.iter().map(RecordBatch::get_array_memory_size).sum(),
+        members: 0,
+        rows: batches.iter().map(RecordBatch::num_rows).sum(),
+        max_batch_rows: batches.iter().map(RecordBatch::num_rows).max().unwrap_or(0),
+    };
     #[cfg(test)]
     {
         let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
         work.collect_batches += batches.len() as u64;
         work.collect_groups += 1;
     }
+    let t = crate::tile_trace::mark();
     let row_gaps: Vec<Vec<(u64, u16)>> = ExportTimers::time(&timers.decode, || {
-        rects.iter().map(|r| rows.gaps.batch_rects(r)).collect()
+        boxes.iter().map(|b| rows.gaps.batch_boxes(b)).collect()
     });
+    tr.gaps_ns += crate::tile_trace::since(t);
 
     // Property extraction and member routing, per chunk in the pool. #535:
     // `decode`, timed per chunk and around the merge below.
@@ -930,29 +1182,54 @@ pub(super) fn finish_group(
             input
         })
         .collect();
-    let chunks: Vec<Vec<Result<ChunkMembers, ExportError>>> = row_members
-        .par_iter_mut()
-        .zip(&chunk_inputs)
-        .map(|(row_members, chunk)| {
-            let chunk_rows = collect_chunk_rows(chunk.batch.num_rows());
-            row_members
-                .par_chunks_mut(chunk_rows)
-                .enumerate()
-                .map(|(i, items)| {
-                    ExportTimers::time(&timers.decode, || {
-                        collect_member_chunk(chunk, i * chunk_rows, items)
-                    })
+    let t = crate::tile_trace::mark();
+    let chunks: Vec<Vec<Result<(ChunkMembers, usize), ExportError>>> =
+        crate::tile_trace::wait("fill_finish", |site| {
+            let chunks = row_members
+                .par_iter_mut()
+                .zip(&chunk_inputs)
+                .map(|(row_members, chunk)| {
+                    let chunk_rows = collect_chunk_rows(chunk.batch.num_rows());
+                    row_members
+                        .par_chunks_mut(chunk_rows)
+                        .enumerate()
+                        .map(|(i, items)| {
+                            site.body(|| {
+                                ExportTimers::time(&timers.decode, || {
+                                    collect_member_chunk(chunk, i * chunk_rows, items).map(|c| {
+                                        let bytes = if measure {
+                                            c.buckets
+                                                .iter()
+                                                .flatten()
+                                                .map(member_bytes_estimate)
+                                                .sum()
+                                        } else {
+                                            0
+                                        };
+                                        (c, bytes)
+                                    })
+                                })
+                            })
+                        })
+                        .collect()
                 })
-                .collect()
-        })
-        .collect();
+                .collect();
+            tr.chunks_core_ns += site.core_ns();
+            chunks
+        });
+    tr.chunks_ns += crate::tile_trace::since(t);
     drop(row_members);
+    let t = crate::tile_trace::mark();
 
     for chunk in chunks.into_iter().flatten() {
-        let ChunkMembers {
-            buckets: chunk_buckets,
-            losses,
-        } = chunk?;
+        let (
+            ChunkMembers {
+                buckets: chunk_buckets,
+                losses,
+            },
+            bytes,
+        ) = chunk?;
+        held.members += bytes;
         // Recorded here, in row order, as the serial loop recorded them.
         ExportTimers::time(&timers.decode, || {
             losses.into_iter().try_for_each(|(source_row, id)| {
@@ -972,8 +1249,9 @@ pub(super) fn finish_group(
             }
         }
     }
+    tr.append_ns += crate::tile_trace::since(t);
     rows.read = first_read as u64;
-    Ok(())
+    Ok(held)
 }
 
 /// Where [`finish_group`] puts a read's members: one call per

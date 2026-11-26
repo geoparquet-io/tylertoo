@@ -164,13 +164,13 @@ fn detached<T: pyo3::marker::Ungil>(
     Ok(out)
 }
 
-/// Before each binding starts work: build the worker pool, then refresh
-/// the log bridge. The pool starts here, not at import: a process forked
-/// after `import tylertoo` would inherit a started pool without its threads
-/// and wait forever on its first parallel job. A host that already owns the
-/// global pool keeps its size.
+/// Before each binding starts work: refresh the log bridge. The worker
+/// pool is built by core's options validation, once the call's whole
+/// configuration passed (#876), so a rejected call sizes nothing; not at
+/// import, since a process forked after `import tylertoo` would inherit a
+/// started pool without its threads and wait forever on its first parallel
+/// job. A host that already owns the global pool keeps its size.
 fn enter(py: Python<'_>) {
-    let _ = tylertoo_core::internal::overview::convert::init_worker_pool();
     refresh_log_levels(py);
 }
 

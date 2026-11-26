@@ -16,6 +16,7 @@ use super::convert::ConvertError;
 use super::level::MemoryProfile;
 use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
 use crate::input_set::{ConvertSource, ReadPlan, ReadSegment, RowGroupSelection};
+use crate::tile_trace::Tally;
 
 /// What the caller wants from [`read_in_order`], and what it knows about the
 /// rows it is about to read.
@@ -316,7 +317,7 @@ fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     let decode = tuning.budget.read_decode_plan(
         tuning.profile,
         workers,
-        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        super::convert::run_cores().unwrap_or(1),
         read_batch_price(tuning),
         workers.saturating_mul(depth.saturating_add(reader)),
     );
@@ -651,12 +652,25 @@ where
     F: FnMut(RecordBatch, usize, Duration) -> Result<ReadFlow, ConvertError>,
 {
     let (depth, decode_threads) = (shape.depth, shape.decode_threads);
-    std::thread::scope(|scope| -> Result<(), ConvertError> {
+    // #876: traced, each worker's time reading and blocked in `send`, and
+    // this thread's blocked on a worker and in `on_batch` (`read` event).
+    let t_read = crate::tile_trace::mark();
+    let busy: Vec<Tally<2>> = (0..workers).map(|_| Tally::new()).collect();
+    // This thread's: blocked on a worker, and in `on_batch`.
+    let merge = Tally::<2>::new();
+    let mut on_batch = |batch: RecordBatch, offset: usize, read: Duration| {
+        let t = crate::tile_trace::mark();
+        let r = on_batch(batch, offset, read);
+        merge.add(1, crate::tile_trace::since(t));
+        r
+    };
+    let on_batch = &mut on_batch;
+    let merged = std::thread::scope(|scope| -> Result<(), ConvertError> {
         // Receivers live in THIS frame, so returning by any path — including
         // an unwind — drops them before the scope joins, releasing any worker
         // parked in `send` (the `super::pipe` liveness contract, #362).
         let mut rxs = Vec::with_capacity(workers);
-        for w in 0..workers {
+        for (w, busy) in busy.iter().enumerate() {
             let (tx, rx) = crossbeam_channel::bounded::<SegMsg>(depth);
             rxs.push(rx);
             // Named so a stack dump, `perf`, or an OS thread listing tells a
@@ -669,8 +683,7 @@ where
                         segments,
                         projection,
                         (batch_size, decode_threads),
-                        workers,
-                        w,
+                        (workers, w, busy),
                         &tx,
                     )
                 })?;
@@ -718,7 +731,10 @@ where
                 current_part = Some(segment.part);
             }
             loop {
-                match rxs[seq % workers].recv() {
+                let t_wait = crate::tile_trace::mark();
+                let got = rxs[seq % workers].recv();
+                merge.add(0, crate::tile_trace::since(t_wait));
+                match got {
                     // A disconnected channel means the worker returned without
                     // sending `End`, which it does only by panicking: the
                     // typed error below is returned, unwinds out of the scope,
@@ -761,7 +777,19 @@ where
             }
         }
         Ok(())
-    })
+    });
+    crate::tile_trace::span("read", t_read, || {
+        let ns = |i: usize| busy.iter().map(|b| b.get(i)).collect::<Vec<_>>();
+        serde_json::json!({
+            "workers": workers,
+            "segments": segments.len(),
+            "read_ns": ns(0),
+            "send_ns": ns(1),
+            "merge_wait_ns": merge.get(0),
+            "deliver_ns": merge.get(1),
+        })
+    });
+    merged
 }
 
 /// Worker `w`: read segments `w, w + workers, …` in order, streaming each
@@ -775,13 +803,14 @@ fn read_segments_for_worker(
     segments: &[ReadSegment],
     projection: Option<&[usize]>,
     (batch_size, decode_threads): (usize, usize),
-    workers: usize,
-    w: usize,
+    (workers, w, busy): (usize, usize, &Tally<2>),
     tx: &Sender<SegMsg>,
 ) {
     let mut seq = w;
     while seq < segments.len() {
+        let t_open = crate::tile_trace::mark();
         let opened = source.open_segment(&segments[seq], projection, batch_size, decode_threads);
+        busy.add(0, crate::tile_trace::since(t_open));
         let mut stream = match opened {
             Ok(s) => s,
             Err(e) => {
@@ -798,9 +827,15 @@ fn read_segments_for_worker(
                     return;
                 }
                 Some(Ok(batch)) => {
-                    if tx.send(SegMsg::Batch(batch, t_read.elapsed())).is_err() {
+                    let read = t_read.elapsed();
+                    if crate::tile_trace::on() {
+                        busy.add(0, u64::try_from(read.as_nanos()).unwrap_or(u64::MAX));
+                    }
+                    let t_send = crate::tile_trace::mark();
+                    if tx.send(SegMsg::Batch(batch, read)).is_err() {
                         return;
                     }
+                    busy.add(1, crate::tile_trace::since(t_send));
                 }
             }
         }

@@ -16,7 +16,7 @@
 //! holding most of them from there on and, under `merge`, from its 1,024th
 //! member on, a half-octave histogram of each line or polygon member's gap
 //! to the tile's previous member in its band (the merge valve's gap measure,
-//! [`super::coalesce_valve::gap_to_rect`]). A tile below that holds only its
+//! [`super::coalesce_valve::gap_to_world_box`]). A tile below that holds only its
 //! count, as the scan's tile counts do; the rest is checked against the scan's memory budget
 //! after every batch, and dropped with a warning when it is over
 //! (`--valve-scope tile` from there on).

@@ -113,24 +113,32 @@ pub(crate) fn par_strip_box_pairs<T: Send>(
     if boxes.len() < 2 * STRIP_BOXES {
         return collect(&|hit| any_box_pair(boxes, hit));
     }
-    match Strips::cut(boxes) {
+    crate::tile_trace::wait("box_pairs", |site| match Strips::cut(boxes) {
         Some(s) => (0..boxes.len())
             .into_par_iter()
-            .flat_map_iter(|p| collect(&|hit| s.tall_run(boxes, p, &mut |i, j| hit(i, j))))
+            .flat_map_iter(|p| {
+                site.body(|| collect(&|hit| s.tall_run(boxes, p, &mut |i, j| hit(i, j))))
+            })
             .chain(s.members.par_iter().enumerate().flat_map_iter(|(k, list)| {
-                (0..list.len())
-                    .flat_map(|p| collect(&|hit| s.strip_run(boxes, k, p, &mut |i, j| hit(i, j))))
-                    .collect::<Vec<_>>()
+                site.body(|| {
+                    (0..list.len())
+                        .flat_map(|p| {
+                            collect(&|hit| s.strip_run(boxes, k, p, &mut |i, j| hit(i, j)))
+                        })
+                        .collect::<Vec<_>>()
+                })
             }))
             .collect(),
         None => {
             let order = x_order(boxes);
             (0..order.len())
                 .into_par_iter()
-                .flat_map_iter(|p| collect(&|hit| x_run(boxes, &order[p..], &mut |i, j| hit(i, j))))
+                .flat_map_iter(|p| {
+                    site.body(|| collect(&|hit| x_run(boxes, &order[p..], &mut |i, j| hit(i, j))))
+                })
                 .collect()
         }
-    }
+    })
 }
 
 /// Indices of `boxes` by min x: [`any_box_pair`]'s order.

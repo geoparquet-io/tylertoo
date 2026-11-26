@@ -183,11 +183,18 @@ For example, `B = 20M`, `I = 10M`, `p = 1000`, `g = 100` gives
 `min(20 GB, 12.56 + 1 + 0.32 GB)` = 13.88 GB (12.93 GiB).
 
 [`pipeline.rs`](../crates/core/src/overview/pipeline.rs) compares that
-estimate with the allowance left after grants. `auto` also spills
+estimate with the allowance left after grants, and with 150% of it when
+footer prices exist (`FOOTER_PRICED_RAM_ADMIT_PERCENT`, #876): `p` uses the
+worst decoded ratio measured and `g` the input's full-resolution geometry.
+NZ parcels estimated 12.2 GiB for a sink that measured 4.8 GiB, and Mato
+Grosso 15.0 GiB for 4.3 GiB. A sink that does not fit is caught by the
+runtime check below. `auto` also spills
 partitioning output above 2 million buffered rows. During RAM buffering it measures
-Arrow bytes plus a 256 B floor per materialized row. The tuner counts shared source rows once; each level adds its own arrays. The tuner projects
-`held bytes + remaining planned rows × observed bytes/row` after each
-input batch and can switch once to spill. Arrow array accounting can
+Arrow bytes plus a 256 B floor per materialized row. The tuner counts shared source rows once; each level adds its own arrays. After each
+input batch the tuner switches once to spill when `held bytes + window ×
+largest input batch's bytes so far` passes its budget, or, from 1,024
+observed rows, when `held bytes + remaining planned rows × observed
+bytes/row` does. Arrow array accounting can
 count shared buffers more than once, so this remains a sizing estimate.
 
 `bounded` spills LZ4 IPC; an `auto` spill uses raw IPC. The cgroup page-cache
@@ -758,8 +765,9 @@ tick:
     }
   },
   // one row per 250 ms tick:
-  // [t_secs, cpu_secs, rss_bytes, read_bytes, write_bytes, rchar]
-  "timeline": [[0.0, 0.01, 23855104, 0, 0, 1048576], ...]
+  // [t_secs, cpu_secs, rss_bytes, read_bytes, write_bytes, rchar, busy]
+  // busy: threads in traced tile work, null unless TYLERTOO_TILE_TRACE is set
+  "timeline": [[0.0, 0.01, 23855104, 0, 0, 1048576, null], ...]
 }
 ```
 
@@ -881,8 +889,8 @@ ended (64-core Neoverse-V1 host, figures from the PR or commit named):
   byte-identical. Two pieces remain, both measured in #876: a few giant
   tiles hold the in-flight cap, so levels has work for only 2–16 cores for
   most of its window; and the fixed default cap of 40 workers, past which
-  more workers added memory but no speed. Until #876 lands, both stay as
-  the limits below.
+  more workers added memory but no speed. The giant tiles stay as a limit
+  below; the cap is now `bounded`'s width only (next list).
 - **Export finalize: fixed by #878.** The stall was one `fdatasync` of the
   whole archive after export's compute (#813 saw 3.2 s on Oregon roads; #818
   measured 0.22–0.25 s there and blamed a slow volume). A writer thread now
@@ -924,7 +932,14 @@ These limits stay as they are:
   places' peak RSS rose a median 18 MiB (lines 73 MiB, FTW Brazil MT 88 MiB),
   and with `MIMALLOC_PURGE_DELAY=0` pass 2's peak was lower than without the
   split. `MemoryBudget` charges it, and `bounded` keeps one thread per reader.
-  The default worker cap of 40 stays.
+- The worker pool takes every core the process may use under `auto` and
+  `speed`, and at most 40 (`WORKER_THREADS_MAX`) under `bounded`
+  (`default_worker_threads`, #876). Under `bounded` with a 24 GB limit, 64
+  workers against 40 raised peak RSS by 13–26% for 0–4% less wall, so
+  `bounded` keeps 40. An explicit `RAYON_NUM_THREADS` wins over the rule.
+  The pool is process-wide, so the first run sizes it: the CLI at startup,
+  the Python bindings at their first call, and a library caller at its
+  first options validation.
 
 ### Export phase (#535)
 
@@ -1159,6 +1174,83 @@ Merging the two into one object would mean either:
 
 A standalone `export-pmtiles` run writes exactly one `"phase": "export"`
 line, the same shape as the second line of a `tiles` run.
+
+## Per-tile export trace (`TYLERTOO_TILE_TRACE`, #876)
+
+`TYLERTOO_TILE_TRACE=<path>` writes a JSONL timeline of the export: one
+event per tile, valve pass, scheduler step and wait site. It answers what
+`TYLERTOO_PROFILE_JSON`'s totals cannot: which tiles set a zoom's wall, what
+their threads did meanwhile, and what the level scheduler held back. Off, it
+costs one relaxed atomic load per event site. On, each thread buffers its
+own lines and the export writes them when it ends, so the file is complete
+only after the export returns. Lines come grouped by thread, not in time
+order, between the export's `start` and `end` lines. The first export in a
+process truncates the file, later ones append. One export at a
+time per process is traced. The output archive is byte-identical with
+tracing on or off.
+
+```bash
+TYLERTOO_TILE_TRACE=/tmp/trace.jsonl tylertoo tiles in.parquet out.pmtiles
+uv run python -I benchmarks/tile_trace.py /tmp/trace.jsonl [--top 10] [--json s.json]
+```
+
+Every event has `ev`, `tid` (the OS thread id) and times in nanoseconds
+since the export started, on one monotonic clock: `t_ns` for a point,
+`start_ns`/`end_ns` for a span. Tile-bound events carry `z`, `x`, `y`, and
+where known `zoom`, `level` (the export's level index), `wave` and `part`
+(the partition's index in its wave); unknown ones are `null`.
+
+| `ev` | When | Fields |
+|---|---|---|
+| `start`, `end` | export start and end | `pid`, `threads` (pool size), `unix_secs`; `start` also has `mono_ns`, the `CLOCK_MONOTONIC` time for lining the trace up with `perf record -k CLOCK_MONOTONIC` (Linux only, 0 elsewhere) |
+| `phase` | the profile's phase changes (`fill`, `levels`, `finalize`) | `phase` |
+| `occ` | every 50 ms | `busy` |
+| `tile` | each tile encode (`encode_group`) | `members`, `vertices`, `passes`, `merged`, `raw_bytes` (0: an empty carrier, not written), `stolen_ns`, `foreign_ns` |
+| `pass` | each size-valve encode | `kind` (`merge`, `drop`, `halve`, `drop_merged`, `fill`), `pass`, `threshold` (merge gap, features kept, or extent), `groups` (features encoded), `merged`, `raw_bytes`, `gzip_bytes` (`null` with no compressed cap), `core_ns` and `wall_ns` per stage, `union_hits`, `union_misses`, `repaired`, `largest_component_vertices` |
+| `wait` | written at the end, per thread, tile (or zoom) and site | `site`, `calls`, `wall_ns`, `max_wall_ns`, `bodies`, `core_ns` |
+| `wave` | a group wave's `stage`: `collected`, `spawned`, `started`, `encoded`, `written` | `level`, `zoom`, `wave`, `members`, `partitions` |
+| `admit_wait`, `window_wait`, `drain_wait` | the collect waits on the in-flight cap, the two-wave window, the gate draining before a late store fill | wave fields, `held`, `cap` |
+| `commit_wait` | an encoded wave waiting for earlier waves' writes | wave fields, `queued` (its share of the cap) |
+| `group`, `serial_level` | a level group, and a level on the serial `export_level` path | `levels`, `zooms`, `cap`; `level`, `zoom`, `waves`, `members` |
+| `fill` | a level's one-level store fill, the coverage fill | `kind` (`level_store`, `coverage`), `level`, `zoom`, `early` |
+| `collect` | a band collect (a store fill's, or a wave's own read), on its driving thread | `level`, `zoom`, `groups`; `recv_ns` (blocked on the reader pipe), `join_ns` (in the finish-and-clip joins), of which `inject_ns` (before a worker took the join), `finish_ns` and `clip_ns` (each half's wall), `clip_core_ns` (the clip's bodies on every thread); `serial_ns` (`finish_group` outside a join); every `finish_group`'s `finish_gaps_ns` (ordered gap walk, serial since #876; its bbox projections run in the clip), `finish_chunks_ns` and `finish_chunks_core_ns` (the parallel member chunks' wall and core), `finish_append_ns` (ordered sink appends) |
+| `read` | a parallel ordered read (`read_in_parallel`), on its merge thread | `workers`, `segments`; per worker `read_ns` (open and decode) and `send_ns` (blocked on its full queue); `merge_wait_ns` (the merge blocked on a worker), `deliver_ns` (in the consumer's callback: for a band read, blocked on the pipe) |
+
+How to read them:
+
+- **`stolen_ns` and `foreign_ns`**: time the tile's thread spent, while
+  the tile was open, in another tile (`stolen_ns`) or in other traced work
+  (`foreign_ns`: a wave's encode task, a clip, another tile's parallel
+  bodies), which rayon runs while a thread waits in a join. Each span is
+  charged once, at the outermost foreign frame. A tile's own work is its
+  wall minus both.
+- **Stages** nest: `build` (one valve encode) holds `quantize`, `union`
+  and `finalize`; `coalesce` and `gzip` stand alone. `core_ns` sums every
+  thread's time in a stage; `wall_ns` is the pass's own thread's, which is
+  the part of the stage on the tile's critical path.
+- **`occ.busy`** counts threads inside a traced tile, body or job and not
+  waiting in a traced parallel call: busy without spin. It is also the
+  `busy` column of the profile's `timeline`.
+- **Wait sites**: `sort` (`encode.rs` member sort), `tiles` (a partition's
+  tiles), `encode_buckets` (a wave's partitions), `fill_clip` (a collect's
+  finish-and-clip join; bodies are the clip's), `fill_finish` (a finish's
+  member chunks), `geometry_chunks`,
+  `layers`, `quantize`, `part_clean`, `box_pairs`, `pairs_within`.
+  `wall_ns` is the caller's time in the call; `core_ns` is its bodies' time
+  on every thread. `sort` and `pairs_within` record wall only: a timed body
+  there would cost more than the work.
+- **Not traced**: the variable-depth probe's tiles (`probe_wave`) have no
+  `tile` events, and the merge's joint-valve tiles have no level or wave.
+  The single-read store fill before the levels is a `phase`, not a `fill`
+  span. The variable-depth levels run the same group schedule and emit the
+  same scheduler events.
+
+`benchmarks/tile_trace.py` prints, per zoom, the wall, the longest tiles
+and their pass stages, and the occupancy timeline; the scheduler holds,
+with each group's idle tail after its last wave spawn while under half the
+pool busy; each wait site's owner wall against its bodies' core time; and
+per band collect, its driving thread's split and its readers' busy and
+blocked time.
 
 ## Sampling profilers
 

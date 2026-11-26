@@ -2434,6 +2434,7 @@ pub tylertoo_core::ConvertOptions::in_flight_batches: usize
 pub tylertoo_core::ConvertOptions::levels: tylertoo_core::LevelPlan
 pub tylertoo_core::ConvertOptions::mask: core::option::Option<tylertoo_core::MaskSource>
 pub tylertoo_core::ConvertOptions::max_row_group_size: usize
+pub tylertoo_core::ConvertOptions::memory_limit: core::option::Option<usize>
 pub tylertoo_core::ConvertOptions::mode: tylertoo_core::Mode
 pub tylertoo_core::ConvertOptions::no_auto_rank: bool
 pub tylertoo_core::ConvertOptions::plan: core::option::Option<std::path::PathBuf>
@@ -2449,6 +2450,7 @@ pub tylertoo_core::ConvertOptions::shard_plan_digest: core::option::Option<alloc
 pub tylertoo_core::ConvertOptions::simplify: tylertoo_core::SimplifyOptions
 pub tylertoo_core::ConvertOptions::sort_key: core::option::Option<alloc::string::String>
 pub tylertoo_core::ConvertOptions::spill_dir: core::option::Option<std::path::PathBuf>
+pub tylertoo_core::ConvertOptions::workers: core::option::Option<usize>
 pub tylertoo_core::ConvertOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::ConvertOptions
 pub fn tylertoo_core::ConvertOptions::is_verbatim(&self) -> bool
@@ -2477,6 +2479,7 @@ pub fn tylertoo_core::ConvertOptions::with_in_flight_batches(self, usize) -> Sel
 pub fn tylertoo_core::ConvertOptions::with_levels(self, tylertoo_core::LevelPlan) -> Self
 pub fn tylertoo_core::ConvertOptions::with_mask(self, core::option::Option<tylertoo_core::MaskSource>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_max_row_group_size(self, usize) -> Self
+pub fn tylertoo_core::ConvertOptions::with_memory_limit(self, core::option::Option<usize>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_mode(self, tylertoo_core::Mode) -> Self
 pub fn tylertoo_core::ConvertOptions::with_no_auto_rank(self, bool) -> Self
 pub fn tylertoo_core::ConvertOptions::with_plan(self, core::option::Option<std::path::PathBuf>) -> Self
@@ -2492,6 +2495,7 @@ pub fn tylertoo_core::ConvertOptions::with_shard_plan_digest(self, core::option:
 pub fn tylertoo_core::ConvertOptions::with_simplify(self, tylertoo_core::SimplifyOptions) -> Self
 pub fn tylertoo_core::ConvertOptions::with_sort_key(self, core::option::Option<alloc::string::String>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_spill_dir(self, core::option::Option<std::path::PathBuf>) -> Self
+pub fn tylertoo_core::ConvertOptions::with_workers(self, core::option::Option<usize>) -> Self
 pub fn tylertoo_core::ConvertOptions::with_zoom_ceiling(self, core::option::Option<u8>) -> Self
 impl core::clone::Clone for tylertoo_core::ConvertOptions
 pub fn tylertoo_core::ConvertOptions::clone(&self) -> tylertoo_core::ConvertOptions
@@ -2678,6 +2682,7 @@ pub tylertoo_core::ExportOptions::feature_id: core::option::Option<alloc::string
 pub tylertoo_core::ExportOptions::feature_order: tylertoo_core::FeatureOrder
 pub tylertoo_core::ExportOptions::layer_name: alloc::string::String
 pub tylertoo_core::ExportOptions::max_zoom_simplify_factor: core::option::Option<f64>
+pub tylertoo_core::ExportOptions::memory_limit: core::option::Option<usize>
 pub tylertoo_core::ExportOptions::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::ExportOptions::min_zoom: core::option::Option<u8>
 pub tylertoo_core::ExportOptions::mlt_profile: tylertoo_core::MltProfile
@@ -2695,6 +2700,7 @@ pub tylertoo_core::ExportOptions::tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::ExportOptions::valve_max_step: f64
 pub tylertoo_core::ExportOptions::valve_scope: tylertoo_core::ValveScope
 pub tylertoo_core::ExportOptions::variable_depth: bool
+pub tylertoo_core::ExportOptions::workers: core::option::Option<usize>
 pub tylertoo_core::ExportOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::ExportOptions
 pub fn tylertoo_core::ExportOptions::verbatim(self) -> Self
@@ -2706,6 +2712,7 @@ pub fn tylertoo_core::ExportOptions::with_feature_id(self, core::option::Option<
 pub fn tylertoo_core::ExportOptions::with_feature_order(self, tylertoo_core::FeatureOrder) -> Self
 pub fn tylertoo_core::ExportOptions::with_layer_name(self, alloc::string::String) -> Self
 pub fn tylertoo_core::ExportOptions::with_max_zoom_simplify_factor(self, core::option::Option<f64>) -> Self
+pub fn tylertoo_core::ExportOptions::with_memory_limit(self, core::option::Option<usize>) -> Self
 pub fn tylertoo_core::ExportOptions::with_metadata(self, tylertoo_core::TilesetMetadata) -> Self
 pub fn tylertoo_core::ExportOptions::with_min_zoom(self, core::option::Option<u8>) -> Self
 pub fn tylertoo_core::ExportOptions::with_mlt_profile(self, tylertoo_core::MltProfile) -> Self
@@ -2723,6 +2730,7 @@ pub fn tylertoo_core::ExportOptions::with_tile_size_limit(self, core::option::Op
 pub fn tylertoo_core::ExportOptions::with_valve_max_step(self, f64) -> Self
 pub fn tylertoo_core::ExportOptions::with_valve_scope(self, tylertoo_core::ValveScope) -> Self
 pub fn tylertoo_core::ExportOptions::with_variable_depth(self, bool) -> Self
+pub fn tylertoo_core::ExportOptions::with_workers(self, core::option::Option<usize>) -> Self
 pub fn tylertoo_core::ExportOptions::with_zoom_ceiling(self, core::option::Option<u8>) -> Self
 impl core::clone::Clone for tylertoo_core::ExportOptions
 pub fn tylertoo_core::ExportOptions::clone(&self) -> tylertoo_core::ExportOptions

@@ -75,6 +75,8 @@ overview(
     mask: str | os.PathLike[str] | _Geometry | None = None,
     filter: str | None = None,
     profile: Literal['auto', 'speed', 'bounded'] = "auto",
+    workers: int | None = None,
+    memory_limit: int | None = None,
     in_flight_batches: int = 0,
     read_workers: int = 0,
     spill_dir: str | os.PathLike[str] | None = None,
@@ -161,6 +163,8 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `mask`: Keep features whose geometry intersects polygons or multipolygons in a GeoJSON (`.geojson` or `.json`, lon/lat per RFC 7946) or GeoParquet file, or a shapely geometry (any object with `.wkb`). Touching counts. A feature also matches when its copy one world width away (±360°) intersects the mask, as with `bbox`. The mask's bbox skips row groups like `bbox`. Combines with `bbox` and `filter` by AND. A GeoParquet mask uses its declared CRS and the same reprojection rules as input. EPSG:4326 masks are converted to EPSG:3857 for 3857 input and vice versa, vertex by vertex. WKB/shapely masks have no CRS: use EPSG:3857 for EPSG:3857 input, otherwise lon/lat EPSG:4326, including for reprojected input.
 * `filter`: SQL-style predicate, such as `"confidence > 0.8"`.
 * `profile`: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles): `"speed"` holds everything in RAM, `"bounded"` uses disk and holds the least, and `"auto"` sizes to the machine's memory. Wheels use mimalloc. Under `"bounded"`, it purges freed pages immediately to reduce peak memory at a speed cost. The setting applies for the duration of each `"bounded"` call and is then restored; overlapping calls on other threads share it while any `"bounded"` call runs. A non-musl source build uses the system allocator with `maturin build --no-default-features` (musl always uses mimalloc).
+* `workers`: [Worker threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads) for the whole run. `None` (default) uses `RAYON_NUM_THREADS` when set, else every core under `"auto"` and `"speed"` and at most 40 under `"bounded"`. `0` is an error. The pool is process-wide, so the first call in a process sets it and later calls keep it.
+* `memory_limit`: [Memory limit](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit) in bytes, such as `24 * 2**30`, used in place of the detected available memory (cgroup limit or `MemAvailable`). It overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. `0` is an error. The limit is process-wide: it stays in force for later calls in the process until another call sets one.
 * `in_flight_batches`: [Concurrent batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency), or `0` to size from the CPU count.
 * `read_workers`: [Reader threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency), or `0` to size from the CPU count.
 * `spill_dir`: [Staging directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files) for remote input.
@@ -210,6 +214,8 @@ export_pmtiles(
     feature_id: str | None = None,
     spill_dir: str | os.PathLike[str] | None = None,
     profile: Literal['auto', 'speed', 'bounded'] = "auto",
+    workers: int | None = None,
+    memory_limit: int | None = None,
     name: str | None = None,
     description: str | None = None,
     attribution: str | None = None,
@@ -249,6 +255,8 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `feature_id`: Integer column to use as the MVT feature ID. By default, features have no ID.
 * `spill_dir`: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files) used when memory runs short.
 * `profile`: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles): `"speed"` holds everything in RAM, `"bounded"` uses disk and holds the least, and `"auto"` sizes to the machine's memory. Wheels use mimalloc. Under `"bounded"`, it purges freed pages immediately to reduce peak memory at a speed cost. The setting applies for the duration of each `"bounded"` call and is then restored; overlapping calls on other threads share it while any `"bounded"` call runs. A non-musl source build uses the system allocator with `maturin build --no-default-features` (musl always uses mimalloc). Output is identical across profiles.
+* `workers`: [Worker threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads) for the whole run. `None` (default) uses `RAYON_NUM_THREADS` when set, else every core under `"auto"` and `"speed"` and at most 40 under `"bounded"`. `0` is an error. The pool is process-wide, so the first call in a process sets it and later calls keep it.
+* `memory_limit`: [Memory limit](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit) in bytes, such as `24 * 2**30`, used in place of the detected available memory (cgroup limit or `MemAvailable`). It overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. `0` is an error. The limit is process-wide: it stays in force for later calls in the process until another call sets one.
 * `name`: Human-readable tileset name, stored in the metadata.
 * `description`: Description of the tileset, stored in the metadata.
 * `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.
@@ -322,6 +330,8 @@ pyramid(
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
     profile: Literal['auto', 'speed', 'bounded'] = "auto",
+    workers: int | None = None,
+    memory_limit: int | None = None,
     tile_format: Literal['mvt', 'mlt'] = "mvt",
     mlt_profile: Literal['web', 'native', 'min-size', 'diffable', 'fast-encoding'] = "web",
 ) -> PyramidReport
@@ -360,6 +370,8 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 * `exclude_properties`: Drop these properties from the tiles of GeoParquet bands. `include_properties` overrides it.
 * `exclude_all_properties`: Drop every property from the tiles of GeoParquet bands. `include_properties` overrides it.
 * `profile`: Memory profile, as for `convert()`, applied to every GeoParquet band's convert and export. Changes memory use, not output bytes.
+* `workers`: See `export_pmtiles()`.
+* `memory_limit`: See `export_pmtiles()`.
 * `tile_format`: See `export_pmtiles()`. Every band must have this format.
 * `mlt_profile`: See `export_pmtiles()`.
 
@@ -631,6 +643,8 @@ convert(
     read_batch_size: int = 8192,
     filter: str | None = None,
     profile: Literal['auto', 'speed', 'bounded'] = "auto",
+    workers: int | None = None,
+    memory_limit: int | None = None,
     in_flight_batches: int = 0,
     read_workers: int = 0,
     save_plan: str | os.PathLike[str] | None = None,
@@ -722,6 +736,8 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `read_batch_size`: See `overview()`.
 * `filter`: See `overview()`.
 * `profile`: See `overview()`.
+* `workers`: See `overview()`.
+* `memory_limit`: See `overview()`.
 * `in_flight_batches`: See `overview()`.
 * `read_workers`: See `overview()`.
 * `save_plan`: See `overview()`.

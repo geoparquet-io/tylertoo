@@ -45,6 +45,7 @@ fn run_tiles_with_profile(
     min_zoom: &str,
     max_zoom: &str,
     rayon_threads: Option<&str>,
+    extra_args: &[&str],
 ) -> (
     tempfile::TempDir,
     serde_json::Value,
@@ -71,6 +72,7 @@ fn run_tiles_with_profile(
             "--report",
             report_json.to_str().unwrap(),
         ])
+        .args(extra_args)
         // Set only in the child's environment: no in-process global state is
         // touched, so this test cannot race any other test in the suite.
         .env("TYLERTOO_PROFILE_JSON", &profile_json)
@@ -118,7 +120,7 @@ fn profile_json_written_and_parses() {
         return;
     };
 
-    let (dir, report, convert, export) = run_tiles_with_profile(&fixture, "0", "6", None);
+    let (dir, report, convert, export) = run_tiles_with_profile(&fixture, "0", "6", None, &[]);
 
     // --- Pairing: both lines of one `tiles` process share a `run_id` and
     // say which phase they are. ---
@@ -158,7 +160,7 @@ fn profile_json_written_and_parses() {
 fn profile_json_saturation_fields_on_a_committed_fixture() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
-    let (_dir, _report, convert, export) = run_tiles_with_profile(&fixture, "0", "6", None);
+    let (_dir, _report, convert, export) = run_tiles_with_profile(&fixture, "0", "6", None, &[]);
     check_saturation(&convert, &convert, &CONVERT_PHASES);
     assert!(
         convert["pass2"]["writer_busy_secs"]
@@ -630,7 +632,15 @@ fn check_saturation(line: &serde_json::Value, holder: &serde_json::Value, phases
     let mut last_t = -1.0;
     for row in timeline {
         let row = row.as_array().expect("timeline row array");
-        assert_eq!(row.len(), 6, "[t, cpu, rss, read, write, rchar]: {line}");
+        assert_eq!(
+            row.len(),
+            7,
+            "[t, cpu, rss, read, write, rchar, busy]: {line}"
+        );
+        assert!(
+            row[6].is_null(),
+            "busy is null without TYLERTOO_TILE_TRACE: {line}"
+        );
         let t = row[0].as_f64().expect("t_secs");
         assert!(t >= last_t, "timeline must be in time order: {line}");
         last_t = t;
@@ -1366,14 +1376,184 @@ fn profile_json_reports_cascade_identical_steps() {
     );
 }
 
-/// The CLI sizes the worker pool from core's `resolve_worker_threads`: the
-/// cores capped at 40 by default, an explicit `RAYON_NUM_THREADS` verbatim.
+/// The CLI sizes the worker pool from core's `resolve_worker_threads` for
+/// the command's profile (#876): `bounded` the cores capped at 40, `auto`
+/// every core, an explicit `RAYON_NUM_THREADS` verbatim, and `--workers`
+/// over both.
 #[test]
 fn cli_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get) as u64;
+    let threads = |env, args: &[&str]| {
+        run_tiles_with_profile(&fixture, "0", "2", env, args).2["threads"]
+            .as_u64()
+            .expect("threads")
+    };
+    assert_eq!(threads(None, &[]), cores);
+    assert_eq!(threads(None, &["--profile", "bounded"]), cores.min(40));
+    assert_eq!(threads(Some("48"), &[]), 48);
+    // `--workers` wins over the rule and over `RAYON_NUM_THREADS`.
+    assert_eq!(threads(Some("48"), &["--workers", "3"]), 3);
+}
+
+/// #876: `--workers` lowers every width sized from the core count, not only
+/// the pool: the run's convert and export use 2 threads, and the partition
+/// wave and in-flight batches are sized for a 2-core host.
+#[test]
+fn cli_workers_lower_every_core_derived_width() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile.jsonl");
+    let output = Command::new(tylertoo_bin())
+        .args(["tiles", fixture.to_str().unwrap()])
+        .arg(dir.path().join("out.pmtiles"))
+        .args(["--max-zoom", "2", "--workers", "2"])
+        .env("TYLERTOO_PROFILE_JSON", &profile)
+        .env_remove("RAYON_NUM_THREADS")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run tylertoo tiles");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let threads = |env| run_tiles_with_profile(&fixture, "0", "2", env).2["threads"].as_u64();
-    assert_eq!(threads(None), Some(cores.min(40) as u64));
-    assert_eq!(threads(Some("48")), Some(48));
+    let run_cores = cores.min(2);
+    let contents = std::fs::read_to_string(&profile).expect("profile");
+    let lines: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert_eq!(lines[0]["threads"], 2, "convert: {}", lines[0]);
+    let export = &lines[1]["export"];
+    assert_eq!(export["threads"], 2, "export: {export}");
+    // A 2-core host's auto wave: its cores, floored at PARTITION_WAVE_MIN (6).
+    let wave = run_cores.max(6);
+    assert_eq!(export["partition_wave_width"], wave, "export: {export}");
+    for needle in [
+        format!("partition wave: {wave} partition(s) per band read (auto: {run_cores} core(s)"),
+        format!("read batch(es) in flight ({run_cores} core(s) detected)"),
+    ] {
+        assert!(stderr.contains(&needle), "missing {needle:?}:\n{stderr}");
+    }
+}
+
+/// #876: `TYLERTOO_TILE_TRACE` writes one JSONL event per line, one `tile`
+/// event per written tile (the profile's per-zoom counts), valve passes and
+/// waits, and an archive byte-identical to the untraced run's.
+#[test]
+fn tile_trace_has_one_tile_event_per_written_tile_and_changes_no_byte() {
+    let Some(fixture) = fixture::realdata("ftw-moldova-z10.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let run = |name: &str, trace: Option<&std::path::Path>| {
+        let out = dir.path().join(format!("{name}.pmtiles"));
+        let profile = dir.path().join(format!("{name}.jsonl"));
+        let output = Command::new(tylertoo_bin())
+            .args(["tiles", fixture.to_str().unwrap(), out.to_str().unwrap()])
+            .args(["--max-zoom", "8", "--max-compressed-tile-size", "2000"])
+            .env("TYLERTOO_PROFILE_JSON", &profile)
+            .env_remove("TYLERTOO_TILE_TRACE")
+            .envs(trace.map(|t| ("TYLERTOO_TILE_TRACE", t)))
+            .output()
+            .expect("run tylertoo tiles");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let export: serde_json::Value = std::fs::read_to_string(&profile)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|v| v["phase"] == "export")
+            .expect("an export profile line");
+        (std::fs::read(&out).unwrap(), export)
+    };
+    let trace = dir.path().join("trace.jsonl");
+    let (plain, _) = run("plain", None);
+    let (traced, export) = run("traced", Some(&trace));
+    assert!(plain == traced, "tracing changed the archive");
+
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}")))
+        .collect();
+    let of = |ev: &'static str| events.iter().filter(move |e| e["ev"] == ev);
+    assert!(
+        events.iter().all(|e| e["tid"].is_u64()),
+        "every event has a tid"
+    );
+    assert_eq!(of("start").count(), 1);
+    assert_eq!(of("end").count(), 1);
+    assert_eq!(events[0]["ev"], "start", "start opens the export's lines");
+    assert_eq!(events[events.len() - 1]["ev"], "end", "end closes them");
+    let mut written = std::collections::BTreeMap::<u64, u64>::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for t in of("tile").filter(|t| t["raw_bytes"].as_u64() > Some(0)) {
+        assert!(t["end_ns"].as_u64() >= t["start_ns"].as_u64(), "{t}");
+        let key = ["z", "x", "y"].map(|k| t[k].as_u64().unwrap());
+        assert!(seen.insert(key), "{t}");
+        *written.entry(t["z"].as_u64().unwrap()).or_default() += 1;
+    }
+    let expected: std::collections::BTreeMap<u64, u64> = export["export"]["per_zoom"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|z| (z["zoom"].as_u64().unwrap(), z["tiles"].as_u64().unwrap()))
+        .filter(|&(_, n)| n > 0)
+        .collect();
+    assert_eq!(written, expected, "one tile event per written tile");
+    assert!(
+        of("pass").any(|p| p["pass"].as_u64() > Some(1)),
+        "the 2000-byte cap runs the valve past its first pass"
+    );
+    assert!(of("wait").any(|w| w["site"] == "tiles" && w["calls"].as_u64() > Some(0)));
+    assert!(of("occ").count() >= 1);
+    assert!(of("phase").any(|p| p["phase"] == "levels"));
+    // The anchor lines the trace up with `perf`, which is Linux-only; the
+    // writer records 0 elsewhere.
+    let anchored = |s: &serde_json::Value| s["mono_ns"].as_u64() > Some(0);
+    assert_eq!(
+        of("start").all(anchored),
+        cfg!(target_os = "linux"),
+        "start carries the monotonic anchor for perf on Linux only"
+    );
+    let quantized: Vec<_> = of("pass")
+        .filter(|p| p["core_ns"]["quantize"].as_u64() > Some(0))
+        .collect();
+    assert!(!quantized.is_empty(), "a merge pass quantizes the tile");
+    for p in quantized {
+        let ns = |k: &str| {
+            p["core_ns"][k]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{k}: {p}"))
+        };
+        assert!(ns("q_project") > 0 && ns("q_box_pairs_1") > 0, "{p}");
+        assert!(
+            ns("q_project") + ns("q_box_pairs_1") + ns("q_box_pairs_2") <= ns("quantize"),
+            "{p}"
+        );
+        assert!(p["dense"].is_u64(), "{p}");
+    }
+    assert!(of("pass").any(|p| p["core_ns"]["l_finish"].as_u64() > Some(0)));
+    for s in of("span") {
+        let (a, b) = (
+            s["start_ns"].as_u64().unwrap(),
+            s["end_ns"].as_u64().unwrap(),
+        );
+        assert!(b >= a + 1_000_000, "a span is at least 1 ms: {s}");
+        assert!(
+            ["stage", "wait", "body", "job"].contains(&s["kind"].as_str().unwrap()),
+            "{s}"
+        );
+        if s["kind"] == "wait" {
+            assert!(
+                s["body_core_ns"].is_u64() && s["last_body_end_ns"].as_u64() <= Some(b),
+                "a wait span carries its call's bodies: {s}"
+            );
+        }
+    }
 }

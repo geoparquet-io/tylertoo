@@ -43,6 +43,18 @@ Args:
         `"bounded"` call runs. A non-musl source build uses the system allocator with
         `maturin build --no-default-features` (musl always uses mimalloc).
         Output is identical across profiles.
+    workers: [Worker threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads)
+        for the whole run. `None` (default) uses `RAYON_NUM_THREADS`
+        when set, else every core under `"auto"` and `"speed"` and at
+        most 40 under `"bounded"`. `0` is an error. The pool is
+        process-wide, so the first call in a process sets it and later
+        calls keep it.
+    memory_limit: [Memory limit](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit)
+        in bytes, such as `24 * 2**30`, used in place of the detected
+        available memory (cgroup limit or `MemAvailable`). It overrides
+        `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. `0` is an error. The limit is
+        process-wide: it stays in force for later calls in the process
+        until another call sets one.
     name: Human-readable tileset name, stored in the metadata.
     description: Description of the tileset, stored in the metadata.
     attribution: Attribution text or HTML stored in the archive

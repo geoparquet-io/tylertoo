@@ -172,6 +172,13 @@ pub(super) struct ExportWorkTally {
     pub(super) band_reads_on_consumer: u64,
     /// Groups clipped while an earlier group still waited to finish (#817).
     pub(super) collect_overlaps: u64,
+    /// The largest scale a collect group was gathered at, and the most
+    /// Arrow and clipped-member bytes one finished group held (#876).
+    /// Member bytes are measured under `auto` only, so they read 0
+    /// under `speed` and `bounded`.
+    pub(super) collect_peak_scale: usize,
+    pub(super) collect_peak_arrow: u64,
+    pub(super) collect_peak_members: u64,
     /// Waves of multi-wave levels a level group collected and encoded in
     /// its pipeline, not the serial wave loop (#817).
     pub(super) group_waves: u64,
@@ -1337,16 +1344,22 @@ pub(super) fn fanout_batch_members(
         let clipped: RowMembers = geoms
             .par_iter()
             .map(|g| {
-                ExportTimers::time(&timers.clip, || {
-                    shared_tile_members(
-                        MemberSource::Shared(g),
-                        finest,
-                        plan.zoom,
-                        opts,
-                        (0, u64::MAX),
-                        diagnostics,
-                    )
-                })
+                // #876: a clip a tile's thread runs is foreign to the tile.
+                crate::tile_trace::job(
+                    || crate::tile_trace::Ctx::zoom(plan.zoom),
+                    || {
+                        ExportTimers::time(&timers.clip, || {
+                            shared_tile_members(
+                                MemberSource::Shared(g),
+                                finest,
+                                plan.zoom,
+                                opts,
+                                (0, u64::MAX),
+                                diagnostics,
+                            )
+                        })
+                    },
+                )
             })
             .collect();
         let t_level = Instant::now();
@@ -1451,16 +1464,28 @@ pub(super) fn encode_buckets(
     timers: &ExportTimers,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
-    buckets
-        .into_par_iter()
-        .map(|members| {
-            let n = members.len();
-            let tiles =
-                encode_layer_members(gzip_cache, members, zoom, opts, fills, timers, diagnostics);
-            if let Some(a) = admitted {
-                a.encoded(n, tiles.as_deref().unwrap_or_default());
-            }
-            tiles
-        })
-        .collect::<Result<_, _>>()
+    crate::tile_trace::wait("encode_buckets", |site| {
+        buckets
+            .into_par_iter()
+            .enumerate()
+            .map(|(part, members)| {
+                site.part(part, || {
+                    let n = members.len();
+                    let tiles = encode_layer_members(
+                        gzip_cache,
+                        members,
+                        zoom,
+                        opts,
+                        fills,
+                        timers,
+                        diagnostics,
+                    );
+                    if let Some(a) = admitted {
+                        a.encoded(n, tiles.as_deref().unwrap_or_default());
+                    }
+                    tiles
+                })
+            })
+            .collect::<Result<_, _>>()
+    })
 }

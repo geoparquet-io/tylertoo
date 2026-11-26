@@ -77,6 +77,8 @@ Args:
     profile: Memory profile, as for `convert()`, applied to every
         GeoParquet band's convert and export. Changes memory use,
         not output bytes.
+    workers: See `export_pmtiles()`.
+    memory_limit: See `export_pmtiles()`.
     tile_format: See `export_pmtiles()`. Every band must have this
         format.
     mlt_profile: See `export_pmtiles()`.

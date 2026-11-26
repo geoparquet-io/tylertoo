@@ -20,7 +20,10 @@ impl From<Vec<u8>> for TileData {
 impl TileData {
     pub(super) fn gzipped(&mut self, cache: &TileGzipCache) -> io::Result<&[u8]> {
         if self.gzip.is_none() {
-            self.gzip = Some(cache.compress(&self.bytes)?);
+            let gzip = crate::tile_trace::stage(crate::tile_trace::Stage::Gzip, || {
+                cache.compress(&self.bytes)
+            })?;
+            self.gzip = Some(gzip);
         }
         Ok(self.gzip.as_deref().expect("filled above"))
     }

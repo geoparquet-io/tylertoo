@@ -127,6 +127,8 @@ Args:
     read_batch_size: See `overview()`.
     filter: See `overview()`.
     profile: See `overview()`.
+    workers: See `overview()`.
+    memory_limit: See `overview()`.
     in_flight_batches: See `overview()`.
     read_workers: See `overview()`.
     save_plan: See `overview()`.

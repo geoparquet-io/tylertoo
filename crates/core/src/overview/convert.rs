@@ -604,6 +604,36 @@ pub struct ConvertOptions {
     ))]
     #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a `--no-default-features` build uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
     pub profile: MemoryProfile,
+    /// Worker threads in the global Rayon pool (#876). `None` (default):
+    /// a positive `RAYON_NUM_THREADS`, else every core under `auto` and
+    /// `speed` and at most [`WORKER_THREADS_MAX`] under `bounded`
+    /// ([`resolve_worker_threads`]). `0` is refused. The pool is
+    /// process-wide: the first run in a process sizes it, and later runs
+    /// keep it. A set count also caps the core count the read workers,
+    /// in-flight batches and partition wave are sized from. Changes speed
+    /// and peak memory only.
+    ///
+    /// [`WORKER_THREADS_MAX`]: WORKER_THREADS_MAX
+    /// [`resolve_worker_threads`]: resolve_worker_threads
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "N", help_heading = "Memory & performance")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Worker threads for the whole run. Default: every core under `auto` and `speed`, at most 40 under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>", long_help = None))]
+    pub workers: Option<usize>,
+    /// Bytes of memory the run may use (#876), in place of the detected
+    /// figure (the smaller of the cgroup headroom and `MemAvailable`).
+    /// `None` (default): `TYLERTOO_AUTO_MEM_LIMIT_BYTES` if set, else the
+    /// detected figure. `0` is refused. Every memory probe of the run reads
+    /// it, through the process-wide override that options validation sets.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "SIZE",
+        value_parser = super::config::cli::parse_size_bytes,
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory the run may use, such as `24G`, in place of the detected available memory (cgroup limit or `MemAvailable`); overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit>", long_help = None))]
+    pub memory_limit: Option<usize>,
     /// Number of Arrow read batches allowed in flight through the streaming
     /// pass-2 pipeline at once. Pass 2 splits it in half (#494): one half is
     /// the read-ahead channel, the other the window of batches its consumers
@@ -995,6 +1025,8 @@ with_setters!(ConvertOptions {
     with_full_column_stats => full_column_stats: bool,
     with_read_batch_size => read_batch_size: usize,
     with_profile => profile: MemoryProfile,
+    with_workers => workers: Option<usize>,
+    with_memory_limit => memory_limit: Option<usize>,
     with_in_flight_batches => in_flight_batches: usize,
     with_read_workers => read_workers: usize,
     with_cluster => cluster: bool,
@@ -1050,8 +1082,8 @@ pub const IN_FLIGHT_BATCHES_MAX: usize = 16;
 
 /// Resolve a requested in-flight-batches value to a concrete depth.
 ///
-/// [`IN_FLIGHT_BATCHES_AUTO`] (0) auto-sizes from
-/// [`std::thread::available_parallelism`], clamped to
+/// [`IN_FLIGHT_BATCHES_AUTO`] (0) auto-sizes from the run's cores
+/// (`run_cores`), clamped to
 /// `[IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX]`; any explicit positive
 /// value is honoured verbatim (uncapped — the caller opted in to the memory
 /// cost), except that pass 2 under `bounded` holds at most 4 in flight. Output is byte-identical for every value: in-flight depth only sets
@@ -1061,9 +1093,7 @@ pub fn resolve_in_flight_batches(requested: usize) -> usize {
     if requested == IN_FLIGHT_BATCHES_AUTO {
         resolve_in_flight_batches_with_cores(
             requested,
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(IN_FLIGHT_BATCHES_MIN),
+            run_cores().unwrap_or(IN_FLIGHT_BATCHES_MIN),
         )
     } else {
         requested
@@ -1083,32 +1113,53 @@ pub(super) fn resolve_in_flight_batches_with_cores(requested: usize, cores: usiz
     }
 }
 
-/// Default ceiling on the worker pool a conversion runs on.
+/// `bounded`'s worker-pool width on a machine with more cores.
 ///
 /// Measured by sweeping `RAYON_NUM_THREADS` (merged perf/memory-batch build,
 /// quiet host, archives byte-identical at every width). At 40 workers wall is
 /// flat on all 16 cells against 64, and RSS is 9-21% lower (Moldova auto
-/// 3103 -> 2747 MiB, 3.36 -> 3.44 s). 32 saved more (Moldova auto 2453 MiB)
-/// but cost Moldova auto 6-8% wall; at 16, wall rose 25-37% on Moldova and
-/// wideprops. Past 40 the extra workers only add allocator memory each keeps
-/// for itself.
+/// 3103 -> 2747 MiB, 3.36 -> 3.44 s). Under `bounded` on the #876 build,
+/// 64 workers against 40 cost 13-26% more peak memory for 0-4% speed, so
+/// `bounded` keeps the cap; `auto` and `speed` take every core, since each
+/// extra worker costs them only 15-35 MB.
 ///
 /// shortcut: measured on one 64-core aarch64 host; re-sweep on other core
 /// counts and architectures before trusting the knee elsewhere.
 pub const WORKER_THREADS_MAX: usize = 40;
 
-/// Workers the global Rayon pool gets.
+/// Workers the global Rayon pool gets under `profile`.
 ///
-/// An explicit positive `RAYON_NUM_THREADS` wins, else the available cores
-/// capped at [`WORKER_THREADS_MAX`]. The CLI and the Python module size the pool with
-/// it ([`init_worker_pool`]). Only the pool: knobs that read
-/// `available_parallelism()` (read workers, in-flight batches, partition
-/// wave) keep the core count, as the sweep ran them.
-pub fn resolve_worker_threads() -> usize {
-    resolve_worker_threads_with(
-        std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
-        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-    )
+/// The `workers` option wins when set (validation refuses `0`), then a
+/// positive `RAYON_NUM_THREADS`, else
+/// `default_worker_threads` on the cores this process may use
+/// (`available_parallelism`, which honours affinity and a cgroup CPU
+/// quota). The CLI, the Python module and the core entry points size the
+/// pool with it ([`init_worker_pool`]). A count the caller chose also caps
+/// the widths sized from the core count (`run_cores`).
+pub fn resolve_worker_threads(profile: MemoryProfile, workers: Option<usize>) -> usize {
+    chosen_worker_threads(workers).unwrap_or_else(|| {
+        default_worker_threads(
+            profile,
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        )
+    })
+}
+
+/// The worker count the caller chose: `workers`, else a positive
+/// `RAYON_NUM_THREADS`.
+fn chosen_worker_threads(workers: Option<usize>) -> Option<usize> {
+    workers
+        .filter(|&n| n > 0)
+        .or_else(|| env_worker_threads(std::env::var("RAYON_NUM_THREADS").ok().as_deref()))
+}
+
+/// The pool width rule (#876): `auto` and `speed` every core, `bounded` at
+/// most [`WORKER_THREADS_MAX`].
+pub(super) fn default_worker_threads(profile: MemoryProfile, cores: usize) -> usize {
+    match profile {
+        MemoryProfile::Bounded => cores.min(WORKER_THREADS_MAX),
+        MemoryProfile::Auto | MemoryProfile::Speed => cores,
+    }
 }
 
 /// [`resolve_worker_threads`] on a given `RAYON_NUM_THREADS` value and core
@@ -1116,24 +1167,94 @@ pub fn resolve_worker_threads() -> usize {
 ///
 /// A value Rayon would ignore (unset, `0`, not a number)
 /// leaves the default.
-pub(super) fn resolve_worker_threads_with(env: Option<&str>, cores: usize) -> usize {
-    match env.and_then(|v| v.trim().parse::<usize>().ok()) {
-        Some(n) if n > 0 => n,
-        _ => cores.min(WORKER_THREADS_MAX),
-    }
+#[cfg(test)]
+pub(super) fn resolve_worker_threads_with(
+    env: Option<&str>,
+    cores: usize,
+    profile: MemoryProfile,
+) -> usize {
+    env_worker_threads(env).unwrap_or_else(|| default_worker_threads(profile, cores))
 }
 
-/// Build the global Rayon pool at [`resolve_worker_threads`] workers, before
-/// any parallel work.
+/// A `RAYON_NUM_THREADS` value Rayon would honour: a positive number.
+fn env_worker_threads(env: Option<&str>) -> Option<usize> {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// Build the global Rayon pool at [`resolve_worker_threads`] workers for
+/// `profile` and the `workers` option, before any parallel work.
 ///
 /// # Errors
 ///
 /// When the pool was already built (a host process such as Python may own
 /// it); callers may ignore it.
-pub fn init_worker_pool() -> Result<(), rayon::ThreadPoolBuildError> {
+pub fn init_worker_pool(
+    profile: MemoryProfile,
+    workers: Option<usize>,
+) -> Result<(), rayon::ThreadPoolBuildError> {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(resolve_worker_threads())
-        .build_global()
+        .num_threads(resolve_worker_threads(profile, workers))
+        .build_global()?;
+    if let Some(chosen) = chosen_worker_threads(workers) {
+        let _ = EXPLICIT_WORKERS.set(chosen);
+    }
+    Ok(())
+}
+
+/// The worker count the global pool was built at when the caller chose it
+/// (`workers` or `RAYON_NUM_THREADS`, #876); unset under a profile's rule.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#876: the global pool is process-wide, so the width it was built at is too"
+)]
+static EXPLICIT_WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// The cores this run may use (#876): the machine's
+/// ([`std::thread::available_parallelism`]), capped by a worker count the
+/// caller chose. Every width sized from the core count (read workers,
+/// in-flight batches, the partition wave, the read's decode plan) reads
+/// this, so lowering `workers` lowers them all. A profile's own pool rule
+/// (`bounded`'s 40) caps nothing here, so the defaults keep their widths.
+/// `None` when the machine's count is unknown, for each caller's fallback.
+pub(crate) fn run_cores() -> Option<usize> {
+    let cores = std::thread::available_parallelism().ok()?.get();
+    Some(run_cores_with(cores, EXPLICIT_WORKERS.get().copied()))
+}
+
+/// `run_cores` on a core count and a chosen worker count (test seam).
+pub(super) fn run_cores_with(cores: usize, workers: Option<usize>) -> usize {
+    workers.map_or(cores, |w| cores.min(w))
+}
+
+/// What a run's options set for the whole process (#876), applied by the
+/// top-level validations (convert, export, tiles, pyramid; see
+/// `config::validate_*`) once every rule of the whole configuration passed,
+/// so a rejected call changes nothing and a library caller gets them as the
+/// CLI and Python do, before any I/O. Nested checks (`check()`) never apply:
+///
+/// - `memory_limit`, when set, becomes the memory figure every probe reads
+///   ([`super::pipeline::set_memory_limit_option`]); unset leaves the
+///   figure as it was, so a run's internal options cannot clear it.
+/// - The global pool is built for `profile` and `workers`
+///   ([`init_worker_pool`]) by the first call off any Rayon pool; a pool a
+///   host or an earlier call built is kept, and a caller already on a
+///   pool's worker uses that pool.
+///
+/// shortcut: the pool is process-wide, so in one process (Python) the first
+/// run's profile and `workers` size it for every later run; upgrade to a
+/// per-run scoped pool when callers mix them in one process.
+pub(super) fn apply_run_resources(
+    profile: MemoryProfile,
+    workers: Option<usize>,
+    memory_limit: Option<usize>,
+) {
+    super::pipeline::set_memory_limit_option(memory_limit);
+    // `build_global` is itself once-only and synchronised: a concurrent
+    // second caller waits for the first build, then keeps that pool.
+    if rayon::current_thread_index().is_none() {
+        let _ = init_worker_pool(profile, workers);
+    }
 }
 
 /// Sentinel for [`ConvertOptions::read_workers`] requesting automatic sizing
@@ -1164,7 +1285,7 @@ pub fn read_workers_ceiling() -> usize {
 
 /// Resolve a requested reader-thread count (both passes, #717) to a concrete one.
 ///
-/// [`READ_WORKERS_AUTO`] (0) takes a QUARTER of the machine's cores, clamped
+/// [`READ_WORKERS_AUTO`] (0) takes a QUARTER of the run's cores (`run_cores`), clamped
 /// to `[1, READ_WORKERS_MAX]` — a quarter because pass 2's readers run
 /// alongside the rayon pool that does the per-batch simplification, and taking
 /// a larger share slows the compute it is feeding (12 cores → 3 readers). Any
@@ -1198,11 +1319,7 @@ pub fn resolve_read_workers(requested: usize) -> usize {
 ///
 /// Pass 2 was flat or faster at the same counts.
 pub(super) fn resolve_pass_read_workers(pass: ReadPass, requested: usize) -> usize {
-    resolve_read_workers_with_cores(
-        pass,
-        requested,
-        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-    )
+    resolve_read_workers_with_cores(pass, requested, run_cores().unwrap_or(1))
 }
 
 /// [`resolve_pass_read_workers`], parameterized on the detected core count
@@ -1271,6 +1388,7 @@ impl ConvertOptions {
     }
 
     pub(crate) fn check(&self) -> Result<(), ConvertError> {
+        super::config::check_run_resources(self.workers, self.memory_limit)?;
         validate_options(self)?;
         self.levels.resolve(self.gsd_base)?;
         Ok(())
@@ -1669,6 +1787,8 @@ impl Default for ConvertOptions {
             full_column_stats: false,
             read_batch_size: DEFAULT_READ_BATCH_SIZE,
             profile: MemoryProfile::Auto,
+            workers: None,
+            memory_limit: None,
             in_flight_batches: IN_FLIGHT_BATCHES_AUTO,
             read_workers: READ_WORKERS_AUTO,
             cluster: false,
@@ -13015,16 +13135,81 @@ mod tests {
         }
     }
 
-    /// The worker pool defaults to the cores capped at 40; an explicit
+    /// The worker pool defaults to every core under `auto` and `speed` and
+    /// to the cores capped at 40 under `bounded` (#876); an explicit
     /// `RAYON_NUM_THREADS` wins, and one Rayon ignores leaves the default.
     #[test]
     fn worker_threads_cap_the_cores_unless_rayon_num_threads_is_set() {
-        assert_eq!(resolve_worker_threads_with(None, 64), 40);
-        assert_eq!(resolve_worker_threads_with(None, 8), 8);
-        assert_eq!(resolve_worker_threads_with(Some("64"), 64), 64);
-        assert_eq!(resolve_worker_threads_with(Some("4"), 64), 4);
-        assert_eq!(resolve_worker_threads_with(Some("0"), 64), 40);
-        assert_eq!(resolve_worker_threads_with(Some("x"), 8), 8);
+        use MemoryProfile::{Auto, Bounded, Speed};
+        let w = resolve_worker_threads_with;
+        assert_eq!(w(None, 64, Bounded), 40);
+        assert_eq!(w(None, 8, Bounded), 8);
+        assert_eq!(w(None, 64, Auto), 64);
+        assert_eq!(w(None, 96, Speed), 96);
+        assert_eq!(w(None, 1, Auto), 1);
+        assert_eq!(w(Some("64"), 64, Bounded), 64);
+        assert_eq!(w(Some("4"), 64, Auto), 4);
+        assert_eq!(w(Some("0"), 64, Bounded), 40);
+        assert_eq!(w(Some("x"), 8, Auto), 8);
+        // #876: the `workers` option wins over everything.
+        assert_eq!(resolve_worker_threads(Bounded, Some(3)), 3);
+        assert_eq!(resolve_worker_threads(Speed, Some(200)), 200);
+    }
+
+    /// #876: a chosen worker count caps the cores every core-derived width
+    /// is sized from, so on 64 cores `workers = 12` sizes the readers and
+    /// in-flight batches as a 12-core host would; unchosen, nothing changes.
+    #[test]
+    fn chosen_workers_size_core_derived_widths_as_a_smaller_host() {
+        assert_eq!(run_cores_with(64, None), 64);
+        assert_eq!(run_cores_with(64, Some(12)), 12);
+        assert_eq!(run_cores_with(8, Some(48)), 8);
+        let read = |cores| {
+            [ReadPass::Scan, ReadPass::Build]
+                .map(|pass| resolve_read_workers_with_cores(pass, READ_WORKERS_AUTO, cores))
+        };
+        let in_flight = |cores| resolve_in_flight_batches_with_cores(IN_FLIGHT_BATCHES_AUTO, cores);
+        assert_eq!(read(run_cores_with(4, None)), [2, 1]);
+        assert_eq!(read(run_cores_with(64, Some(4))), [2, 1]);
+        assert_eq!(in_flight(run_cores_with(64, None)), 16);
+        assert_eq!(in_flight(run_cores_with(64, Some(12))), 12);
+    }
+
+    /// #876: `workers` and `memory_limit` of 0 are refused at validation, on
+    /// convert and export alike; unset and positive values pass.
+    #[test]
+    fn zero_workers_or_memory_limit_is_refused() {
+        let msg = |e: &dyn std::fmt::Display| e.to_string();
+        let convert = |workers, memory_limit| {
+            let o = ConvertOptions {
+                workers,
+                memory_limit,
+                ..ConvertOptions::default()
+            };
+            o.check().err().map(|e| msg(&e))
+        };
+        let export = |workers, memory_limit| {
+            let o = super::super::export::ExportOptions {
+                workers,
+                memory_limit,
+                ..Default::default()
+            };
+            o.check().err().map(|e| msg(&e))
+        };
+        for check in [&convert as &dyn Fn(_, _) -> _, &export] {
+            assert_eq!(check(None, None), None);
+            assert_eq!(check(Some(4), Some(1 << 30)), None);
+            let workers = check(Some(0), None).expect("0 workers");
+            assert!(
+                workers.contains("--workers / workers must be at least 1"),
+                "{workers}"
+            );
+            let limit = check(None, Some(0)).expect("0 bytes");
+            assert!(
+                limit.contains("--memory-limit / memory_limit must be more than 0"),
+                "{limit}"
+            );
+        }
     }
 
     #[test]

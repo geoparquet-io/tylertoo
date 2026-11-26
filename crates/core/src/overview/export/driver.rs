@@ -273,6 +273,7 @@ impl ExportProgress {
     /// Attribute every sample the background sampler takes from now on to
     /// `phase`, until the next call. A no-op when profiling is off.
     pub(super) fn enter_phase(&mut self, phase: &'static str) {
+        crate::tile_trace::event("phase", || serde_json::json!({ "phase": phase }));
         if let Some(sampler) = &self.rss_sampler {
             sampler.mark_phase(phase);
             self.close_stage_phase();
@@ -557,6 +558,7 @@ pub(super) fn export_level(
     let timers = &progress.profile.timers;
 
     let t_tiles = Instant::now();
+    let t_level = crate::tile_trace::mark();
     let ctx = level.level_ctx(timers);
     let mut tally = LevelTally::default();
     let total_waves = plan.wave_count();
@@ -566,11 +568,11 @@ pub(super) fn export_level(
     let mut last_wave_log = Instant::now();
     let (mut level_store, level_grants) = match level.level_read {
         Some(read) if store.is_none() && total_waves > 1 => {
+            let t_fill = Instant::now();
             let (backing, grants) = level_read_backing(read, plan, budget, 0);
-            (
-                Some(fill_level_store(&ctx, plan, backing, diagnostics)?),
-                grants,
-            )
+            let filled = fill_level_store(&ctx, plan, backing, diagnostics)?;
+            trace_fill(t_fill, level, false);
+            (Some(filled), grants)
         }
         _ => (None, Vec::new()),
     };
@@ -580,13 +582,16 @@ pub(super) fn export_level(
         (None, None) => 0,
     };
     for (wave_idx, wave) in plan.waves().enumerate() {
-        let results: Vec<Vec<EncodedTile>> = match (level_store.as_mut(), store.as_deref_mut()) {
-            (Some(s), _) => encode_wave_from_store(s, 0, &ctx, wave_idx, wave, diagnostics)?,
-            (None, Some(s)) => {
-                encode_wave_from_store(s, level_idx, &ctx, wave_idx, wave, diagnostics)?
-            }
-            (None, None) => process_wave(&ctx, wave, diagnostics)?,
-        };
+        let results: Vec<Vec<EncodedTile>> = crate::tile_trace::job(
+            || crate::tile_trace::Ctx::wave(level_idx, zoom, wave_idx),
+            || match (level_store.as_mut(), store.as_deref_mut()) {
+                (Some(s), _) => encode_wave_from_store(s, 0, &ctx, wave_idx, wave, diagnostics),
+                (None, Some(s)) => {
+                    encode_wave_from_store(s, level_idx, &ctx, wave_idx, wave, diagnostics)
+                }
+                (None, None) => process_wave(&ctx, wave, diagnostics),
+            },
+        )?;
         write_encoded_tiles(writer, zoom, &results, level.terminals, &mut tally, timers)?;
 
         if last_wave_log.elapsed() >= WAVE_LOG_INTERVAL {
@@ -605,6 +610,17 @@ pub(super) fn export_level(
     for grant in level_grants {
         budget.release(grant);
     }
+    crate::tile_trace::span("serial_level", t_level, || {
+        let mut v = wave_fields(level, 0);
+        v["waves"] = plan.wave_count().into();
+        v["members"] = plan
+            .partitions
+            .iter()
+            .map(|p| p.members)
+            .sum::<usize>()
+            .into();
+        v
+    });
     Ok(finish_level(
         level,
         &tally,
@@ -657,8 +673,10 @@ pub(super) fn build_fills_if_asked(
         coverage_fill::WORKSPACE_WANT_BYTES,
         coverage_fill::WORKSPACE_FLOOR_BYTES,
     );
+    let t_fill = crate::tile_trace::mark();
     let built =
         coverage_fill::build_fill_map(last, first.plan.zoom, grant.bytes(), timers, diagnostics);
+    crate::tile_trace::span("fill", t_fill, || serde_json::json!({ "kind": "coverage" }));
     budget.release(grant);
     built.map(Some)
 }
@@ -701,6 +719,7 @@ pub(super) fn export_level_groups(
                 ..*l
             })
             .collect();
+        let t_group = crate::tile_trace::mark();
         zooms.extend(export_level_group(
             writer,
             LevelMemory {
@@ -713,6 +732,14 @@ pub(super) fn export_level_groups(
             progress,
             diagnostics,
         )?);
+        crate::tile_trace::span("group", t_group, || {
+            serde_json::json!({
+                "levels": group_levels.iter().map(|l| l.level_idx).collect::<Vec<_>>(),
+                "zooms": group_levels.iter().map(|l| l.plan.zoom).collect::<Vec<_>>(),
+                "cap": gate.cap,
+                "single_wave_cap": gate.single_wave_cap,
+            })
+        });
     }
     Ok(zooms)
 }
@@ -850,6 +877,7 @@ pub(super) fn export_level_group(
                             fill_level_store(&ctx, level.plan, backing, diagnostics)
                                 .map_err(|e| (i, e))?,
                         );
+                        trace_fill(t_fill, level, early);
                     }
                     Ok(t_fill.elapsed().as_secs_f64())
                 };
@@ -867,9 +895,11 @@ pub(super) fn export_level_group(
                     0.0
                 };
                 if multi_wave {
-                    in_flight.wait_until(|| {
-                        let c = lock_commit(&commit, &timers);
-                        c.error.is_some() || c.written + 1 >= unit
+                    gate_wait(("window_wait", level, w), &in_flight, || {
+                        in_flight.wait_until(|| {
+                            let c = lock_commit(&commit, &timers);
+                            c.error.is_some() || c.written + 1 >= unit
+                        });
                     });
                     if lock_commit(&commit, &timers).error.is_some() {
                         break 'levels;
@@ -879,9 +909,13 @@ pub(super) fn export_level_group(
                     // The store's grant is sized beside this level's widest
                     // wave only, so it fills once every earlier wave is
                     // encoded: the grant plus one wave, as in the serial loop.
-                    drop(in_flight.wait_for(|held| held == 0));
+                    gate_wait(("drain_wait", level, w), &in_flight, || {
+                        drop(in_flight.wait_for(|held| held == 0));
+                    });
                 }
-                let held = in_flight.admit(wave.iter().map(|p| p.members).sum());
+                let held = gate_wait(("admit_wait", level, w), &in_flight, || {
+                    in_flight.admit(wave.iter().map(|p| p.members).sum())
+                });
                 // The level's wall starts with its fill.
                 let start = if early { fill_start } else { Instant::now() };
                 let t_collect = Instant::now();
@@ -903,6 +937,7 @@ pub(super) fn export_level_group(
                     diagnostics,
                 )
                 .map_err(|e| (i, e))?;
+                trace_wave("collected", level, w);
                 // The fill is timed on its own: an early one does not count
                 // the waits between it and the wave's admission.
                 let collect_secs = t_collect.elapsed().as_secs_f64() + fill_secs;
@@ -921,55 +956,60 @@ pub(super) fn export_level_group(
                     .filter(|next| level_waves(next.plan) > 1 && store.is_none())
                     .map(|next| next.level_idx);
                 let (commit, timers, in_flight) = (&commit, &*timers, &in_flight);
+                trace_wave("spawned", level, w);
                 scope.spawn(move |_| {
-                    #[cfg(test)]
-                    if let Some(next) = next_fill {
-                        hold_for_fill(level.work, next);
-                    }
-                    #[cfg(test)]
-                    if (i, w) == (0, 0) {
-                        stall_first_wave(level.work, commit, levels.len());
-                    }
-                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let t_encode = Instant::now();
-                        let tiles = encode_buckets(
-                            level.gzip_cache,
-                            (buckets, Some(&held)),
-                            level.plan.zoom,
-                            &TileEncoding::single(level.options).with_floors(level.floors),
-                            level.fills,
-                            timers,
-                            diagnostics,
-                        );
-                        // The tiles' share of the cap goes with them until
-                        // written; a failed wave's goes back with `held`.
-                        let queued = if tiles.is_ok() { held.take_queued() } else { 0 };
-                        drop(held);
-                        let encoded = tiles.map(|tiles| EncodedWave {
-                            tiles,
-                            start,
-                            collect_secs,
-                            encode_secs: t_encode.elapsed().as_secs_f64(),
-                            spill_bytes,
-                            queued,
-                        });
-                        lock_commit(commit, timers).finish((i, w), encoded);
-                    }));
-                    let freed = {
-                        let mut c = lock_commit(commit, timers);
-                        if run.is_err() {
-                            // The collect may wait on this wave's write: fail
-                            // the group so it stops, then let Rayon re-raise.
-                            let e = std::io::Error::other("a wave's encode or write panicked");
-                            c.fail(i, ExportError::Io(e));
+                    wave_job(level, w, || {
+                        #[cfg(test)]
+                        if let Some(next) = next_fill {
+                            hold_for_fill(level.work, next);
                         }
-                        std::mem::take(&mut c.freed)
-                    };
-                    in_flight.release(freed);
-                    in_flight.notify();
-                    if let Err(panic) = run {
-                        std::panic::resume_unwind(panic);
-                    }
+                        #[cfg(test)]
+                        if (i, w) == (0, 0) {
+                            stall_first_wave(level.work, commit, levels.len());
+                        }
+                        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let t_encode = Instant::now();
+                            let tiles = encode_buckets(
+                                level.gzip_cache,
+                                (buckets, Some(&held)),
+                                level.plan.zoom,
+                                &TileEncoding::single(level.options).with_floors(level.floors),
+                                level.fills,
+                                timers,
+                                diagnostics,
+                            );
+                            let encoded_ns = trace_wave("encoded", level, w);
+                            // The tiles' share of the cap goes with them until
+                            // written; a failed wave's goes back with `held`.
+                            let queued = if tiles.is_ok() { held.take_queued() } else { 0 };
+                            drop(held);
+                            let encoded = tiles.map(|tiles| EncodedWave {
+                                tiles,
+                                start,
+                                collect_secs,
+                                encode_secs: t_encode.elapsed().as_secs_f64(),
+                                spill_bytes,
+                                queued,
+                                encoded_ns,
+                            });
+                            lock_commit(commit, timers).finish((i, w), encoded);
+                        }));
+                        let freed = {
+                            let mut c = lock_commit(commit, timers);
+                            if run.is_err() {
+                                // The collect may wait on this wave's write: fail
+                                // the group so it stops, then let Rayon re-raise.
+                                let e = std::io::Error::other("a wave's encode or write panicked");
+                                c.fail(i, ExportError::Io(e));
+                            }
+                            std::mem::take(&mut c.freed)
+                        };
+                        in_flight.release(freed);
+                        in_flight.notify();
+                        if let Err(panic) = run {
+                            std::panic::resume_unwind(panic);
+                        }
+                    })
                 });
                 unit += 1;
             }
@@ -1039,6 +1079,72 @@ pub(super) fn stall_first_wave(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// #876: a wave's identity and size in the trace.
+pub(super) fn wave_fields(level: &ExportLevelCtx<'_>, w: usize) -> serde_json::Value {
+    let wave = level.plan.wave(w);
+    serde_json::json!({
+        "level": level.level_idx,
+        "zoom": level.plan.zoom,
+        "wave": w,
+        "members": wave.iter().map(|p| p.members).sum::<usize>(),
+        "partitions": wave.len(),
+    })
+}
+
+/// #876: a `wave` lifecycle event, and when it was, if tracing.
+pub(super) fn trace_wave(stage: &str, level: &ExportLevelCtx<'_>, w: usize) -> Option<u64> {
+    let t = crate::tile_trace::mark();
+    crate::tile_trace::event("wave", || {
+        let mut v = wave_fields(level, w);
+        v["stage"] = stage.into();
+        v
+    });
+    t
+}
+
+/// #876: run wave `w`'s encode task as a traced job, its tiles placed in
+/// the wave.
+pub(super) fn wave_job<R>(level: &ExportLevelCtx<'_>, w: usize, task: impl FnOnce() -> R) -> R {
+    let ctx = || crate::tile_trace::Ctx::wave(level.level_idx, level.plan.zoom, w);
+    crate::tile_trace::job(ctx, || {
+        trace_wave("started", level, w);
+        task()
+    })
+}
+
+/// #876: run a collect's `wait` on the group's gate as trace event `ev`,
+/// with the members `held` when it ended (an admission's included).
+pub(super) fn gate_wait<R>(
+    (ev, level, w): (&'static str, &ExportLevelCtx<'_>, usize),
+    gate: &InFlight,
+    wait: impl FnOnce() -> R,
+) -> R {
+    let start = crate::tile_trace::mark();
+    let r = wait();
+    crate::tile_trace::span(ev, start, || {
+        let mut v = wave_fields(level, w);
+        v["held"] = gate.held().into();
+        v["cap"] = gate.cap.into();
+        v
+    });
+    r
+}
+
+/// #876: a level's one-level store fill, started at `t_fill`.
+pub(super) fn trace_fill(t_fill: Instant, level: &ExportLevelCtx<'_>, early: bool) {
+    let start = crate::tile_trace::mark().map(|now| {
+        now.saturating_sub(u64::try_from(t_fill.elapsed().as_nanos()).unwrap_or(u64::MAX))
+    });
+    crate::tile_trace::span("fill", start, || {
+        serde_json::json!({
+            "kind": "level_store",
+            "level": level.level_idx,
+            "zoom": level.plan.zoom,
+            "early": early,
+        })
+    });
 }
 
 /// How a level group runs ([`export_level_group`]): the [`InFlight`] cap
@@ -1297,6 +1403,8 @@ pub(super) struct EncodedWave {
     /// The members of the group's [`InFlight`] cap the encoded tiles keep
     /// until they are written ([`InFlight::queued_share`]).
     pub(super) queued: usize,
+    /// #876: when the encode finished, when tracing.
+    pub(super) encoded_ns: Option<u64>,
 }
 
 /// The level [`GroupCommit`] is writing: its tally and times so far.
@@ -1410,6 +1518,11 @@ impl GroupCommit<'_> {
         }
         open.collect_secs += encoded.collect_secs;
         open.encode_secs += encoded.encode_secs;
+        crate::tile_trace::span("commit_wait", encoded.encoded_ns, || {
+            let mut v = wave_fields(level, w);
+            v["queued"] = encoded.queued.into();
+            v
+        });
         let timers = &self.progress.profile.timers;
         let zoom = level.plan.zoom;
         write_encoded_tiles(
@@ -1421,6 +1534,7 @@ impl GroupCommit<'_> {
             timers,
         )?;
         drop(encoded.tiles);
+        trace_wave("written", level, w);
         self.written += 1;
         let waves = level_waves(level.plan);
         if w + 1 < waves {

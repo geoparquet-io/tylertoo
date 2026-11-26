@@ -91,9 +91,9 @@ fn write_points(path: &Path) {
     w.close().expect("close fixture");
 }
 
-/// Run `export-pmtiles` on `overview`, with `mem_limit` as the RAM probe's
-/// override when given. Returns (success, stderr).
-fn export(overview: &Path, out: &Path, mem_limit: Option<&str>) -> (bool, String) {
+/// Run `export-pmtiles` on `overview` with `args`, with `mem_limit` as the
+/// RAM probe's env override when given. Returns (success, stderr).
+fn export(overview: &Path, out: &Path, mem_limit: Option<&str>, args: &[&str]) -> (bool, String) {
     let mut cmd = Command::new(tylertoo_bin());
     cmd.args([
         "export-pmtiles",
@@ -102,6 +102,7 @@ fn export(overview: &Path, out: &Path, mem_limit: Option<&str>) -> (bool, String
         "--max-tile-size",
         "500000",
     ])
+    .args(args)
     .env_remove("TYLERTOO_AUTO_MEM_LIMIT_BYTES");
     if let Some(limit) = mem_limit {
         cmd.env("TYLERTOO_AUTO_MEM_LIMIT_BYTES", limit);
@@ -142,10 +143,10 @@ fn export_warns_when_a_tile_exceeds_the_override() {
     // 5k members at several hundred resident bytes each is a few MB,
     // past a 1 MB override even serially.
     let warned = dir.path().join("warned.pmtiles");
-    let (ok, stderr) = export(&overview, &warned, Some("1000000"));
+    let (ok, stderr) = export(&overview, &warned, Some("1000000"), &[]);
     assert!(ok, "the override only warns:\n{stderr}");
     for needle in [
-        "continuing because the memory figure is the TYLERTOO_AUTO_MEM_LIMIT_BYTES override",
+        "continuing because the memory figure is the --memory-limit / TYLERTOO_AUTO_MEM_LIMIT_BYTES override",
         "overview level 0 (z0) cannot fit in memory",
         "z0/0/0",
         "--verbatim",
@@ -161,11 +162,110 @@ fn export_warns_when_a_tile_exceeds_the_override() {
 
     // The same file exports when the probe is left to the machine.
     let exported = dir.path().join("exported.pmtiles");
-    let (ok, stderr) = export(&overview, &exported, None);
+    let (ok, stderr) = export(&overview, &exported, None, &[]);
     assert!(ok, "export must succeed with real RAM:\n{stderr}");
     assert!(
         !stderr.contains("cannot fit in memory"),
         "5k points fit in real RAM:\n{stderr}"
     );
     assert!(exported.exists());
+}
+
+/// #876: `--memory-limit` is the same override as the env var and wins over
+/// it, so the export's own memory check reads the flag: 1 MB warns even
+/// with the env var claiming 1 TiB.
+#[test]
+fn the_memory_limit_flag_overrides_the_env_var() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("points.parquet");
+    write_points(&input);
+    let overview = dir.path().join("overview.parquet");
+    let status = Command::new(tylertoo_bin())
+        .args([
+            "overview",
+            input.to_str().unwrap(),
+            overview.to_str().unwrap(),
+            "--min-zoom",
+            "0",
+            "--max-zoom",
+            "2",
+            "--verbatim",
+        ])
+        .env_remove("TYLERTOO_AUTO_MEM_LIMIT_BYTES")
+        .output()
+        .expect("run tylertoo overview");
+    assert!(status.status.success());
+    for env in [None, Some("1099511627776")] {
+        let out = dir.path().join("flag.pmtiles");
+        let (ok, stderr) = export(
+            &overview,
+            &out,
+            env,
+            &["--memory-limit", "1000000", "--force"],
+        );
+        assert!(ok, "{env:?}: the override only warns:\n{stderr}");
+        assert!(
+            stderr.contains("overview level 0 (z0) cannot fit in memory"),
+            "{env:?}: the flag sets the figure:\n{stderr}"
+        );
+    }
+}
+
+/// #876: `--workers 0` and `--memory-limit 0` (or an unparseable size) are
+/// refused before any I/O, as usage errors (exit 2): the input does not
+/// exist, and pyramid's `--work-dir` is a file its probe would refuse.
+#[test]
+fn zero_workers_and_memory_limit_are_refused_before_any_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.parquet");
+    let out = dir.path().join("out.pmtiles");
+    let not_a_dir = dir.path().join("not-a-dir");
+    std::fs::write(&not_a_dir, b"").unwrap();
+    let (missing, out) = (missing.to_str().unwrap(), out.to_str().unwrap());
+    let band = format!("0-2:{missing}");
+    let pyramid = |flag: &'static str| -> Vec<String> {
+        [
+            "pyramid",
+            out,
+            "--band",
+            band.as_str(),
+            "--work-dir",
+            not_a_dir.to_str().unwrap(),
+            flag,
+            "0",
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    let run = |command: &str, flag: &str, value: &str| -> Vec<String> {
+        [command, missing, out, flag, value]
+            .map(String::from)
+            .to_vec()
+    };
+    let workers = "--workers / workers must be at least 1";
+    let memory = "--memory-limit / memory_limit must be more than 0 bytes";
+    for (args, needle) in [
+        (run("tiles", "--workers", "0"), workers),
+        (run("export-pmtiles", "--workers", "0"), workers),
+        (pyramid("--workers"), workers),
+        (run("tiles", "--memory-limit", "0"), memory),
+        (run("export-pmtiles", "--memory-limit", "0"), memory),
+        (pyramid("--memory-limit"), memory),
+        (
+            run("tiles", "--memory-limit", "lots"),
+            "Invalid size: 'lots'",
+        ),
+    ] {
+        let output = Command::new(tylertoo_bin())
+            .args(&args)
+            .output()
+            .expect("run tylertoo");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains(needle), "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("missing.parquet") && !stderr.contains("not-a-dir"),
+            "{args:?} touched the input or work dir: {stderr}"
+        );
+    }
 }

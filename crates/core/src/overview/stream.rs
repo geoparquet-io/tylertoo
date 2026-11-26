@@ -362,9 +362,7 @@ fn resolve_and_log_in_flight_batches(
     let in_flight = cap(super::convert::resolve_in_flight_batches(requested));
     log::info!(
         "[convert] {phase} parallelism: {in_flight} read batch(es) in flight ({} core(s) detected)",
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(0)
+        super::convert::run_cores().unwrap_or(0)
     );
     in_flight
 }
@@ -563,6 +561,8 @@ struct TimelineSample {
     cpu_secs: Option<f64>,
     rss_bytes: Option<u64>,
     io: Option<ProcIo>,
+    /// #876: threads doing traced tile work, when `TYLERTOO_TILE_TRACE` is on.
+    busy: Option<u32>,
 }
 
 /// Samples a timeline keeps before it halves itself.
@@ -766,6 +766,7 @@ impl RssSampler {
                     cpu_secs: tick.cpu.map(|(u, s)| u + s),
                     rss_bytes: mib.map(|m| (m * 1024.0 * 1024.0) as u64),
                     io: tick.io,
+                    busy: crate::tile_trace::occupancy(),
                 });
             }
             // A timeout is the next tick; a message or a dropped sender
@@ -4621,6 +4622,7 @@ fn timeline_row(s: &TimelineSample) -> serde_json::Value {
         s.io.map(|io| io.read_bytes),
         s.io.map(|io| io.write_bytes),
         s.io.map(|io| io.rchar),
+        s.busy,
     ])
 }
 
@@ -7801,7 +7803,7 @@ pub(super) fn process_batch_cascade(
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     /// #852: a geometry several levels keep unchanged (one `Arc`, #499) is
     /// pooled once, and each level indexes its own geometries in order.
     #[test]
@@ -8229,7 +8231,7 @@ mod tests {
 
     /// #543 review (S1-1): the production preflight must not touch
     /// `pipeline::available_memory_bytes` — its process-wide cache is meant
-    /// to hold post-pass-1 headroom, and a pre-scan call would freeze a
+    /// to hold export-start headroom, and a pre-scan call would freeze a
     /// near-empty-cgroup figure for every later `auto` decision. Counted
     /// per thread, so parallel tests warming the cache cannot race this.
     #[test]
@@ -9256,11 +9258,17 @@ mod tests {
     /// `effective_cores` (#810). nextest already
     /// gives each test its own process; the re-exec is harmless there.
     fn run_alone(test: &str) -> bool {
+        run_alone_in(module_path!(), test)
+    }
+
+    /// [`run_alone`] for a test of another module: `module` is its
+    /// `module_path!()`.
+    pub(in crate::overview) fn run_alone_in(module: &str, test: &str) -> bool {
         const CHILD: &str = "TYLERTOO_RSS_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
             return true;
         }
-        let (_, module) = module_path!().split_once("::").expect("crate::module path");
+        let (_, module) = module.split_once("::").expect("crate::module path");
         let name = format!("{module}::{test}");
         let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
             .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
@@ -9611,7 +9619,8 @@ mod tests {
             assert!((p["utilization"].as_f64().unwrap() - eff / threads).abs() < 1e-9);
         }
         let row = &v["timeline"][0];
-        assert_eq!(row.as_array().map(Vec::len), Some(6), "{v}");
+        // #876 added the tile trace's busy column (null when untraced).
+        assert_eq!(row.as_array().map(Vec::len), Some(7), "{v}");
     }
 
     /// #810: each stage sum counts every disjoint stage exactly once. Each
@@ -9672,6 +9681,7 @@ mod tests {
             cpu_secs: None,
             rss_bytes: None,
             io: None,
+            busy: None,
         };
         for i in 0..TIMELINE_CAP * 3 {
             tl.push(sample(i as f64));
