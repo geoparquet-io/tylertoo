@@ -968,7 +968,7 @@ fn stable_hash(index: usize) -> u64 {
 
 /// Integer grid cell key. Includes the kind discriminant so per-kind grids
 /// (which have different cell sizes) never share a bucket.
-type CellKey = (u8, i64, i64);
+pub(super) type CellKey = (u8, i64, i64);
 
 /// The [`Priority::sort_rank`] value that means "this feature has no sort key".
 ///
@@ -1037,7 +1037,12 @@ impl Priority {
     /// three columns, not the six a whole [`FeatureRow`] carries; routing
     /// both through one body keeps the two paths bit-identical.
     #[inline]
-    fn from_parts(sort_key: f64, diag_sq: f64, index: usize, dir: SortDirection) -> Self {
+    pub(super) fn from_parts(
+        sort_key: f64,
+        diag_sq: f64,
+        index: usize,
+        dir: SortDirection,
+    ) -> Self {
         // A non-finite key is a MISSING key (#428). The extractors upstream
         // already file NaN/±inf under `None`, but `AssignFeature::sort_key`
         // is reachable from the public `assign_levels` API and from
@@ -1120,7 +1125,7 @@ impl Priority {
 }
 
 /// Where one feature lands in one level's winner grid.
-enum Placement {
+pub(super) enum Placement {
     /// Ineligible at this level (ladder feature, gated out, degenerate cell).
     Skip,
     /// Thinning disabled for this kind — the feature wins unconditionally.
@@ -1133,7 +1138,7 @@ enum Placement {
 /// shared verbatim by the serial and the parallel build so the two cannot
 /// drift.
 #[inline]
-fn place_feature(
+pub(super) fn place_feature(
     feat: FeatureRow,
     config: &AssignConfig,
     gsd_units: f64,

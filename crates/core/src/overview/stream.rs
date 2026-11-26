@@ -40,6 +40,7 @@ use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, Ac
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
 };
+use super::assign_stream::{StreamAssigned, StreamAssigner};
 use super::cluster::{ClusterEntry, ClusterTables};
 use super::coalesce::{
     chain_stage_resident_bytes, collected_line_bytes, CoalesceInput, ExactChains,
@@ -106,6 +107,11 @@ struct Pass1Keys<'a> {
     /// The budget the category interner is charged to, and the feature
     /// table's bytes already resident.
     budget: (&'a MemoryBudget, u64),
+    /// Whether the row-indexed ranking keys and class groups are kept. A
+    /// streamed assignment (#928) never reads them: its lines run only under
+    /// the size fallback, and its polygons never contest a cell. The vocab
+    /// scan still runs, so the ranking provenance is unchanged.
+    retain_keys: bool,
 }
 
 struct Pass1Accum<'a> {
@@ -117,6 +123,9 @@ struct Pass1Accum<'a> {
     skipped_rows: &'a mut usize,
     /// #802: each chunk's polygon vertex occurrences, for the junction pins.
     junctions: &'a mut Vec<Vec<Occurrence>>,
+    /// #928: the streamed assignment, which takes each chunk's features in
+    /// place of `features`.
+    stream: Option<&'a mut StreamAssigner>,
 }
 
 struct WriterProvenance<'a> {
@@ -1266,7 +1275,7 @@ fn polygon_area_f32(g: &Geometry<f64>) -> f32 {
 /// The accumulator's per-level settings: enabled on every planned level but
 /// the finest where the collapse mode and the level's representation draw
 /// placeholder squares.
-fn accumulate_levels(
+pub(super) fn accumulate_levels(
     options: &ConvertOptions,
     level_specs: &[(f64, Option<u8>)],
     level_reprs: &[Representation],
@@ -2685,6 +2694,39 @@ fn resolve_winner_tables(
     // pass 2. `take` drops every column outright, which is what the old
     // `clear` + `shrink_to_fit` pair was reaching for.
     *features = FeatureTable::new();
+    let (counts, coalesce_build) =
+        level_counts(ctx, hist, &carriers, coalesce_scratch, &level_specs, rss);
+
+    Ok(WinnerTables {
+        level_specs,
+        cluster_tables,
+        cluster_categories,
+        kinds,
+        coalesce_build,
+        min_levels,
+        counts,
+        carriers,
+        finest,
+        junctions: None,
+    })
+}
+
+/// Per-level row counts from the per-level winner histogram (`hist`): made
+/// cumulative in duplicating mode, plus each level's carriers, plus the
+/// coalesced chain counts (which also builds the chain tables, #570). Shared
+/// by the table and the streamed (#928) assignment.
+fn level_counts(
+    ctx: &Pass1Ctx<'_>,
+    hist: Vec<usize>,
+    carriers: &[Vec<usize>],
+    coalesce_scratch: Option<CoalesceScratch>,
+    level_specs: &[(f64, Option<u8>)],
+    rss: &mut RssTracker,
+) -> (Vec<usize>, Option<CoalesceBuild>) {
+    let memory = *ctx.budget;
+    let crs = ctx.crs;
+    let options = ctx.config.options();
+    let diagnostics = ctx.diagnostics;
     let mut counts: Vec<usize> = match options.mode {
         Mode::Duplicating => hist
             .iter()
@@ -2697,14 +2739,14 @@ fn resolve_winner_tables(
     };
     // #384: carriers are members of their level only (not of finer ones —
     // there the feature is either a real member already or absent).
-    for (count, level_carriers) in counts.iter_mut().zip(&carriers) {
+    for (count, level_carriers) in counts.iter_mut().zip(carriers) {
         *count += level_carriers.len();
     }
     let mut coalesce_build = None;
     if let Some(scratch) = coalesce_scratch {
         // Duplicating only (partitioning + coalescing is rejected upstream).
         let (chain_counts, build) =
-            coalesce_level_counts(memory, &scratch, &level_specs, crs, options, diagnostics);
+            coalesce_level_counts(memory, &scratch, level_specs, crs, options, diagnostics);
         for (count, chains) in counts.iter_mut().zip(chain_counts) {
             *count += chains;
         }
@@ -2716,10 +2758,70 @@ fn resolve_winner_tables(
         rss.log_phase("coalesce chain stage");
     }
 
+    (counts, coalesce_build)
+}
+
+/// #928: the [`WinnerTables`] of a streamed assignment. Everything the
+/// table path computes after `min_levels` and the carriers is computed the
+/// same way here; the cluster stage never runs (the gate excludes it).
+fn resolve_streamed_winner_tables(
+    ctx: &Pass1Ctx<'_>,
+    assigned: StreamAssigned,
+    coalesce_scratch: Option<CoalesceScratch>,
+    line_tally: (usize, u64),
+    rss: &mut RssTracker,
+) -> Result<WinnerTables, ConvertError> {
+    let options = ctx.config.options();
+    let level_specs = options.levels.resolve(options.gsd_base)?;
+    let num_levels = level_specs.len();
+    let finest = num_levels.saturating_sub(1);
+    let StreamAssigned {
+        min_levels,
+        kinds,
+        carriers,
+        memory,
+        ..
+    } = assigned;
+    let rows = min_levels.len().max(1) as f64;
+    log::info!(
+        "[assign] streamed assignment memory: min_levels {} B ({:.2} B/row), kinds {} B \
+         ({:.2} B/row), carriers {} B ({:.2} B/row, {} row(s)), line cell maps {} B \
+         ({} cell(s), {:.2} B/row), carrier patch maps {} B ({} patch(es), {:.2} B/row)",
+        memory.min_levels,
+        memory.min_levels as f64 / rows,
+        memory.kinds,
+        memory.kinds as f64 / rows,
+        memory.carriers,
+        memory.carriers as f64 / rows,
+        carriers.iter().map(Vec::len).sum::<usize>(),
+        memory.cell_maps,
+        memory.cells,
+        memory.cell_maps as f64 / rows,
+        memory.patch_maps,
+        memory.patches,
+        memory.patch_maps as f64 / rows,
+    );
+    rss.log_phase("assignment+budget (winner tables)");
+    let (tally_lines, tally_bytes) = line_tally;
+    let coalesce_on = coalesce_effective(options, tally_lines, tally_bytes, ctx.diagnostics);
+    let coalesce_scratch = coalesce_scratch.filter(|_| coalesce_on);
+    let mut hist = vec![0usize; num_levels];
+    for (row, &ml) in min_levels.iter().enumerate() {
+        if ml == UNASSIGNED_LEVEL {
+            continue;
+        }
+        let line = || kinds.as_ref().is_some_and(|k| k[row] == FeatureKind::Line);
+        if coalesce_scratch.is_some() && line() {
+            continue; // counted via the per-level chain stage
+        }
+        hist[usize::from(ml).min(finest)] += 1;
+    }
+    let (counts, coalesce_build) =
+        level_counts(ctx, hist, &carriers, coalesce_scratch, &level_specs, rss);
     Ok(WinnerTables {
         level_specs,
-        cluster_tables,
-        cluster_categories,
+        cluster_tables: None,
+        cluster_categories: None,
         kinds,
         coalesce_build,
         min_levels,
@@ -3377,15 +3479,24 @@ fn run_pass1_and_assign(
         skipped_rows,
         geom_bytes,
         pass1_stage_secs,
+        stream,
     } = run_pass1_with_chunk_rows(inputs, adaptive_pass1_chunk_rows(options.read_batch_size))?;
     diagnostics.once(crate::diagnostics::Diagnostic::UnusableGeometry {
         count: skipped_rows,
         total: num_rows,
     });
-    let num_features = features.len();
+    // #928: the streamed path's grids fold here, before the counts below.
+    let t_fold = Instant::now();
+    let stream = stream.map(|s| s.finish(num_rows));
+    let fold_wall = t_fold.elapsed();
+    let num_features = stream.as_ref().map_or(features.len(), |s| s.features);
     // Per-kind counts ride along in the plan artifact (a sharded build reads
     // them to size its work); one extra O(N) pass, taken only when saving.
-    let kind_counts = options.save_plan.is_some().then(|| count_kinds(&features));
+    let kind_counts = options.save_plan.is_some().then(|| {
+        stream
+            .as_ref()
+            .map_or_else(|| count_kinds(&features), |s| s.kind_counts)
+    });
 
     // The bbox-derived tallies were folded DURING the scan (#543: the pass-1
     // table keeps center + squared diagonal, not the bbox): #188 antimeridian
@@ -3424,24 +3535,29 @@ fn run_pass1_and_assign(
     rss.enter_phase("assignment+budget (winner tables)");
 
     let t_assign = Instant::now();
-    let tables = resolve_winner_tables(
-        inputs,
-        AssignmentInputs {
-            features: &mut features,
-            acc_values,
-            categories,
-            areas,
-            coalesce_scratch,
-            line_tally,
-            num_rows,
-        },
-        rss,
-    )?;
+    let tables = match stream {
+        Some(assigned) => {
+            resolve_streamed_winner_tables(inputs, assigned, coalesce_scratch, line_tally, rss)?
+        }
+        None => resolve_winner_tables(
+            inputs,
+            AssignmentInputs {
+                features: &mut features,
+                acc_values,
+                categories,
+                areas,
+                coalesce_scratch,
+                line_tally,
+                num_rows,
+            },
+            rss,
+        )?,
+    };
     let mut tables = tables;
     tables.junctions = (!junctions.keys().is_empty()).then_some(junctions);
     // Stops before `--save-plan` serialization, which is I/O for an opt-in
     // artifact rather than part of the assignment itself.
-    let assign_wall = t_assign.elapsed();
+    let assign_wall = t_assign.elapsed() + fold_wall;
 
     // Persisted here, the first moment the assignment is complete and before
     // pass 2 touches anything: what survives resolve_winner_tables IS the
@@ -3467,6 +3583,7 @@ fn run_pass1_and_assign(
             entry_zoom.as_ref(),
             totals,
         )?;
+        rss.log_phase("save-plan (tables + plan clone)");
         plan.save(path)?;
         let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         log::info!(
@@ -5393,6 +5510,8 @@ struct Pass1Output {
     num_rows: usize,
     /// Rows skipped for a null, empty, or non-finite geometry (H4).
     skipped_rows: usize,
+    /// #928: the streamed assignment; `features` is empty when it is set.
+    stream: Option<StreamAssigner>,
     /// Encoded size of the geometry column over the selected row groups, from
     /// the footers' uncompressed column sizes (#305; footer-derived since
     /// #717, see [`ConvertSource::selected_column_bytes`]). `geom_bytes /
@@ -6064,8 +6183,11 @@ fn extract_pass1_batch_keys(
         ladder_values,
         category,
         budget,
+        retain_keys,
     } = inputs;
+    let collect_lines = collect_lines && retain_keys;
     match plan {
+        RankPlan::ExplicitSort { .. } | RankPlan::ExplicitClass { .. } if !retain_keys => {}
         RankPlan::ExplicitSort { idx, .. } => {
             explicit_keys.extend(extract_sort_keys(batch.column(proj(*idx)).as_ref()));
         }
@@ -6080,13 +6202,15 @@ fn extract_pass1_batch_keys(
             for cand in roads.iter_mut() {
                 let col = batch.column(proj(cand.idx));
                 scan_road_vocab(col.as_ref(), &mut cand.found);
-                cand.keys
-                    .extend(extract_class_ranks(col.as_ref(), &cand.ranking)?);
+                if retain_keys {
+                    cand.keys
+                        .extend(extract_class_ranks(col.as_ref(), &cand.ranking)?);
+                }
                 if collect_lines {
                     cand.interner.extend(col.as_ref(), &mut cand.groups);
                 }
             }
-            if let Some((idx, _)) = confidence {
+            if let Some((idx, _)) = confidence.as_ref().filter(|_| retain_keys) {
                 confidence_keys.extend(extract_sort_keys(batch.column(proj(*idx)).as_ref()));
             }
         }
@@ -6294,6 +6418,7 @@ fn merge_pass1_chunks(
         point_count,
         skipped_rows,
         junctions,
+        mut stream,
     } = inputs;
     // The ranges tile the batch contiguously from 0, so the last one's end is
     // the batch row count (0 for an empty batch).
@@ -6306,9 +6431,18 @@ fn merge_pass1_chunks(
         kept_row[start..start + chunk.kept_row.len()].copy_from_slice(&chunk.kept_row);
         *point_count += chunk.point_count;
         *skipped_rows += chunk.skipped_rows;
-        // Empty unless the #384 accumulator is on, so no `want_areas` gate is
-        // needed here — an empty `extend` is a no-op.
-        areas.extend(chunk.areas);
+        if let Some(stream) = stream.as_deref_mut() {
+            stream.push_chunk(
+                &chunk.features,
+                &chunk.areas,
+                chunk_base,
+                chunk.kept_row.len(),
+            )?;
+        } else {
+            // Empty unless the #384 accumulator is on, so no `want_areas` gate
+            // is needed here — an empty `extend` is a no-op.
+            areas.extend(chunk.areas);
+        }
         junctions.push(chunk.junctions);
         let feat_offset = features.len();
         lines.absorb(
@@ -6319,7 +6453,9 @@ fn merge_pass1_chunks(
             chunk.line_bytes,
         );
         tally.merge(&chunk.tally, chunk_base);
-        features.append_rebased(&chunk.features, chunk_base);
+        if stream.is_none() {
+            features.append_rebased(&chunk.features, chunk_base);
+        }
     }
     Ok(kept_row)
 }
@@ -6380,21 +6516,19 @@ fn run_pass1_with_chunk_rows(
     ctx: &Pass1Ctx<'_>,
     chunk_rows: usize,
 ) -> Result<Pass1Output, ConvertError> {
-    let source = ctx.source;
     let input_schema = ctx.descriptor.schema();
     let geom_idx = ctx
         .descriptor
         .geometry_name()
         .and_then(|n| input_schema.index_of(n).ok())
         .ok_or_else(|| ConvertError::NoGeometryColumn {
-            input: source.display_name(),
+            input: ctx.source.display_name(),
         })?;
     let options = ctx.config.options();
     let diagnostics = ctx.diagnostics;
     let acc_cols = ctx.acc_cols;
     let row_groups = ctx.selected_row_groups;
     let filter = ctx.bound_filter;
-    let bbox_query = ctx.bbox_query;
     let chunk_rows = chunk_rows.max(1);
     let mut plan = build_rank_plan(ctx.descriptor, options)?;
 
@@ -6426,11 +6560,11 @@ fn run_pass1_with_chunk_rows(
     // #717: from the footers, not the Arrow batches, whose buffer capacity
     // depends on how many readers produced them. Being a footer fact, it also
     // prices pass 1's own read-ahead.
-    let geom_bytes = source.selected_column_bytes(row_groups, geom_idx)?;
-    let selected_rows = u64::try_from(source.selected_row_count(row_groups)?).unwrap_or(0);
+    let geom_bytes = ctx.source.selected_column_bytes(row_groups, geom_idx)?;
+    let selected_rows = u64::try_from(ctx.source.selected_row_count(row_groups)?).unwrap_or(0);
     let mut read_tuning = pass1_read_tuning(*ctx.budget, options, geom_bytes, selected_rows);
     // #716: pass 1's batches carry only its projection; price them by it.
-    read_tuning.footer = footer_price(source, row_groups, cols.iter().copied())?;
+    read_tuning.footer = footer_price(ctx.source, row_groups, cols.iter().copied())?;
 
     let t_pass1_fn = Instant::now();
     let pass1_timers = Pass1Timers::default();
@@ -6438,20 +6572,11 @@ fn run_pass1_with_chunk_rows(
     let in_flight = resolve_and_log_in_flight_batches("pass 1", options.in_flight_batches, |n| n);
     log::debug!("[profile] pass1 chunk_rows={chunk_rows}");
 
-    let mut features = FeatureTable::new();
+    // #928: the assignment path, decided before the first row is read.
+    let (mut features, mut stream) = pass1_tables(ctx, &plan, selected_rows)?;
     // #188/#429 bbox tallies, folded chunk by chunk as the scan produces
     // features (#543 — see `super::convert::BboxTally`).
     let mut bbox_tally = super::convert::BboxTally::default();
-    // #543 review: pre-size the feature table when its final length is known
-    // from the footers — i.e. no per-feature `--bbox`/`--filter` can drop
-    // rows (only null/unusable geometries, a small overshoot). Growing by
-    // `push` instead costs a transient ~2× the table at the last doubling
-    // (realloc = alloc + copy + free under mimalloc): 128 GiB at 1.58B rows.
-    // `try_reserve_exact` so an absurd size falls back to growth instead of
-    // aborting. Capacity only — output is unchanged.
-    if bbox_query.is_none() && filter.is_none() && ctx.mask.is_none() {
-        let _ = features.try_reserve_exact(usize::try_from(selected_rows).unwrap_or(0));
-    }
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
     let want_areas = accumulator_requested(options);
     let mut areas: Vec<f32> = Vec::new();
@@ -6571,6 +6696,7 @@ fn run_pass1_with_chunk_rows(
                         point_count: &mut point_count,
                         skipped_rows: &mut skipped_rows,
                         junctions: &mut chunk_occ,
+                        stream: stream.as_mut(),
                     },
                 )?;
                 if collect_lines == LineCollect::Collect && lines.mode != LineCollect::Collect {
@@ -6605,6 +6731,7 @@ fn run_pass1_with_chunk_rows(
                         ladder_values: &mut ladder_values,
                         category: category.as_mut(),
                         budget: (ctx.budget, features.allocated_bytes()),
+                        retain_keys: stream.is_none(),
                     },
                 )?;
                 Pass1Timers::add(&timers_ref.keys, t_keys);
@@ -6620,11 +6747,13 @@ fn run_pass1_with_chunk_rows(
         confidence_keys,
         explicit_groups,
         lines.mode == LineCollect::Collect,
-        features.len(),
+        stream
+            .as_ref()
+            .map_or(features.len(), StreamAssigner::features),
         point_count,
     );
 
-    if let Some(keys) = keys {
+    if let Some(keys) = keys.filter(|_| stream.is_none()) {
         // Keys are extracted per ROW (including skipped-geometry rows), so
         // they are looked up by each feature's row index, not zipped
         // positionally.
@@ -6669,7 +6798,92 @@ fn run_pass1_with_chunk_rows(
         skipped_rows,
         geom_bytes,
         pass1_stage_secs: pass1_timers.stage_secs(),
+        stream,
     })
+}
+
+/// Pass 1's feature table and streamed assigner (#928): exactly one of them
+/// fills. The path is decided here, before the first row is read, and never
+/// switched.
+fn pass1_tables(
+    ctx: &Pass1Ctx<'_>,
+    plan: &RankPlan,
+    selected_rows: u64,
+) -> Result<(FeatureTable, Option<StreamAssigner>), ConvertError> {
+    let mut features = FeatureTable::new();
+    let stream = stream_assigner(ctx, plan, selected_rows)?;
+    // #543 review: pre-size the feature table when its final length is known
+    // from the footers — i.e. no per-feature `--bbox`/`--filter` can drop
+    // rows (only null/unusable geometries, a small overshoot). Growing by
+    // `push` instead costs a transient ~2× the table at the last doubling
+    // (realloc = alloc + copy + free under mimalloc): 128 GiB at 1.58B rows.
+    // `try_reserve_exact` so an absurd size falls back to growth instead of
+    // aborting. Capacity only — output is unchanged.
+    if stream.is_none()
+        && ctx.bbox_query.is_none()
+        && ctx.bound_filter.is_none()
+        && ctx.mask.is_none()
+    {
+        let _ = features.try_reserve_exact(usize::try_from(selected_rows).unwrap_or(0));
+    }
+    Ok((features, stream))
+}
+
+/// #928: the streamed assigner when `TYLERTOO_STREAM_ASSIGN=1` and the run
+/// is inside the v1 scope ([`super::assign_stream::stream_path`]); `None`
+/// keeps the table path. Logs the path taken, once.
+fn stream_assigner(
+    ctx: &Pass1Ctx<'_>,
+    plan: &RankPlan,
+    rows: u64,
+) -> Result<Option<StreamAssigner>, ConvertError> {
+    use super::assign_stream as sa;
+    let options = ctx.config.options();
+    if !sa::requested() {
+        sa::record_path(false);
+        log::info!("[assign] level assignment path: table");
+        return Ok(None);
+    }
+    let level_specs = options.levels.resolve(options.gsd_base)?;
+    let level_reprs = super::convert::level_representations(&level_specs, &options.representation);
+    let declared = sa::declared_kinds(
+        ctx.source
+            .resolved_schemas()?
+            .into_iter()
+            .map(ResolvedSchema::declared_geometry_types),
+    );
+    let gate = sa::StreamGate {
+        options,
+        declared,
+        size_fallback_ranking: matches!(plan, RankPlan::SizeFallback),
+        accumulate_columns: !ctx.acc_cols.is_empty(),
+        shared_nodes: wants_pins(options),
+        level_reprs: &level_reprs,
+    };
+    let allowed = match sa::stream_path(&gate) {
+        Ok(kinds) => kinds,
+        Err(reason) => {
+            sa::record_path(false);
+            log::info!(
+                "[assign] level assignment path: table ({}=1 set, but {reason})",
+                sa::STREAM_ASSIGN_ENV
+            );
+            return Ok(None);
+        }
+    };
+    sa::record_path(true);
+    log::info!(
+        "[assign] level assignment path: streamed (#928; {allowed:?}, {} level(s))",
+        level_specs.len()
+    );
+    Ok(Some(StreamAssigner::new(
+        allowed,
+        options,
+        &level_specs,
+        &level_reprs,
+        ctx.crs,
+        usize::try_from(rows).unwrap_or(0),
+    )))
 }
 
 // ============================================================================
@@ -10985,6 +11199,12 @@ pub(super) mod tests {
         areas: Vec<f32>,
         options: &ConvertOptions,
     ) -> WinnerTables {
+        let num_rows = features.len();
+        table_winner_tables(features, areas, num_rows, options)
+    }
+
+    /// Run `f` with a [`Pass1Ctx`] over the preflight fixture, in EPSG:3857.
+    fn with_assign_ctx<R>(options: &ConvertOptions, f: impl FnOnce(&Pass1Ctx<'_>) -> R) -> R {
         let (_input, source, _) = preflight_fixture();
         let config = options.validate().unwrap();
         let budget = MemoryBudget::with_available(None);
@@ -11003,21 +11223,324 @@ pub(super) mod tests {
             bound_filter: None,
             crs: Crs::Epsg3857,
         };
-        let num_rows = features.len();
-        resolve_winner_tables(
-            &ctx,
-            AssignmentInputs {
-                features,
-                areas,
-                acc_values: Vec::new(),
-                categories: None,
-                coalesce_scratch: None,
-                line_tally: (0, 0),
-                num_rows,
+        f(&ctx)
+    }
+
+    /// The table path's [`WinnerTables`] over `features` (row-indexed into
+    /// `num_rows` rows, gaps allowed).
+    fn table_winner_tables(
+        features: &mut FeatureTable,
+        areas: Vec<f32>,
+        num_rows: usize,
+        options: &ConvertOptions,
+    ) -> WinnerTables {
+        with_assign_ctx(options, |ctx| {
+            resolve_winner_tables(
+                ctx,
+                AssignmentInputs {
+                    features,
+                    areas,
+                    acc_values: Vec::new(),
+                    categories: None,
+                    coalesce_scratch: None,
+                    line_tally: (0, 0),
+                    num_rows,
+                },
+                &mut RssTracker::new(false, "test"),
+            )
+            .unwrap()
+        })
+    }
+
+    /// #928: the streamed path's [`WinnerTables`] over the same rows, fed
+    /// as pass 1 feeds it: `chunk_rows`-row chunks with chunk-local indices.
+    fn streamed_winner_tables(
+        feats: &[AssignFeature],
+        areas: &[f32],
+        num_rows: usize,
+        options: &ConvertOptions,
+        chunk_rows: usize,
+    ) -> WinnerTables {
+        let level_specs = options.levels.resolve(options.gsd_base).unwrap();
+        let reprs =
+            super::super::convert::level_representations(&level_specs, &options.representation);
+        let mut assigner = StreamAssigner::new(
+            super::super::assign_stream::KindSet {
+                polygons: true,
+                lines: true,
             },
-            &mut RssTracker::new(false, "test"),
-        )
-        .unwrap()
+            options,
+            &level_specs,
+            &reprs,
+            Crs::Epsg3857,
+            num_rows,
+        );
+        let mut next = 0;
+        let mut base = 0;
+        while base < num_rows {
+            let rows = chunk_rows.min(num_rows - base);
+            let (mut chunk, mut chunk_areas) = (Vec::new(), Vec::new());
+            while next < feats.len() && feats[next].index < base + rows {
+                chunk.push(AssignFeature {
+                    index: feats[next].index - base,
+                    ..feats[next]
+                });
+                chunk_areas.push(areas[next]);
+                next += 1;
+            }
+            assigner
+                .push_chunk(&table(&chunk), &chunk_areas, base, rows)
+                .unwrap();
+            base += rows;
+        }
+        with_assign_ctx(options, |ctx| {
+            resolve_streamed_winner_tables(
+                ctx,
+                assigner.finish(num_rows),
+                None,
+                (0, 0),
+                &mut RssTracker::new(false, "test"),
+            )
+            .unwrap()
+        })
+    }
+
+    /// Seeded polygons and lines in EPSG:3857 metres that cross every
+    /// level's gate, contest line cells, include exact twins, and skip rows
+    /// (index gaps, and a gap at the end). Returns `(features, areas, rows)`.
+    fn stream_fixture(
+        n: usize,
+        seed: u64,
+        finest_gsd: f64,
+    ) -> (Vec<AssignFeature>, Vec<f32>, usize) {
+        let mut state = seed | 1;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let extent = finest_gsd * 4096.0;
+        let (mut feats, mut areas) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        let mut index = 0usize;
+        for i in 0..n {
+            let feat = if i % 7 == 6 {
+                // An exact twin of the previous row: only the hash and the
+                // index separate them.
+                let prev: &AssignFeature = feats.last().unwrap();
+                AssignFeature { index, ..*prev }
+            } else {
+                let size = finest_gsd * 2f64.powf(rnd() * 14.0 - 2.0);
+                let (x, y) = (rnd() * extent - extent / 2.0, rnd() * extent);
+                let kind = if rnd() < 0.5 {
+                    FeatureKind::Polygon
+                } else {
+                    FeatureKind::Line
+                };
+                AssignFeature {
+                    index,
+                    bbox: [x, y, x + size, y + size * rnd()],
+                    kind,
+                    sort_key: None,
+                    entry_level: None,
+                }
+            };
+            let area = match feat.kind {
+                FeatureKind::Polygon => {
+                    let [x0, y0, x1, y1] = feat.bbox;
+                    ((x1 - x0) * (y1 - y0) * (0.2 + rnd() * 0.8)) as f32
+                }
+                _ => 0.0,
+            };
+            feats.push(feat);
+            areas.push(area);
+            index += 1 + if rnd() < 0.2 {
+                (rnd() * 3.0) as usize
+            } else {
+                0
+            };
+        }
+        (feats, areas, index + 5)
+    }
+
+    fn assert_winner_tables_eq(a: &WinnerTables, b: &WinnerTables, what: &str) {
+        assert_eq!(a.level_specs, b.level_specs, "{what}: level_specs");
+        assert_eq!(a.finest, b.finest, "{what}: finest");
+        assert!(a.min_levels == b.min_levels, "{what}: min_levels differ");
+        assert_eq!(a.counts, b.counts, "{what}: counts");
+        assert!(a.carriers == b.carriers, "{what}: carriers differ");
+        assert_eq!(a.kinds, b.kinds, "{what}: kinds");
+        assert!(a.coalesce_build.is_none() && b.coalesce_build.is_none());
+        assert!(a.cluster_tables.is_none() && b.cluster_tables.is_none());
+    }
+
+    /// #928: the streamed assignment's tables equal the table path's, for
+    /// every v1 config shape, whatever the chunking and the thread count.
+    /// 40 000 features is above the sharded winner build's cutoff
+    /// (`WINNER_CHUNK_FEATURES`) and the parallel fold's (4096 rows).
+    #[test]
+    fn streamed_winner_tables_match_the_table_path() {
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 12,
+            },
+            coalesce_lines: false,
+            ..Default::default()
+        };
+        let square_band = ConvertOptions {
+            representation: vec![super::super::convert::RepresentationBand::new(
+                3,
+                8,
+                Representation::Square,
+            )],
+            ..base.clone()
+        };
+        let floored = ConvertOptions {
+            gsd_base: 8192.0,
+            ..base.clone()
+        };
+        let explicit = ConvertOptions {
+            levels: LevelPlan::Gsds(vec![9000.0, 3100.0, 1700.0, 400.0, 130.0, 61.0, 10.0]),
+            ..base.clone()
+        };
+        let partitioning = ConvertOptions {
+            mode: Mode::Partitioning,
+            ..base.clone()
+        };
+        let mut no_budget = base.clone();
+        no_budget.density.enabled = false;
+        let plan_kinds = ConvertOptions {
+            save_plan: Some("unused.plan".into()),
+            ..base.clone()
+        };
+        let mut coarse_lines = base.clone();
+        coarse_lines.assign.line_thinning = 3.0;
+        let cases = [
+            ("default", base),
+            ("square band", square_band),
+            ("floored residual", floored),
+            ("explicit non-halving --gsd", explicit),
+            ("partitioning", partitioning),
+            ("no density budget", no_budget),
+            ("kinds for --save-plan", plan_kinds),
+            ("coarser line cells", coarse_lines),
+        ];
+        for (seed, (name, options)) in cases.into_iter().enumerate() {
+            let finest = *options
+                .levels
+                .resolve(options.gsd_base)
+                .unwrap()
+                .last()
+                .unwrap();
+            let (feats, areas, rows) = stream_fixture(40_000, 0x928 + seed as u64, finest.0);
+            let mut reference = None;
+            for threads in [1usize, 8] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let tables = pool.install(|| {
+                    table_winner_tables(&mut table(&feats), areas.clone(), rows, &options)
+                });
+                match &reference {
+                    None => reference = Some(tables),
+                    Some(r) => assert_winner_tables_eq(r, &tables, name),
+                }
+            }
+            let reference = reference.unwrap();
+            assert!(
+                reference
+                    .min_levels
+                    .iter()
+                    .any(|&l| l != UNASSIGNED_LEVEL && l > 0),
+                "{name}: some row must lose a coarse level"
+            );
+            assert_eq!(
+                reference.carriers.iter().any(|c| !c.is_empty()),
+                name != "partitioning",
+                "{name}: carriers only where the accumulator runs"
+            );
+            for chunk_rows in [1usize, 777, usize::MAX] {
+                let streamed = streamed_winner_tables(&feats, &areas, rows, &options, chunk_rows);
+                assert_winner_tables_eq(
+                    &reference,
+                    &streamed,
+                    &format!("{name}, chunk {chunk_rows}"),
+                );
+            }
+        }
+    }
+
+    /// #928: a convert with the switch on streams (and says so) for a
+    /// polygon + line input, falls back for points, and in both cases writes
+    /// the same overview and plan bytes as the table path. Multi-part, with
+    /// row groups and read batches that split across several readers.
+    #[test]
+    fn stream_assign_converts_byte_identically() {
+        use super::super::assign_stream::{last_path_streamed, with_stream_assign};
+        let dir = tempfile::tempdir().unwrap();
+        let parts = dir.path().join("parts");
+        std::fs::create_dir(&parts).unwrap();
+        let shapes = |points: usize, lines: usize, polys: usize, seed: f64| {
+            mixed_geometries(points, lines, polys)
+                .into_iter()
+                .enumerate()
+                .map(|(i, g)| {
+                    use geo::MapCoords;
+                    let s = 1.0 + ((i as f64 * seed).sin() * 0.5);
+                    Some(g.map_coords(|c| geo::coord! { x: c.x * s * 0.01, y: c.y * s * 0.01 }))
+                })
+                .collect::<Vec<Option<Geometry<f64>>>>()
+        };
+        let write = |path: &Path, geoms: Vec<Option<Geometry<f64>>>| {
+            let values: Vec<f64> = (0..geoms.len()).map(|i| i as f64).collect();
+            write_input_with_f64_row_groups(path, &geoms, "rank", &values, Some(25));
+        };
+        write(&parts.join("a.parquet"), shapes(0, 140, 160, 1.3));
+        let mut b = shapes(0, 90, 120, 2.9);
+        b[17] = None; // a skipped row
+        write(&parts.join("b.parquet"), b);
+        let points = dir.path().join("points.parquet");
+        write(&points, shapes(300, 0, 0, 0.7));
+
+        let run = |input: &Path, on: bool, tag: &str| {
+            let out = dir.path().join(format!("{tag}-{on}.parquet"));
+            let plan = dir.path().join(format!("{tag}-{on}.plan"));
+            let options = ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 9,
+                },
+                coalesce_lines: false,
+                no_auto_rank: true,
+                read_batch_size: 7,
+                read_workers: 3,
+                save_plan: Some(plan.clone()),
+                ..Default::default()
+            };
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(6)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                with_stream_assign(on, || {
+                    super::super::convert::convert_to_overviews(input, &out, &options).unwrap();
+                    assert_eq!(
+                        last_path_streamed(),
+                        Some(on && tag == "mixed"),
+                        "{tag} path"
+                    );
+                })
+            });
+            (std::fs::read(out).unwrap(), std::fs::read(plan).unwrap())
+        };
+        for (input, tag) in [(parts.as_path(), "mixed"), (points.as_path(), "points")] {
+            let (table_out, table_plan) = run(input, false, tag);
+            let (stream_out, stream_plan) = run(input, true, tag);
+            assert!(table_out == stream_out, "{tag}: overview bytes differ");
+            assert!(table_plan == stream_plan, "{tag}: plan bytes differ");
+        }
     }
 
     /// #875: a square band bypasses the gate. With thinning off every polygon

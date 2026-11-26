@@ -13,6 +13,7 @@
 
 pub mod accumulate;
 pub mod assign;
+mod assign_stream;
 pub mod auto_zoom;
 pub(crate) mod cells;
 pub mod check;

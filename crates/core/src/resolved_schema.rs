@@ -269,6 +269,16 @@ impl ResolvedSchema {
     pub fn primary_column(&self) -> Option<&str> {
         self.facts.primary_column.as_deref()
     }
+    /// The primary geometry column's declared `geometry_types` from the
+    /// `geo` footer key, or `None` when the footer declares none (#928).
+    pub(crate) fn declared_geometry_types(&self) -> Option<Vec<String>> {
+        let geo: Value = serde_json::from_str(self.facts.geo_json.as_deref()?).ok()?;
+        let types = geo["columns"][self.geometry_name()?]["geometry_types"].as_array()?;
+        types
+            .iter()
+            .map(|t| t.as_str().map(str::to_owned))
+            .collect()
+    }
     /// Every geometry field, in schema order.
     pub fn geometry_columns(&self) -> &[String] {
         &self.facts.geometry_columns

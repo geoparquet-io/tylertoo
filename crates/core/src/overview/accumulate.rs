@@ -151,16 +151,8 @@ pub fn tiny_polygon_carriers(
         levels.par_iter().enumerate().map(run).collect()
     };
     let floored_zooms: Vec<f64> = per_level.iter().filter_map(|(_, z)| *z).collect();
-    let out: Vec<Vec<usize>> = per_level.into_iter().map(|(c, _)| c).collect();
-    if !floored_zooms.is_empty() {
-        let zooms: Vec<String> = floored_zooms.iter().map(|z| format!("z{z}")).collect();
-        log::info!(
-            "[convert] tiny-polygon accumulator: at {} a one-GSD placeholder is narrower \
-             than one tile unit, so its side is raised to one unit (fewer, visible squares)",
-            zooms.join(", ")
-        );
-    }
-    out
+    log_floored_zooms(&floored_zooms);
+    per_level.into_iter().map(|(c, _)| c).collect()
 }
 
 /// One level of [`tiny_polygon_carriers`]: its sorted carrier rows, and its
@@ -173,23 +165,12 @@ fn level_carriers(
     level: &AccumulateLevel,
     crs: Crs,
 ) -> (Vec<usize>, Option<f64>) {
-    let mut out = Vec::new();
     if !level.enabled {
-        return (out, None);
+        return (Vec::new(), None);
     }
     #[cfg(test)]
     super::testutil::rendezvous::arrive("accumulate level");
-    let gsd_units = gsd_to_coord_units(level.gsd_meters, crs);
-    let side = placeholder_side(level.gsd_meters, level.zoom, crs);
-    let floored = side > level_tolerance(level.gsd_meters, crs, 1.0);
-    let floored_zoom = floored.then(|| export_zoom(level.gsd_meters, level.zoom));
-    let threshold = side * side;
-    let cell = ACCUMULATE_CELL_GSD * gsd_units;
-    // NaN / zero guards (a NaN compares false everywhere).
-    if threshold.is_nan() || threshold <= 0.0 || cell.is_nan() || cell <= 0.0 {
-        return (out, floored_zoom);
-    }
-    let mut acc: HashMap<(i64, i64), Patch> = HashMap::new();
+    let mut acc = LevelAccumulator::new(level, crs);
     for (pos, (&ml, &area)) in min_levels.iter().zip(areas).enumerate() {
         if features.kind(pos) != FeatureKind::Polygon || usize::from(ml) <= li {
             continue; // not a polygon, or already present at this level
@@ -197,10 +178,74 @@ fn level_carriers(
         if features.entry_level(pos).is_some() {
             continue; // #364: the ladder decides where it first appears
         }
+        acc.add(features.indices()[pos], features.center(pos), area);
+    }
+    acc.finish()
+}
+
+/// One level's accumulator, fed one gate/thinning loser at a time in
+/// ascending row order: the per-row body of [`tiny_polygon_carriers`],
+/// shared with the streaming assignment (#928) so both read the same
+/// patches, rounding and dither.
+pub(super) struct LevelAccumulator {
+    /// `None` when the level does not accumulate (disabled, or a NaN /
+    /// non-positive threshold or patch width).
+    active: Option<ActiveLevel>,
+    floored_zoom: Option<f64>,
+}
+
+struct ActiveLevel {
+    threshold: f64,
+    cell: f64,
+    floored: bool,
+    acc: HashMap<(i64, i64), Patch>,
+    out: Vec<usize>,
+}
+
+impl LevelAccumulator {
+    pub(super) fn new(level: &AccumulateLevel, crs: Crs) -> Self {
+        if !level.enabled {
+            return Self {
+                active: None,
+                floored_zoom: None,
+            };
+        }
+        let gsd_units = gsd_to_coord_units(level.gsd_meters, crs);
+        let side = placeholder_side(level.gsd_meters, level.zoom, crs);
+        let floored = side > level_tolerance(level.gsd_meters, crs, 1.0);
+        let floored_zoom = floored.then(|| export_zoom(level.gsd_meters, level.zoom));
+        let threshold = side * side;
+        let cell = ACCUMULATE_CELL_GSD * gsd_units;
+        // NaN / zero guards (a NaN compares false everywhere).
+        let valid = !(threshold.is_nan() || threshold <= 0.0 || cell.is_nan() || cell <= 0.0);
+        Self {
+            active: valid.then(|| ActiveLevel {
+                threshold,
+                cell,
+                floored,
+                acc: HashMap::new(),
+                out: Vec::new(),
+            }),
+            floored_zoom,
+        }
+    }
+
+    /// Whether [`Self::add`] can do anything.
+    pub(super) fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// Feed one polygon that is not a member of this level (and not on a
+    /// ladder), with its row `index`, bbox centre and f32 area.
+    pub(super) fn add(&mut self, index: usize, (cx, cy): (f64, f64), area: f32) {
+        let Some(level) = &mut self.active else {
+            return;
+        };
         let area = f64::from(area);
         if area.is_nan() || area <= 0.0 {
-            continue;
+            return;
         }
+        let threshold = level.threshold;
         // DIVERGENCE FROM TIPPECANOE: tippecanoe only accumulates rings
         // with area <= pixel² and keeps larger rings as geometry, so its
         // residual never exceeds one placeholder. Here a non-member is
@@ -219,39 +264,77 @@ fn level_carriers(
         // therefore lands in a patch near lng 0, far from where it
         // sits. The rest of the pipeline has no wrap handling either
         // (#342); this stays consistent with it until that lands.
-        let (cx, cy) = features.center(pos);
-        let key = ((cx / cell).floor() as i64, (cy / cell).floor() as i64);
-        let patch = acc.entry(key).or_default();
+        let key = (
+            (cx / level.cell).floor() as i64,
+            (cy / level.cell).floor() as i64,
+        );
+        let patch = level.acc.entry(key).or_default();
         patch.total += area;
         if patch.total >= threshold {
-            out.push(features.indices()[pos]);
+            level.out.push(index);
             patch.total -= threshold;
         } else {
-            patch.last_free = Some((features.indices()[pos], cx, cy));
+            patch.last_free = Some((index, cx, cy));
         }
     }
-    // A patch keeps less than one `T` unemitted. At a floored level `T`
-    // is up to several times one GSD², so that
-    // truncation would thin sparse patches noticeably (at `--gsd-base
-    // 8192`, ~12% of the z3 area in the #407 probe). There, dither the
-    // residual instead: the patch's last non-carrier contributor also
-    // becomes a carrier with probability `residual / T`, decided by the
-    // same anchor hash the `--collapse-square` dither uses, so expected
-    // placeholder area equals the clamped dropped area. Unfloored levels
-    // keep the plain truncation, byte-identical to before #407.
-    if floored {
-        for patch in acc.values() {
-            if let Some((index, cx, cy)) = patch.last_free {
-                if dither_u01(cx, cy) < patch.total / threshold {
-                    out.push(index);
+
+    /// `(occupied patches, allocated patch-map bytes)`: the working state
+    /// the streaming assignment reports (#928).
+    pub(super) fn patch_map_bytes(&self) -> (usize, u64) {
+        self.active.as_ref().map_or((0, 0), |l| {
+            let slot = std::mem::size_of::<((i64, i64), Patch)>() + 1;
+            (l.acc.len(), (l.acc.capacity() * slot) as u64)
+        })
+    }
+
+    /// The level's sorted carrier rows, and its export zoom when the
+    /// placeholder side is floored there.
+    pub(super) fn finish(self) -> (Vec<usize>, Option<f64>) {
+        let Some(level) = self.active else {
+            return (Vec::new(), self.floored_zoom);
+        };
+        let ActiveLevel {
+            threshold,
+            floored,
+            acc,
+            mut out,
+            ..
+        } = level;
+        // A patch keeps less than one `T` unemitted. At a floored level `T`
+        // is up to several times one GSD², so that
+        // truncation would thin sparse patches noticeably (at `--gsd-base
+        // 8192`, ~12% of the z3 area in the #407 probe). There, dither the
+        // residual instead: the patch's last non-carrier contributor also
+        // becomes a carrier with probability `residual / T`, decided by the
+        // same anchor hash the `--collapse-square` dither uses, so expected
+        // placeholder area equals the clamped dropped area. Unfloored levels
+        // keep the plain truncation, byte-identical to before #407.
+        if floored {
+            for patch in acc.values() {
+                if let Some((index, cx, cy)) = patch.last_free {
+                    if dither_u01(cx, cy) < patch.total / threshold {
+                        out.push(index);
+                    }
                 }
             }
         }
+        // `features` is in input order and `index` is monotone in it, but
+        // sort anyway: the lookup is a binary search.
+        out.sort_unstable();
+        (out, self.floored_zoom)
     }
-    // `features` is in input order and `index` is monotone in it, but
-    // sort anyway: the lookup is a binary search.
-    out.sort_unstable();
-    (out, floored_zoom)
+}
+
+/// One `log::info` naming the zooms where the placeholder side is floored.
+pub(super) fn log_floored_zooms(floored_zooms: &[f64]) {
+    if !floored_zooms.is_empty() {
+        let zooms: Vec<String> = floored_zooms.iter().map(|z| format!("z{z}")).collect();
+        log::info!(
+            "[convert] tiny-polygon accumulator: at {} a one-GSD placeholder is narrower \
+             than one tile unit, so its side is raised to one unit (fewer, visible squares)",
+            zooms.join(", ")
+        );
+    }
 }
 
 /// One accumulation patch's running state.
