@@ -2221,10 +2221,10 @@ fn create_level_writer(
     // levels' row groups; `bounded` keeps its one-level envelope.
     writer_opts.overlap_levels = !matches!(options.profile, super::level::MemoryProfile::Bounded);
 
-    // #923: the in-memory overview keeps a chunk while the budget the
-    // writer runs under, after its encodes, still grants it.
+    // #923: the in-memory overview keeps a chunk while it fits the room the
+    // writer's budget leaves outside its allowance.
     if let Some(store) = store {
-        store.admit_under(*budget, options.profile);
+        store.admit_under(budget.overview_cap(), budget.overview_margin());
     }
     let writer = OverviewWriter::create_sink(output_path, store, &out_schema, writer_opts)?;
 

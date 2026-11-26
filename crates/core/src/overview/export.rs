@@ -2009,7 +2009,7 @@ fn export_pmtiles_validated(
     let _tile_trace = crate::tile_trace::Session::start(diagnostics);
     let reader = match store {
         Some(store) => {
-            // #923: the overview's resident chunks are this run's to reclaim.
+            // #923: this run's grants evict the overview under real pressure.
             budget.hold_overview(store);
             OverviewReader::open_store(store, input_path.to_path_buf())?
         }

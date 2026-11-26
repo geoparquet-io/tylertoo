@@ -1214,10 +1214,7 @@ fn place_intermediate(
         None if in_memory => {
             let store = super::chunked::OverviewStore::new(dir.clone());
             if let Some(cap) = cap {
-                store.admit_under(
-                    super::memory::MemoryBudget::with_available(Some(cap)),
-                    super::level::MemoryProfile::Speed,
-                );
+                store.admit_under(cap, 0);
             }
             // Never created: it names the overview in messages and puts the
             // disk preflights on the eviction file's volume.

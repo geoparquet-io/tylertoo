@@ -716,6 +716,8 @@ pub(super) fn export_level_groups(
     }
     let mut zooms = Vec::with_capacity(levels.len());
     for group in groups {
+        // #923: evict the in-memory overview if memory runs short.
+        budget.relieve_overview();
         // #788: each level owns its zoom's fill, taken out of the map as
         // its group starts and dropped when the group is written.
         let group_fills: Vec<Option<coverage_fill::FillMap>> = levels[group.clone()]

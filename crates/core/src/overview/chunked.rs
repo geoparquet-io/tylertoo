@@ -2,14 +2,21 @@
 //!
 //! Under `auto` and `speed` the intermediate overview is written here, not
 //! to a temp file. Its bytes are cut into one chunk per row group (plus the
-//! footer). A chunk is either resident (anonymous memory, charged to the run's
-//! [`MemoryBudget`]) or evicted, written at its own offset to one anonymous
-//! temp file. A regular file cannot be kept out of writeback, so an overview
-//! that lives in one is partly flushed to disk under a cgroup's dirty limit
-//! and slows the archive's fsync. A memfd cannot be reclaimed without swap.
-//! This store keeps what the budget grants in RAM and gives it back on
-//! demand: what does not fit is ordinary page cache, which is today's
-//! behaviour.
+//! footer). A chunk is either resident (anonymous memory) or evicted, written
+//! at its own offset to one anonymous temp file. A regular file cannot be
+//! kept out of writeback, so an overview that lives in one is partly flushed
+//! to disk under a cgroup's dirty limit and slows the archive's fsync. A
+//! memfd cannot be reclaimed without swap.
+//!
+//! The resident chunks live where the file's page cache did: outside the
+//! [`MemoryBudget`]'s allowance, so no grant or plan sees them. A chunk is
+//! admitted on its real bytes while the store holds less than its share of
+//! the room outside the allowance ([`MemoryBudget::overview_cap`]) and the
+//! live headroom stays above the rest of it
+//! ([`MemoryBudget::overview_margin`]). The export's budget evicts chunks
+//! when a live probe shows the headroom below that margin, at every grant
+//! and every level group ([`OverviewStore::relieve`]). What is evicted is
+//! ordinary page cache, which is today's behaviour.
 //!
 //! Eviction takes the highest-offset resident chunk first. The writer
 //! writes levels in band order and the export reads them in the same order
@@ -24,11 +31,11 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use bytes::Bytes;
 
-use super::level::MemoryProfile;
-use super::memory::{MemoryBudget, MemoryPhase, Price, PriceBasis};
+#[cfg(doc)]
+use super::memory::MemoryBudget;
 
 /// A `Copy` handle on a live [`OverviewStore`], so the `Copy`
-/// [`MemoryBudget`] can hold the store it reclaims from.
+/// [`MemoryBudget`] can hold the store it relieves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StoreId(u64);
 
@@ -82,8 +89,26 @@ struct Inner {
     file: Option<Arc<File>>,
     /// Bytes ever evicted to the file.
     on_disk: u64,
-    /// The writer's budget: a chunk stays resident while it grants it.
-    admit: Option<(MemoryBudget, MemoryProfile)>,
+    /// The writer's admission: a chunk stays resident while it allows it.
+    admit: Option<Admit>,
+}
+
+/// The room a chunk is admitted into ([`OverviewStore::admit_under`]).
+#[derive(Debug)]
+struct Admit {
+    cap: u64,
+    margin: u64,
+    /// The last live headroom probe and the resident bytes then.
+    probed: Option<(u64, u64)>,
+}
+
+/// Bytes admitted between two live headroom probes: a probe reads a few
+/// `/proc` and cgroup files, too many for every row group.
+const PROBE_EVERY_BYTES: u64 = 64 << 20;
+
+/// The live, uncached headroom the OOM killer acts on (#923).
+fn live_headroom() -> Option<u64> {
+    super::pipeline::probe_oom_memory_limit().map(|l| l.bytes)
 }
 
 #[derive(Debug)]
@@ -151,11 +176,33 @@ impl OverviewStore {
         StoreId(self.id)
     }
 
-    /// Admit the chunks the writer seals against `budget` under `profile`.
+    /// Admit the chunks the writer seals while at most `cap` bytes are
+    /// resident and the live headroom stays above `margin`
+    /// ([`MemoryBudget::overview_cap`], [`MemoryBudget::overview_margin`]).
     /// Without it every chunk stays resident. An admission already set
     /// stays (a test's).
-    pub(super) fn admit_under(&self, budget: MemoryBudget, profile: MemoryProfile) {
-        lock(&self.inner).admit.get_or_insert((budget, profile));
+    pub(super) fn admit_under(&self, cap: u64, margin: u64) {
+        lock(&self.inner).admit.get_or_insert(Admit {
+            cap,
+            margin,
+            probed: None,
+        });
+    }
+
+    /// Evict resident chunks, highest offset first, while the live headroom
+    /// is below `margin` (#923): real memory pressure, not a grant's size.
+    pub(super) fn relieve(&self, margin: u64) {
+        if self.resident_bytes() == 0 {
+            return;
+        }
+        let Some(headroom) = live_headroom() else {
+            return;
+        };
+        if headroom < margin {
+            if let Err(e) = self.evict(margin - headroom) {
+                log::warn!("[overview] cannot evict the in-memory overview to disk: {e}");
+            }
+        }
     }
 
     /// Bytes written.
@@ -207,21 +254,21 @@ impl OverviewStore {
         let data = std::mem::take(&mut inner.open);
         let len = data.len() as u64;
         let start = inner.len - len;
+        let resident = self.resident_bytes();
         let admitted = match &mut inner.admit {
             None => true,
-            Some((budget, profile)) => {
-                // Charged as a grant: out of the allowance one for one.
-                let fits = budget.room(*profile) >= len;
-                if fits {
-                    let _held = budget.fit(
-                        *profile,
-                        MemoryPhase::Write,
-                        Price::new(len, PriceBasis::Measured),
-                        1,
-                        1,
-                    );
+            Some(admit) => {
+                if admit
+                    .probed
+                    .is_none_or(|(_, then)| resident.saturating_sub(then) >= PROBE_EVERY_BYTES)
+                {
+                    admit.probed = live_headroom().map(|h| (h, resident));
                 }
-                fits
+                // Between probes the headroom falls by what was admitted.
+                let headroom = admit
+                    .probed
+                    .map_or(u64::MAX, |(h, then)| h.saturating_sub(resident - then));
+                resident + len <= admit.cap && headroom >= admit.margin.saturating_add(len)
             }
         };
         let state = if admitted {
@@ -383,11 +430,11 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn filled(chunks: &[&[u8]], budget: Option<MemoryBudget>) -> Arc<OverviewStore> {
+    fn filled(chunks: &[&[u8]], cap: Option<u64>) -> Arc<OverviewStore> {
         let dir = tempfile::tempdir().unwrap();
         let store = OverviewStore::new(dir.keep());
-        if let Some(b) = budget {
-            store.admit_under(b, MemoryProfile::Auto);
+        if let Some(cap) = cap {
+            store.admit_under(cap, 0);
         }
         let mut sink = OverviewSink::Store(Arc::clone(&store));
         for c in chunks {
@@ -432,13 +479,20 @@ mod tests {
         assert_eq!(store.resident_bytes(), all.len() as u64);
         assert_eq!(store.disk_bytes(), 0);
         check_reads(&store, &all);
-        // All evicted: the budget grants nothing.
-        let store = filled(&refs, Some(MemoryBudget::with_available(Some(0))));
+        // All evicted: no room.
+        let store = filled(&refs, Some(0));
         assert_eq!(store.resident_bytes(), 0);
         assert_eq!(store.disk_bytes(), all.len() as u64);
         check_reads(&store, &all);
+        // A margin no headroom meets evicts everything too.
+        let dir = tempfile::tempdir().unwrap();
+        let tight = OverviewStore::new(dir.keep());
+        tight.admit_under(u64::MAX, u64::MAX);
+        tight.append(&all);
+        tight.cut().unwrap();
+        assert_eq!(tight.resident_bytes(), 0);
         // Mixed: the budget holds the first chunks, the rest go to disk.
-        let store = filled(&refs, Some(MemoryBudget::with_available(Some(5000))));
+        let store = filled(&refs, Some(5000));
         let resident = store.resident_bytes();
         assert!(resident > 0 && resident < all.len() as u64, "{resident}");
         assert_eq!(resident + store.disk_bytes(), all.len() as u64);
@@ -455,6 +509,13 @@ mod tests {
             1
         );
         assert!(matches!(lock(&store.inner).chunks[6].state, State::Disk));
+        check_reads(&store, &all);
+        // Pressure: a margin above any headroom evicts every chunk.
+        let store = filled(&refs, None);
+        store.relieve(0);
+        assert_eq!(store.disk_bytes(), 0, "no pressure, no eviction");
+        store.relieve(u64::MAX);
+        assert_eq!(store.resident_bytes(), 0);
         check_reads(&store, &all);
     }
 
