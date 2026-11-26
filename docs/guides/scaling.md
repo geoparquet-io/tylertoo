@@ -111,9 +111,12 @@ can still add memory overhead. A build with `--no-default-features` uses the
 system allocator, except on musl targets, which always use mimalloc.
 
 tylertoo reads cgroup v2 `memory.max` and `memory.high` or the cgroup v1 limit,
-subtracting memory the cgroup cannot reclaim. Before export probes it, the
-allocator returns its freed pages to the OS, so memory the convert has
-already freed is not counted against the export. Slurm, Docker, and Kubernetes
+subtracting memory the cgroup cannot reclaim. On Linux, before export first
+probes it, tylertoo asks the allocator to return freed pages to the OS, so
+most of the memory the convert has already freed is not counted against the
+export. This happens once per process, and covers the calling thread's heap
+and the shared allocator arenas; pages a worker thread still holds can
+stay counted, and in Python only the first call in a process does it. Slurm, Docker, and Kubernetes
 jobs use this limit to size buffers. `--memory-limit` (Python
 `memory_limit`) and the `TYLERTOO_AUTO_MEM_LIMIT_BYTES` environment variable
 override both `MemAvailable` and the cgroup figure; see
