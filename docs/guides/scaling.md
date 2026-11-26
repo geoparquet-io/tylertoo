@@ -169,6 +169,17 @@ intermediate payload uses the selected input's compressed/uncompressed footer ra
 2x safety margin, capped at the raw estimate. Spill uses the profile's codec
 price (raw for `auto`, 0.4 times raw for `bounded`); framing stays raw for both.
 
+When you run under a container or cgroup memory cap, Linux starts writing the
+`tiles` intermediate overview and pass-2 spill to disk once they pass the
+limit's dirty-page threshold, even though tylertoo deletes them when the run
+ends. If these files share a slow volume with your output archive, such as a
+baseline gp3 EBS volume at about 125 MB/s, their writes compete with the
+archive's, and `tiles` spends seconds waiting in export finalize. To avoid
+this wait, point `--spill-dir` (Python: `spill_dir`) at a faster local disk,
+such as instance-store NVMe, while keeping your output where it is. On a
+64-core machine under a 24 GiB limit with output on a roughly 125 MB/s volume,
+this change cut NZ parcels from about 33 s to 26 s, with byte-identical output.
+
 - **Remote stage file.** A remote convert copies the column chunks it touches
   to local disk, using about as much space as those chunks. Both passes read
   the staged data. Local inputs never stage. A free-space check warns of a
