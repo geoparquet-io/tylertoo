@@ -1260,11 +1260,11 @@ fn valve_sample_bytes(
                             let at = (u64::from(*r) - base) as u32;
                             rows.binary_search(&at).expect("taken above")
                         };
-                        // #919: each row is clipped once a level, over the
-                        // key range of the tiles sampling it there; a tile
-                        // takes its own piece. A piece does not depend on the
-                        // range, so the samples are those of a clip per tile,
-                        // which clipped a large row whole for every tile.
+                        // #919: each row is clipped once a level, into the
+                        // tiles sampling it there alone; a tile takes its own
+                        // piece. A piece does not depend on the other tiles
+                        // clipped with it, so the samples are those of a clip
+                        // per tile, which clipped a large row whole per tile.
                         let mut keys: HashMap<(usize, usize), Vec<u64>> = HashMap::new();
                         for (i, wanted_rows) in &wanted {
                             for r in wanted_rows.iter().filter(in_batch) {
@@ -1276,22 +1276,20 @@ fn valve_sample_bytes(
                             .into_par_iter()
                             .flat_map_iter(|((k, level), mut keys)| {
                                 keys.sort_unstable();
+                                keys.dedup();
                                 #[cfg(test)]
                                 clipped.fetch_add(
                                     geoms[k].coords_count(),
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
-                                let (lo, hi) = (keys[0], keys[keys.len() - 1]);
-                                feature_tile_members(
+                                feature_tile_members_of(
                                     &geoms[k],
                                     zooms[level],
                                     opts,
-                                    lo,
-                                    hi,
+                                    &keys,
                                     &diagnostics,
                                 )
                                 .into_iter()
-                                .filter(move |(key, _)| keys.binary_search(key).is_ok())
                                 .map(move |(key, g)| ((k, level, key), g))
                             })
                             .collect();

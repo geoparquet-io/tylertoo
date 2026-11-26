@@ -3335,6 +3335,101 @@ fn price_samples_clip_a_large_row_once_for_all_its_tiles() {
     );
 }
 
+/// #919: the sampler clips a row once into the tiles that sample it, and
+/// each tile takes its own piece. That piece must be the one a clip into
+/// that tile alone gives, for every tile the row's bbox reaches (a piece or
+/// none), and no other tile may be clipped or held, so the floors are those
+/// of the per-tile clip it replaced: across the cascade and direct paths,
+/// the world-edge wrap, holes, several parts and a self-intersecting ring.
+#[test]
+fn a_range_clip_gives_each_tile_the_piece_of_its_own_clip() {
+    let opts = ExportOptions::default();
+    let d = crate::diagnostics::Diagnostics::default();
+    let ring = |cx: f64, cy: f64, r: f64, n: u32| -> LineString<f64> {
+        LineString::from(
+            (0..=n)
+                .map(|i| {
+                    let a = f64::from(i % n) * std::f64::consts::TAU / f64::from(n);
+                    (cx + r * 1.5 * a.cos(), cy + r * a.sin())
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let poly = |rings: Vec<LineString<f64>>| {
+        let mut rings = rings.into_iter();
+        geo::Polygon::new(rings.next().unwrap(), rings.collect())
+    };
+    let mut corpus = equivalence_corpus();
+    corpus.extend([
+        // 5,000 vertices: the direct loop at z3, the cascade at z4-5.
+        (
+            "disc",
+            Geometry::Polygon(poly(vec![ring(10.0, 5.0, 40.0, 5_000)])),
+            vec![3, 4, 5],
+        ),
+        // The hole's tiles are reached by the bbox, not the geometry.
+        (
+            "annulus",
+            Geometry::Polygon(poly(vec![
+                ring(-60.0, 20.0, 30.0, 3_000),
+                ring(-60.0, 20.0, 25.0, 3_000),
+            ])),
+            vec![4, 5],
+        ),
+        (
+            "two_parts",
+            Geometry::MultiPolygon(geo::MultiPolygon(vec![
+                poly(vec![ring(-120.0, -30.0, 8.0, 400)]),
+                poly(vec![ring(100.0, 40.0, 8.0, 400)]),
+            ])),
+            vec![3, 5],
+        ),
+        (
+            "bowtie",
+            Geometry::Polygon(poly(vec![LineString::from(vec![
+                (-30.0, -30.0),
+                (30.0, 30.0),
+                (30.0, -30.0),
+                (-30.0, 30.0),
+                (-30.0, -30.0),
+            ])])),
+            vec![3, 5],
+        ),
+        // Stored past +180: its overhang is drawn at the west edge.
+        (
+            "over_the_antimeridian",
+            Geometry::Polygon(poly(vec![ring(178.0, -10.0, 12.0, 2_000)])),
+            vec![3, 5],
+        ),
+    ]);
+    for (name, geom, zooms) in corpus {
+        let r = geom.bounding_rect().expect("bbox");
+        let bbox = TileBounds::new(r.min().x, r.min().y, r.max().x, r.max().y);
+        for z in zooms {
+            // The tiles the sampler can ask for: the scan's, by bbox.
+            let (_, counts) = size_bboxes(&[Some(bbox)], z, &opts, true);
+            let mut keys: Vec<u64> = counts.into_keys().collect();
+            keys.sort_unstable();
+            let ends = vec![keys[0], keys[keys.len() - 1]];
+            let alternate: Vec<u64> = keys.iter().step_by(2).copied().collect();
+            for wanted in [&keys, &alternate, &ends] {
+                let shared = members_by_key(feature_tile_members_of(&geom, z, &opts, wanted, &d));
+                let mut own = HashMap::new();
+                for &k in wanted {
+                    own.extend(feature_tile_members(&geom, z, &opts, k, k, &d));
+                }
+                assert_eq!(
+                    shared,
+                    own,
+                    "'{name}' z{z}, {} of {} tiles",
+                    wanted.len(),
+                    keys.len()
+                );
+            }
+        }
+    }
+}
+
 /// #768: a predictor over the scan's budget drops its dense state and
 /// says so; the export goes on as under `--valve-scope tile`, with the
 /// same tile counts.
