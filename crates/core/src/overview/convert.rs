@@ -1131,7 +1131,7 @@ pub const WORKER_THREADS_MAX: usize = 40;
 ///
 /// The `workers` option wins when set (validation refuses `0`), then a
 /// positive `RAYON_NUM_THREADS`, else
-/// [`default_worker_threads`] on the cores this process may use
+/// `default_worker_threads` on the cores this process may use
 /// (`available_parallelism`, which honours affinity and a cgroup CPU
 /// quota). The CLI, the Python module and the core entry points size the
 /// pool with it ([`init_worker_pool`]). Only the pool: knobs that read
