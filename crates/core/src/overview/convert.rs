@@ -5617,8 +5617,11 @@ pub(super) struct Pass1MemoryReport {
     pub(super) outcome: Pass1MemoryOutcome,
     /// Footer-counted input rows the verdict was formed from.
     pub(super) rows: u64,
-    /// `rows ×` [`PASS1_BYTES_PER_ROW`].
+    /// `rows × bytes_per_row`.
     pub(super) estimated_bytes: u64,
+    /// The per-row price of the level assignment path that runs (#928):
+    /// [`PASS1_BYTES_PER_ROW`] on the table path.
+    pub(super) bytes_per_row: u64,
     /// The probed figure and which term supplied it; `None` when nothing
     /// could be probed.
     pub(super) limit_bytes: Option<u64>,
@@ -5766,6 +5769,7 @@ pub(super) fn preflight_pass1_memory(
         outcome,
         rows,
         estimated_bytes,
+        bytes_per_row: price.bytes_per_row,
         limit_bytes: limit.map(|l| l.bytes),
         limit_source: limit.map(|l| l.source.describe()),
     };

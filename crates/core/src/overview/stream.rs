@@ -4746,6 +4746,7 @@ fn pass1_memory_json(r: super::convert::Pass1MemoryReport) -> serde_json::Value 
         "verdict": r.outcome.as_str(),
         "rows": r.rows,
         "estimated_bytes": r.estimated_bytes,
+        "bytes_per_row": r.bytes_per_row,
         "limit_bytes": r.limit_bytes,
         "limit_source": r.limit_source,
     })
