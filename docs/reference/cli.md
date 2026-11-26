@@ -216,6 +216,8 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 | --- | --- |
 | `--spill-dir <PATH>` | Directory for the export's spill file, used when buffered tiles exceed the memory budget. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>. |
 | `--profile <PROFILE>` | Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a `--no-default-features` build uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>. Default: `auto`. Possible values: `auto`, `speed`, `bounded`. |
+| `--workers <N>` | Worker threads for the whole run. Default: every core under `auto` and `speed`, at most 40 under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>. |
+| `--memory-limit <SIZE>` | Memory the run may use, such as `24G`, in place of the detected available memory (cgroup limit or `MemAvailable`); overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit>. |
 
 ## `tylertoo decode`
 
@@ -345,6 +347,8 @@ tylertoo pyramid [OPTIONS] --band <LO-HI:[SYSTEM:]INPUT[:LAYER]> <OUTPUT>
 | Option | Description |
 | --- | --- |
 | `--profile <PROFILE>` | Memory profile, as for tiles, for every GeoParquet band's convert and export; changes memory use, not output bytes. Default: `auto`. Possible values: `auto`, `speed`, `bounded`. |
+| `--workers <N>` | Worker threads, as for tiles. |
+| `--memory-limit <SIZE>` | Memory the run may use, such as `24G`, as for tiles. |
 
 ## `tylertoo merge`
 
@@ -492,6 +496,8 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | --- | --- |
 | `--read-batch-size <ROWS>` | Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>. Default: `8192`. |
 | `--profile <PROFILE>` | Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a `--no-default-features` build uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>. Default: `auto`. Possible values: `auto`, `speed`, `bounded`. |
+| `--workers <N>` | Worker threads for the whole run. Default: every core under `auto` and `speed`, at most 40 under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>. |
+| `--memory-limit <SIZE>` | Memory the run may use, such as `24G`, in place of the detected available memory (cgroup limit or `MemAvailable`); overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit>. |
 | `--in-flight-batches <N\|auto>` | Read batches in flight at once, or `auto` to size it to the cores. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>. Default: `auto`. |
 | `--read-workers <N\|auto>` | Reader threads for both passes, or `auto` for half the cores in the first pass and a quarter in the second, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>. Default: `auto`. |
 | `--spill-dir <PATH>` | Directory for spill files: staged remote input, and on `tiles` the intermediate overview. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>. |

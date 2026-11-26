@@ -2363,6 +2363,15 @@ memory the convert has just freed counts as available (#876). Under every profil
 still refuses a tile that alone needs more than the machine's memory
 ([Export waves](guides/scaling.md#export-waves)).
 
+Two options sit beside the profile. `--memory-limit SIZE` (Python
+`memory_limit`, in bytes) replaces the detected memory that every budget
+above is a share of, and takes precedence over
+`TYLERTOO_AUTO_MEM_LIMIT_BYTES` ([Memory limit](guides/scaling.md#memory-limit)).
+`--workers N` (Python `workers`) sets the worker pool; without it `auto`
+and `speed` use every core and `bounded` at most 40
+([Worker threads](guides/scaling.md#worker-threads), with measured wall
+times and peak memory per core count).
+
 `auto` is a third shape, not a switch between the other two: on a large
 machine it holds more than `bounded` and less than `speed`. On a machine
 with about 90 GB available, Moldova (632k polygons, z0-14) under `auto`

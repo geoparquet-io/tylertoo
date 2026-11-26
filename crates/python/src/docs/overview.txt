@@ -141,6 +141,18 @@ Args:
         restored; overlapping calls on other threads share it while any
         `"bounded"` call runs. A non-musl source build uses the system allocator with
         `maturin build --no-default-features` (musl always uses mimalloc).
+    workers: [Worker threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads)
+        for the whole run. `None` (default) uses `RAYON_NUM_THREADS`
+        when set, else every core under `"auto"` and `"speed"` and at
+        most 40 under `"bounded"`. `0` is an error. The pool is
+        process-wide, so the first call in a process sets it and later
+        calls keep it.
+    memory_limit: [Memory limit](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit)
+        in bytes, such as `24 * 2**30`, used in place of the detected
+        available memory (cgroup limit or `MemAvailable`). It overrides
+        `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. `0` is an error. The limit is
+        process-wide: it stays in force for later calls in the process
+        until another call sets one.
     in_flight_batches: [Concurrent batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency),
         or `0` to size from the CPU count.
     read_workers: [Reader threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency),

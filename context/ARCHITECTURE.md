@@ -95,6 +95,22 @@ times, through three probes in `pipeline.rs`, each for a reason:
 - **export's diagnostics:** the cap on the Python loss list comes from its
   own `MemoryBudget::probe()`. It sizes a report, never the archive.
 
+Every probe above reads one override first (`auto_mem_limit_override`):
+the `memory_limit` option (`--memory-limit`), else
+`TYLERTOO_AUTO_MEM_LIMIT_BYTES` (#876). The option reaches the probes as a
+process-wide value that `ConvertOptions::validate` and
+`ExportOptions::validate` set before any I/O (`apply_run_resources`), not
+through the budgets: export's budget readers (the join's fits,
+`resolve_partition_wave`) take no options. An unset option leaves the value
+alone, so a run's internal default options cannot clear it, and in Python a
+later call without `memory_limit` keeps an earlier call's.
+
+The same validation builds the global Rayon pool on a library caller's
+first run (#876): `workers` when set, else a positive `RAYON_NUM_THREADS`,
+else every core under `auto` and `speed` and `min(cores, 40)` under
+`bounded` (`resolve_worker_threads`). The CLI builds it at startup, and
+Python on its first call, with the same rule.
+
 `--max-zoom auto` also stages its sample through a throwaway
 `MemoryBudget::probe()` (`auto_zoom.rs`), before `preflight()` builds the
 conversion's budget. That grant is released before the conversion starts.
