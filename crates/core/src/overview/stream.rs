@@ -6925,20 +6925,24 @@ fn pass1_tables(
 /// taken, once.
 fn stream_assigner(ctx: &Pass1Ctx<'_>, rows: u64) -> Result<Option<StreamAssigner>, ConvertError> {
     use super::assign_stream as sa;
-    let (kinds, spans) = match ctx.assign {
+    let (kinds, spans, bytes_per_row) = match ctx.assign {
         AssignPath::Table(reason) => {
             sa::record_path(false);
             log::info!("[assign] level assignment path: table ({reason})");
             return Ok(None);
         }
-        AssignPath::Streamed { kinds, spans, .. } => (*kinds, spans),
+        AssignPath::Streamed {
+            kinds,
+            spans,
+            bytes_per_row,
+        } => (*kinds, spans, *bytes_per_row),
     };
     let options = ctx.config.options();
     let level_specs = options.levels.resolve(options.gsd_base)?;
     let level_reprs = super::convert::level_representations(&level_specs, &options.representation);
     sa::record_path(true);
     log::info!(
-        "[assign] level assignment path: streamed ({kinds:?}, {} level(s))",
+        "[assign] level assignment path: streamed ({kinds:?}, {} level(s), priced at {bytes_per_row} B/row)",
         level_specs.len()
     );
     let assigner = StreamAssigner::new(

@@ -242,6 +242,10 @@ impl AssignPath {
             0
         };
         let worst = base + per_row(cells) + patch_excess;
+        log::debug!(
+            "[assign] predicted live line cells {cells}, patches {patches} over {rows} rows: \
+             streamed {worst} B/row"
+        );
         let map_bytes = cells.saturating_add(if gate.bounded_profile { patches } else { 0 });
         if map_bytes.saturating_mul(MAP_ENTRY_BYTES) > SMALL_MAPS
             && Pass1Price::streamed(worst).whole_job_per_row()
@@ -453,43 +457,109 @@ impl Eviction {
             && spans.iter().any(|s| s.bounds.is_some())
     }
 
-    /// An upper bound on the entries live at once over levels of cell (or
-    /// patch) widths `widths`, from the footers alone. A group's rows open
-    /// at most one entry each per level, and no more than its bounds cover
-    /// (grown by the two cells an entry's own grown cell can reach past
-    /// them); every entry a group opens is due by the last group those
-    /// grown bounds reach. An unbounded group's entries stay to the end.
+    /// The peak entries live at once over levels of cell (or patch) widths
+    /// `widths`, predicted from the footers alone. While the stream is in
+    /// group `g`, `g` holds at most one entry per row and per cell its
+    /// bounds cover. After it, an entry stays only while a later group's
+    /// bounds reach its grown cell, so `g` keeps the cells its bounds share
+    /// with later groups' (each grown by the two cells a grown cell
+    /// reaches), until the last such group. Footers say nothing of where in
+    /// its bounds a group's rows lie, so each shared region keeps its share
+    /// of the group's rows by area: overlapping, unsorted groups keep about
+    /// all of them, sorted groups a thin edge. A group with more than
+    /// [`Self::NEIGHBOURS`] later neighbours at a level, or followed by an
+    /// unbounded group, keeps all its entries to the end, which caps the
+    /// cost on unsorted input; an unbounded group keeps one per row.
     fn predicted_peak(&self, widths: &[f64]) -> u64 {
         let n = self.ends.len();
-        let mut delta = vec![0i64; n + 1];
-        for &w in widths {
-            for g in 0..n {
-                let rows = self.ends[g] - g.checked_sub(1).map_or(0, |p| self.ends[p]);
-                let (entries, last) = match self.bounds[g] {
-                    Some([x0, y0, x1, y1]) if w.is_finite() && w > 0.0 => {
-                        let grown = [x0 - 2.0 * w, y0 - 2.0 * w, x1 + 2.0 * w, y1 + 2.0 * w];
-                        let cells = (((x1 - x0) / w).ceil() + 3.0) * (((y1 - y0) / w).ceil() + 3.0);
-                        let entries = if cells < rows as f64 {
-                            cells as usize
+        let widths: Vec<f64> = widths
+            .iter()
+            .copied()
+            .filter(|w| w.is_finite() && *w > 0.0)
+            .collect();
+        let grow = |[x0, y0, x1, y1]: [f64; 4], d: f64| [x0 - d, y0 - d, x1 + d, y1 + d];
+        // Cells of width `w` a rectangle touches, with the slack the eviction
+        // grows them by; none when it is empty.
+        let cells = |[x0, y0, x1, y1]: [f64; 4], w: f64| {
+            if x0 > x1 || y0 > y1 {
+                0.0
+            } else {
+                (((x1 - x0) / w).ceil() + 3.0) * (((y1 - y0) / w).ceil() + 3.0)
+            }
+        };
+        let meet = |a: [f64; 4], b: [f64; 4]| {
+            [
+                a[0].max(b[0]),
+                a[1].max(b[1]),
+                a[2].min(b[2]),
+                a[3].min(b[3]),
+            ]
+        };
+        // The fraction of `whole` that `part` (inside it) covers; all of it
+        // when `whole` has no area.
+        let share = |part: [f64; 4], whole: [f64; 4]| {
+            let area = |[x0, y0, x1, y1]: [f64; 4]| (x1 - x0).max(0.0) * (y1 - y0).max(0.0);
+            let whole = area(whole);
+            if whole > 0.0 {
+                (area(part) / whole).min(1.0)
+            } else {
+                1.0
+            }
+        };
+        let mut delta = vec![0f64; n + 1];
+        for g in 0..n {
+            let rows = (self.ends[g] - g.checked_sub(1).map_or(0, |p| self.ends[p])) as f64;
+            let later_unbounded = self.last_unbounded.get(g + 1).copied().flatten();
+            for &w in &widths {
+                let (open, kept, last) = match self.bounds[g] {
+                    Some(b) => {
+                        let open = rows.min(cells(b, w));
+                        let reach = 3.0 * w;
+                        let envelope = AABB::from_corners(
+                            [b[0] - reach, b[1] - reach],
+                            [b[2] + reach, b[3] + reach],
+                        );
+                        let found: Vec<usize> = self
+                            .tree
+                            .locate_in_envelope_intersecting(&envelope)
+                            .map(|e| e.data)
+                            .filter(|&j| j > g)
+                            .take(Self::NEIGHBOURS + 1)
+                            .collect();
+                        if found.len() > Self::NEIGHBOURS || later_unbounded.is_some() {
+                            (open, open, n - 1)
                         } else {
-                            rows
-                        };
-                        (entries, self.expiry_at(g, grown))
+                            let (mut kept, mut last) = (0.0, g);
+                            for j in found {
+                                let bj = self.bounds[j].expect("the tree holds bounded groups");
+                                let shared = meet(grow(b, w), grow(bj, 2.0 * w));
+                                let touched = cells(shared, w);
+                                if touched > 0.0 {
+                                    kept += touched.min(rows * share(shared, grow(b, w)));
+                                    last = last.max(j);
+                                }
+                            }
+                            (open, kept.min(open), last)
+                        }
                     }
-                    _ => (rows, n - 1),
+                    None => (rows, rows, n - 1),
                 };
-                let entries = i64::try_from(entries).unwrap_or(i64::MAX);
-                delta[g] = delta[g].saturating_add(entries);
-                delta[last + 1] = delta[last + 1].saturating_sub(entries);
+                delta[g] += open;
+                delta[g + 1] -= open - kept;
+                delta[last + 1] -= kept;
             }
         }
-        let (mut live, mut peak) = (0i64, 0i64);
+        let (mut live, mut peak) = (0f64, 0f64);
         for d in &delta[..n] {
-            live = live.saturating_add(*d);
+            live += d;
             peak = peak.max(live);
         }
-        u64::try_from(peak).unwrap_or(0)
+        peak as u64
     }
+
+    /// Later groups a group's bounds may meet before the prediction gives
+    /// up on it ([`Self::predicted_peak`]).
+    const NEIGHBOURS: usize = 64;
 
     /// Move to `row`'s group, returning the groups finished on the way.
     fn advance(&mut self, row: usize) -> std::ops::Range<usize> {
