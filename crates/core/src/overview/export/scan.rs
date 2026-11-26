@@ -942,6 +942,13 @@ fn predict_floors(
          rows: &dyn Fn(&[valve_predict::SampleAt]) -> Result<SampleRows, ExportError>| {
             let price = Price::model(member.saturating_mul(members as u64));
             let chunk = budget.affordable(options.profile, MemoryPhase::ExportCollect, price);
+            // #919: a row sampled by tiles in several chunks is clipped once
+            // a chunk, so a tight budget can still make this slow; say so.
+            log::info!(
+                "[export] valve predictor: pricing {} tiles by samples of {members} members, in {} chunks (--valve-scope tile skips this)",
+                tiles.len(),
+                tiles.len().div_ceil(chunk),
+            );
             let mut bytes = HashMap::new();
             for tiles in tiles.chunks(chunk) {
                 #[cfg(test)]
@@ -964,10 +971,6 @@ fn predict_floors(
             Ok::<_, ExportError>(bytes)
         };
     let priced = p.priced();
-    log::info!(
-        "[export] valve predictor: pricing {} tiles by sample encodes (--valve-scope tile skips this)",
-        priced.len()
-    );
     let mut bytes = sample(&priced, valve_predict::PRICE_MEMBERS, &|tiles| {
         stored_sample_rows(reader, p, tiles)
     })?;
