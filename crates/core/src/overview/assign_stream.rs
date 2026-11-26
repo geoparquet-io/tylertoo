@@ -18,15 +18,16 @@
 //! rows already folded into `min_levels` cannot be recovered.
 
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 
+use foldhash::HashMap;
+use rayon::prelude::*;
 use rstar::primitives::{GeomWithData, Rectangle};
 use rstar::{RTree, AABB};
 
 use super::accumulate::{log_floored_zooms, CarrierRow, LevelAccumulator};
 use super::assign::{
-    gsd_to_coord_units, place_feature, AssignConfig, CellKey, FeatureKind, FeatureTable, Placement,
-    Priority, SortDirection,
+    gsd_to_coord_units, place_feature, AssignConfig, CellKey, FeatureKind, FeatureRow,
+    FeatureTable, Placement, Priority, SortDirection,
 };
 use super::convert::{ConvertError, ConvertOptions};
 use super::level::Crs;
@@ -339,27 +340,30 @@ impl Eviction {
         from..self.current
     }
 
-    /// Whether `center` lies inside the current group's footer bounds.
-    fn contains(&self, (x, y): (f64, f64)) -> bool {
-        match self.bounds.get(self.current) {
+    /// Whether `center` lies inside the footer bounds of `row`'s group.
+    fn contains_row(&self, row: usize, (x, y): (f64, f64)) -> bool {
+        let group = self.ends.partition_point(|&end| end <= row);
+        match self.bounds.get(group) {
             Some(Some([x0, y0, x1, y1])) => x >= *x0 && x <= *x1 && y >= *y0 && y <= *y1,
             _ => true,
         }
     }
 
-    /// Schedule `due`, covering `rect`, to close after the last group that
-    /// can still reach it.
-    fn schedule(&mut self, due: Due, [x0, y0, x1, y1]: [f64; 4]) {
+    /// The last group that can still reach `rect`: the one to close it after.
+    fn expiry(&self, [x0, y0, x1, y1]: [f64; 4]) -> usize {
         let current = self.current.min(self.ends.len() - 1);
         let envelope = AABB::from_corners([x0, y0], [x1, y1]);
-        let last = self
-            .tree
+        self.tree
             .locate_in_envelope_intersecting(&envelope)
             .map(|g| g.data)
             .chain(self.last_unbounded[current])
             .max()
             .unwrap_or(current)
-            .max(current);
+            .max(current)
+    }
+
+    /// Schedule `due` to close after group `last` (its [`Self::expiry`]).
+    fn schedule(&mut self, due: Due, last: usize) {
         let list = &mut self.due[last];
         let before = list.capacity();
         list.push(due);
@@ -382,6 +386,16 @@ impl Eviction {
         (self.peak_cap * std::mem::size_of::<Due>() + index) as u64
     }
 }
+
+/// One scan chunk handed to [`StreamAssigner::push_batch`]: its table,
+/// areas, first row and row count.
+pub(super) type ChunkRef<'a> = (&'a FeatureTable, &'a [f32], usize, usize);
+
+/// A placed row: the row, its area, and the coarsest level it wins.
+type Placed = (FeatureRow, f32, u8);
+
+/// The cells and patches one level opened in a segment.
+type Opened = (Vec<(Due, usize)>, Vec<(Due, usize)>);
 
 /// The streaming assignment's result, row-indexed like `WinnerTables`.
 pub(super) struct StreamAssigned {
@@ -415,6 +429,8 @@ pub(super) struct StreamAssigner {
     live_cells: usize,
     peak_patches: usize,
     live_patches: usize,
+    /// `[profile]` split: placement, level contests, scheduling.
+    timers: [std::time::Duration; 3],
 }
 
 impl StreamAssigner {
@@ -455,7 +471,7 @@ impl StreamAssigner {
             reprs: (0..finest)
                 .map(|l| level_reprs.get(l).copied().unwrap_or_default())
                 .collect(),
-            grids: (0..finest).map(|_| HashMap::new()).collect(),
+            grids: (0..finest).map(|_| HashMap::default()).collect(),
             any_acc: accs.iter().any(LevelAccumulator::is_active),
             accs,
             min_levels,
@@ -467,6 +483,7 @@ impl StreamAssigner {
             live_cells: 0,
             peak_patches: 0,
             live_patches: 0,
+            timers: Default::default(),
         }
     }
 
@@ -507,105 +524,207 @@ impl StreamAssigner {
         self.features
     }
 
-    /// Assign one scan chunk: `chunk` holds chunk-local indices, `areas` is
-    /// parallel to it (empty unless the accumulator is on), and the chunk
-    /// covers rows `base..base + rows`.
+    /// Assign consecutive scan chunks `(chunk, areas, base, rows)`: each
+    /// `chunk` holds chunk-local indices, `areas` is parallel to it (empty
+    /// unless the accumulator is on), and it covers rows `base..base + rows`. The per-row placement fans out
+    /// over rows; the order-dependent contests and patch sums fan out over
+    /// levels, each level still reading its rows in ascending order, so
+    /// tie-breaks and the dither are those of a serial pass.
     ///
     /// # Errors
     ///
-    /// A row of a kind the footers did not declare: the streamed path cannot
-    /// fall back once rows are folded.
-    pub(super) fn push_chunk(
-        &mut self,
-        chunk: &FeatureTable,
-        areas: &[f32],
-        base: usize,
-        rows: usize,
-    ) -> Result<(), ConvertError> {
-        let end = base + rows;
+    /// A row of a kind the footers did not declare, or outside its row
+    /// group's bounds: the streamed path cannot fall back once rows are
+    /// folded. The first such row in row order is the one reported.
+    pub(super) fn push_batch(&mut self, chunks: &[ChunkRef<'_>]) -> Result<(), ConvertError> {
+        let Some(&(_, _, last_base, last_rows)) = chunks.last() else {
+            return Ok(());
+        };
+        let end = last_base + last_rows;
         self.min_levels.resize(end, super::stream::UNASSIGNED_LEVEL);
         if let Some(k) = &mut self.kinds {
             k.resize(end, FeatureKind::Point);
         }
-        let dir = self.config.sort_direction;
-        for pos in 0..chunk.len() {
-            let mut row = chunk.row(pos);
-            row.index += base;
-            if !self.allowed.has(row.kind) {
-                return Err(undeclared(row.index, row.kind));
-            }
-            self.advance(row.index);
-            if self.evict.as_ref().is_some_and(|e| !e.contains(row.center)) {
-                return Err(outside_bounds(row.index));
-            }
-            debug_assert!(!row.sort_key.is_finite() && row.entry_level.is_none());
-            match row.kind {
-                FeatureKind::Point => self.kind_counts.0 += 1,
-                FeatureKind::Line => self.kind_counts.1 += 1,
-                FeatureKind::Polygon => self.kind_counts.2 += 1,
-            }
-            self.features += 1;
-            let mut ml = self.finest;
-            for li in 0..self.gsd_units.len() {
-                match place_feature(row, &self.config, self.gsd_units[li], self.reprs[li]) {
-                    Placement::Skip => {}
-                    Placement::Wins => ml = ml.min(li as u8),
-                    Placement::Cell(key) => {
-                        // A polygon's level must be final before the
-                        // accumulator reads it; the gate rules this out.
-                        if row.kind == FeatureKind::Polygon {
-                            return Err(undeclared(row.index, row.kind));
+        let t = std::time::Instant::now();
+        // Each chunk writes its own slice of the row tables, in parallel.
+        let first = chunks[0].2;
+        let mut min_levels = std::mem::take(&mut self.min_levels);
+        let mut kinds = self.kinds.take();
+        let mut ml_rest = &mut min_levels[first..end];
+        let mut kind_rest = kinds.as_mut().map(|k| &mut k[first..end]);
+        let mut slices = Vec::with_capacity(chunks.len());
+        for &(_, _, _, rows) in chunks {
+            let (ml, rest) = std::mem::take(&mut ml_rest).split_at_mut(rows);
+            ml_rest = rest;
+            let kind = kind_rest.take().map(|k| {
+                let (kind, rest) = k.split_at_mut(rows);
+                kind_rest = Some(rest);
+                kind
+            });
+            slices.push((ml, kind));
+        }
+        let placed: Vec<_> = chunks
+            .par_iter()
+            .zip(slices)
+            .map(
+                |(&(chunk, areas, base, _), (ml, mut kind))| -> Result<_, ConvertError> {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    let mut counts = [0usize; 3];
+                    for pos in 0..chunk.len() {
+                        let mut row = chunk.row(pos);
+                        let local = row.index;
+                        row.index += base;
+                        let level = self.place(row)?;
+                        ml[local] = level;
+                        if let Some(k) = kind.as_deref_mut() {
+                            k[local] = row.kind;
                         }
-                        let challenger = Incumbent {
-                            diag_sq: row.diag_sq,
-                            index: row.index,
-                        };
-                        match self.grids[li].entry(key) {
-                            Entry::Occupied(mut slot) => {
-                                if challenger.priority(dir).beats(&slot.get().priority(dir)) {
-                                    *slot.get_mut() = challenger;
+                        counts[row.kind as usize] += 1;
+                        let area = areas.get(pos).copied().unwrap_or(0.0);
+                        out.push((row, area, level));
+                    }
+                    Ok((out, counts))
+                },
+            )
+            .collect();
+        self.min_levels = min_levels;
+        self.kinds = kinds;
+        let mut rows = Vec::with_capacity(placed.iter().flatten().map(|(o, _)| o.len()).sum());
+        for p in placed {
+            // In chunk order, so the first bad row in row order is reported.
+            let (out, [points, lines, polygons]) = p?;
+            self.kind_counts.0 += points;
+            self.kind_counts.1 += lines;
+            self.kind_counts.2 += polygons;
+            rows.extend(out);
+        }
+        self.features += rows.len();
+        self.timers[0] += t.elapsed();
+        // One segment per row group, so closes still happen at group ends.
+        let mut a = 0;
+        while a < rows.len() {
+            let t = std::time::Instant::now();
+            self.advance(rows[a].0.index);
+            self.timers[2] += t.elapsed();
+            let group_end = self
+                .evict
+                .as_ref()
+                .and_then(|e| e.ends.get(e.current).copied())
+                .unwrap_or(usize::MAX);
+            let b = a + rows[a..].partition_point(|(r, _, _)| r.index < group_end);
+            self.assign_segment(&rows[a..b]);
+            a = b;
+        }
+        Ok(())
+    }
+
+    /// The pure per-row part: the row's checks and the coarsest level it
+    /// wins outright.
+    fn place(&self, row: FeatureRow) -> Result<u8, ConvertError> {
+        if !self.allowed.has(row.kind) {
+            return Err(undeclared(row.index, row.kind));
+        }
+        if self
+            .evict
+            .as_ref()
+            .is_some_and(|e| !e.contains_row(row.index, row.center))
+        {
+            return Err(outside_bounds(row.index));
+        }
+        debug_assert!(!row.sort_key.is_finite() && row.entry_level.is_none());
+        let mut ml = self.finest;
+        for li in 0..self.gsd_units.len() {
+            match place_feature(row, &self.config, self.gsd_units[li], self.reprs[li]) {
+                Placement::Skip => {}
+                Placement::Wins => ml = ml.min(li as u8),
+                // A polygon's level must be final before the accumulator
+                // reads it; the gate rules this out.
+                Placement::Cell(_) if row.kind == FeatureKind::Polygon => {
+                    return Err(undeclared(row.index, row.kind));
+                }
+                Placement::Cell(_) => {}
+            }
+        }
+        Ok(ml)
+    }
+
+    /// Run the cell contests and patch sums of `rows` (ascending, one row
+    /// group) on every level at once, then schedule what they opened.
+    fn assign_segment(&mut self, rows: &[Placed]) {
+        let config = &self.config;
+        let dir = config.sort_direction;
+        let any_acc = self.any_acc;
+        let t = std::time::Instant::now();
+        let evict = self.evict.as_ref();
+        let opened: Vec<Opened> = self
+            .grids
+            .par_iter_mut()
+            .zip(self.accs.par_iter_mut())
+            .zip(self.gsd_units.par_iter().zip(self.reprs.par_iter()))
+            .enumerate()
+            .map(|(li, ((grid, acc), (&gsd, &repr)))| {
+                let level = li as u8;
+                let cs = gsd * config.line_thinning;
+                let width = acc.patch_width();
+                // The R-tree lookups run here, in parallel; only the pushes
+                // onto the due lists stay serial.
+                let expiry = |rect| evict.map_or(0, |e: &Eviction| e.expiry(rect));
+                let (mut cells, mut patches) = (Vec::new(), Vec::new());
+                for &(row, area, ml) in rows {
+                    match row.kind {
+                        FeatureKind::Line => {
+                            let Placement::Cell(key) = place_feature(row, config, gsd, repr) else {
+                                continue;
+                            };
+                            let challenger = Incumbent {
+                                diag_sq: row.diag_sq,
+                                index: row.index,
+                            };
+                            match grid.entry(key) {
+                                Entry::Occupied(mut slot) => {
+                                    if challenger.priority(dir).beats(&slot.get().priority(dir)) {
+                                        *slot.get_mut() = challenger;
+                                    }
                                 }
-                            }
-                            Entry::Vacant(slot) => {
-                                slot.insert(challenger);
-                                self.live_cells += 1;
-                                self.peak_cells = self.peak_cells.max(self.live_cells);
-                                if let Some(evict) = &mut self.evict {
-                                    let cs = self.gsd_units[li] * self.config.line_thinning;
+                                Entry::Vacant(slot) => {
+                                    slot.insert(challenger);
                                     let (_, ix, iy) = key;
-                                    let rect = grown_cell(ix, iy, cs);
-                                    evict.schedule(Due::cell(li as u8, key), rect);
+                                    let d = Due::cell(level, key);
+                                    cells.push((d, expiry(grown_cell(ix, iy, cs))));
                                 }
                             }
                         }
+                        // The gate keeps every row index within a `CarrierRow`.
+                        FeatureKind::Polygon if any_acc && usize::from(ml) > li => {
+                            if let Some((ix, iy)) =
+                                acc.add(row.index as CarrierRow, row.center, area)
+                            {
+                                let d = Due::patch(level, (ix, iy));
+                                let w = width.expect("an open patch has a width");
+                                patches.push((d, expiry(grown_cell(ix, iy, w))));
+                            }
+                        }
+                        _ => {}
                     }
                 }
-            }
-            self.min_levels[row.index] = ml;
-            if let Some(k) = &mut self.kinds {
-                k[row.index] = row.kind;
-            }
-            if self.any_acc && row.kind == FeatureKind::Polygon {
-                let area = areas.get(pos).copied().unwrap_or(0.0);
-                for (li, acc) in self.accs.iter_mut().enumerate() {
-                    if usize::from(ml) > li {
-                        // The gate keeps every row index within a `CarrierRow`.
-                        let index = row.index as CarrierRow;
-                        if let Some((ix, iy)) = acc.add(index, row.center, area) {
-                            self.live_patches += 1;
-                            self.peak_patches = self.peak_patches.max(self.live_patches);
-                            if let (Some(evict), Some(w)) = (&mut self.evict, acc.patch_width()) {
-                                evict.schedule(
-                                    Due::patch(li as u8, (ix, iy)),
-                                    grown_cell(ix, iy, w),
-                                );
-                            }
-                        }
-                    }
+                (cells, patches)
+            })
+            .collect();
+        self.timers[1] += t.elapsed();
+        let t = std::time::Instant::now();
+        for (cells, patches) in opened {
+            self.live_cells += cells.len();
+            self.live_patches += patches.len();
+            if let Some(evict) = &mut self.evict {
+                for (d, last) in cells.into_iter().chain(patches) {
+                    evict.schedule(d, last);
                 }
             }
         }
-        Ok(())
+        self.timers[2] += t.elapsed();
+        // Nothing closes inside a segment, so its end is its peak.
+        self.peak_cells = self.peak_cells.max(self.live_cells);
+        self.peak_patches = self.peak_patches.max(self.live_patches);
     }
 
     /// Fold the line grids' winners and close the accumulator.
@@ -620,8 +739,15 @@ impl StreamAssigner {
             evict,
             peak_cells,
             peak_patches,
+            timers,
             ..
         } = self;
+        log::debug!(
+            "[profile] streamed assignment: place {:.2}s, levels {:.2}s, schedule {:.2}s",
+            timers[0].as_secs_f64(),
+            timers[1].as_secs_f64(),
+            timers[2].as_secs_f64()
+        );
         let mut memory = StreamMemory {
             cells: peak_cells,
             patches: peak_patches,
@@ -756,7 +882,7 @@ mod tests {
             let mut a =
                 StreamAssigner::new(BOTH, &options, &specs, &reprs, Crs::Epsg3857, (1, &spans));
             assert!(a.evicts());
-            a.push_chunk(&[line(x)].iter().collect(), &[], 0, 1)
+            a.push_batch(&[(&[line(x)].iter().collect(), &[], 0, 1)])
         };
         assert!(push(1.0).is_ok());
         let err = push(500.0).unwrap_err().to_string();

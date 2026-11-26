@@ -43,7 +43,7 @@ use super::accumulate::{
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
 };
-use super::assign_stream::{StreamAssigned, StreamAssigner};
+use super::assign_stream::{ChunkRef, StreamAssigned, StreamAssigner};
 use super::cluster::{ClusterEntry, ClusterTables};
 use super::coalesce::{
     chain_stage_resident_bytes, collected_line_bytes, CoalesceInput, ExactChains,
@@ -126,9 +126,50 @@ struct Pass1Accum<'a> {
     skipped_rows: &'a mut usize,
     /// #802: each chunk's polygon vertex occurrences, for the junction pins.
     junctions: &'a mut Vec<Vec<Occurrence>>,
-    /// #928: the streamed assignment, which takes each chunk's features in
-    /// place of `features`.
-    stream: Option<&'a mut StreamAssigner>,
+    /// #928: the batch's chunks held for the streamed assignment, in place
+    /// of `features`.
+    stream: Option<&'a mut Vec<StreamChunk>>,
+}
+
+/// #928: one scan chunk held for [`StreamAssigner::push_batch`]: its
+/// features, areas, first row and row count.
+type StreamChunk = (FeatureTable, Vec<f32>, usize, usize);
+
+/// #928: run `scan` over this batch's chunk `ranges` while the held batch
+/// is assigned, then empty `held` for this batch's chunks. Batches assign
+/// one after another; overlapping each with the next scan hides most of it.
+///
+/// # Errors
+///
+/// The held batch's assignment error, which comes first in row order.
+fn scan_while_assigning<T: Send>(
+    stream: Option<&mut StreamAssigner>,
+    held: &mut Vec<StreamChunk>,
+    ranges: &[(usize, usize)],
+    scan: impl Fn(&(usize, usize)) -> T + Sync + Send,
+) -> Result<Vec<T>, ConvertError> {
+    let (scanned, assigned) = rayon::join(
+        || ranges.par_iter().map(scan).collect(),
+        || push_held(stream, held),
+    );
+    assigned?;
+    held.clear();
+    Ok(scanned)
+}
+
+/// #928: assign the held batch, if the streamed path is on.
+fn push_held(
+    stream: Option<&mut StreamAssigner>,
+    held: &[StreamChunk],
+) -> Result<(), ConvertError> {
+    let Some(stream) = stream else {
+        return Ok(());
+    };
+    let refs: Vec<ChunkRef<'_>> = held
+        .iter()
+        .map(|(f, a, b, r)| (f, a.as_slice(), *b, *r))
+        .collect();
+    stream.push_batch(&refs)
 }
 
 struct WriterProvenance<'a> {
@@ -6453,19 +6494,19 @@ fn merge_pass1_chunks(
     let n = ranges.last().map_or(0, |&(start, len)| start + len);
     let mut kept_row = vec![false; n];
     for (ci, res) in chunk_results.into_iter().enumerate() {
-        let chunk = res?;
+        let mut chunk = res?;
         let (start, _len) = ranges[ci];
         let chunk_base = base + start;
         kept_row[start..start + chunk.kept_row.len()].copy_from_slice(&chunk.kept_row);
         *point_count += chunk.point_count;
         *skipped_rows += chunk.skipped_rows;
-        if let Some(stream) = stream.as_deref_mut() {
-            stream.push_chunk(
-                &chunk.features,
-                &chunk.areas,
+        if let Some(held) = stream.as_deref_mut() {
+            held.push((
+                std::mem::take(&mut chunk.features),
+                std::mem::take(&mut chunk.areas),
                 chunk_base,
                 chunk.kept_row.len(),
-            )?;
+            ));
         } else {
             // Empty unless the #384 accumulator is on, so no `want_areas` gate
             // is needed here — an empty `extend` is a no-op.
@@ -6654,6 +6695,7 @@ fn run_pass1_with_chunk_rows(
         // columnar extraction below stays serial on the full batch, exactly
         // as the pre-#460 loop did.
         |rx: Receiver<Pass1ReadMsg>| -> Result<(), ConvertError> {
+            let mut held: Vec<StreamChunk> = Vec::new(); // #928: the previous batch
             for msg in rx.iter() {
                 Pass1Timers::add_dur(&timers_ref.read, msg.read_dur);
                 let batch = msg.batch;
@@ -6678,23 +6720,18 @@ fn run_pass1_with_chunk_rows(
                 // of the batch that crosses the ceiling (the reader already
                 // bounds that) before the scratch is released.
                 let collect_lines = lines.mode;
-                let chunk_results: Vec<Result<ChunkScan, ConvertError>> = ranges
-                    .par_iter()
-                    .map(|&(start, len)| {
-                        // Slice only the geometry column (not the whole
-                        // `RecordBatch`, which would touch every non-geometry
-                        // column's offsets too, for no benefit here).
+                let chunk_results =
+                    scan_while_assigning(stream.as_mut(), &mut held, &ranges, |&(start, len)| {
+                        // Slice only the geometry column: slicing the batch
+                        // would touch every column's offsets for nothing.
                         let gcol = batch.column(gcol_idx).slice(start, len);
                         let mask_slice = filter_mask.as_deref().map(|m| &m[start..start + len]);
                         scan_chunk(
                             ctx,
                             &gfield,
                             gcol.as_ref(),
-                            // Diagnostics only (see `scan_chunk`): the chunk's
-                            // global first row, used solely to name the row
-                            // range in a decode error. NOT an index base —
-                            // the merge below still rebases every chunk-local
-                            // index itself.
+                            // The chunk's first row, for decode errors only: NOT
+                            // an index base (the merge below rebases indices).
                             base + start,
                             mask_slice,
                             ScanCollection {
@@ -6704,8 +6741,7 @@ fn run_pass1_with_chunk_rows(
                             },
                             timers_ref,
                         )
-                    })
-                    .collect();
+                    })?;
 
                 // Merge chunks IN ORDER, rebasing every chunk-local index by
                 // this chunk's global row/feature offset — never a global
@@ -6724,7 +6760,7 @@ fn run_pass1_with_chunk_rows(
                         point_count: &mut point_count,
                         skipped_rows: &mut skipped_rows,
                         junctions: &mut chunk_occ,
-                        stream: stream.as_mut(),
+                        stream: stream.is_some().then_some(&mut held),
                     },
                 )?;
                 if collect_lines == LineCollect::Collect && lines.mode != LineCollect::Collect {
@@ -6764,7 +6800,7 @@ fn run_pass1_with_chunk_rows(
                 )?;
                 Pass1Timers::add(&timers_ref.keys, t_keys);
             }
-            Ok(())
+            push_held(stream.as_mut(), &held)
         },
     )?;
 
@@ -11373,8 +11409,10 @@ pub(super) mod tests {
             (num_rows, &spans),
         );
         assert_eq!(assigner.evicts(), evict);
+        // Chunks go in batches of up to three, as a scan batch hands them.
         let mut next = 0;
         let mut base = 0;
+        let mut batch: Vec<(FeatureTable, Vec<f32>, usize, usize)> = Vec::new();
         while base < num_rows {
             let rows = chunk_rows.min(num_rows - base);
             let (mut chunk, mut chunk_areas) = (Vec::new(), Vec::new());
@@ -11386,10 +11424,16 @@ pub(super) mod tests {
                 chunk_areas.push(areas[next]);
                 next += 1;
             }
-            assigner
-                .push_chunk(&table(&chunk), &chunk_areas, base, rows)
-                .unwrap();
+            batch.push((table(&chunk), chunk_areas, base, rows));
             base += rows;
+            if batch.len() == 3 || base == num_rows {
+                let refs: Vec<ChunkRef<'_>> = batch
+                    .iter()
+                    .map(|(t, a, b, r)| (t, a.as_slice(), *b, *r))
+                    .collect();
+                assigner.push_batch(&refs).unwrap();
+                batch.clear();
+            }
         }
         let assigned = assigner.finish(num_rows);
         let memory = assigned.memory;

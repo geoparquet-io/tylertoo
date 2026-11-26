@@ -4878,6 +4878,7 @@ dependencies = [
  "dhat",
  "fast_hilbert",
  "flate2",
+ "foldhash 0.2.0",
  "fs4",
  "futures-util",
  "geo",

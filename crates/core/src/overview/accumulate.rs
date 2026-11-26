@@ -49,8 +49,6 @@
 //! Features placed by an entry-zoom ladder (#364) are never accumulated:
 //! the ladder decides where they first appear.
 
-use std::collections::HashMap;
-
 use rayon::prelude::*;
 
 use super::assign::{gsd_to_coord_units, FeatureKind, FeatureTable};
@@ -226,7 +224,8 @@ struct ActiveLevel {
     threshold: f64,
     cell: f64,
     floored: bool,
-    acc: HashMap<(i64, i64), Patch>,
+    /// foldhash: patch order never reaches the output (it is sorted).
+    acc: foldhash::HashMap<(i64, i64), Patch>,
     out: Vec<CarrierRow>,
 }
 
@@ -251,7 +250,7 @@ impl LevelAccumulator {
                 threshold,
                 cell,
                 floored,
-                acc: HashMap::new(),
+                acc: foldhash::HashMap::default(),
                 out: Vec::new(),
             }),
             floored_zoom,
