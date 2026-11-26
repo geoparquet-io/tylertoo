@@ -1379,6 +1379,22 @@ pub(super) struct TileTarget<'a> {
     /// The geometry the clip started from: a piece that is still it is
     /// [`TilePiece::Whole`].
     pub(super) source: &'a Geometry<f64>,
+    /// Sorted keys: only these tiles of the window are wanted (#919), so
+    /// the cascade skips the subtrees between them.
+    pub(super) wanted: Option<&'a [u64]>,
+}
+
+impl TileTarget<'_> {
+    /// Whether a tile with a key in `keys` is wanted.
+    fn wants(&self, keys: std::ops::RangeInclusive<u64>) -> bool {
+        let (lo, hi) = (*keys.start(), *keys.end());
+        lo <= self.key_hi
+            && self.key_lo <= hi
+            && self.wanted.is_none_or(|w| {
+                w.get(w.partition_point(|&k| k < lo))
+                    .is_some_and(|&k| k <= hi)
+            })
+    }
 }
 
 /// Clip (or fast-path pass through) one feature into every tile it intersects
@@ -1429,6 +1445,7 @@ pub(super) fn feature_tile_pieces(
     opts: &ExportOptions,
     key_lo: u64,
     key_hi: u64,
+    wanted: Option<&[u64]>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Vec<(u64, TilePiece)> {
     let Some(rect) = geom.bounding_rect() else {
@@ -1452,6 +1469,7 @@ pub(super) fn feature_tile_pieces(
                 assume_simple,
                 diagnostics,
                 source: geom,
+                wanted,
             },
             &mut out,
         );
@@ -1473,6 +1491,7 @@ pub(super) fn feature_tile_pieces(
                 assume_simple,
                 diagnostics,
                 source: &copy,
+                wanted,
             },
             &mut out,
         );
@@ -1506,7 +1525,31 @@ pub(super) fn feature_tile_members(
     key_hi: u64,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Vec<(u64, Geometry<f64>)> {
-    feature_tile_pieces(geom, zoom, opts, key_lo, key_hi, diagnostics)
+    owned_members(
+        geom,
+        feature_tile_pieces(geom, zoom, opts, key_lo, key_hi, None, diagnostics),
+    )
+}
+
+/// [`feature_tile_members`] of the tiles `keys` (sorted) names alone: the
+/// cascade skips the tiles between them, which a key range would clip and
+/// hold (#919).
+pub(super) fn feature_tile_members_of(
+    geom: &Geometry<f64>,
+    zoom: u8,
+    opts: &ExportOptions,
+    keys: &[u64],
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Vec<(u64, Geometry<f64>)> {
+    let (Some(&lo), Some(&hi)) = (keys.first(), keys.last()) else {
+        return Vec::new();
+    };
+    let pieces = feature_tile_pieces(geom, zoom, opts, lo, hi, Some(keys), diagnostics);
+    owned_members(geom, pieces)
+}
+
+fn owned_members(geom: &Geometry<f64>, pieces: Vec<(u64, TilePiece)>) -> Vec<(u64, Geometry<f64>)> {
+    pieces
         .into_iter()
         .map(|(key, piece)| match piece {
             TilePiece::Whole => (key, geom.clone()),
@@ -1551,6 +1594,7 @@ pub(super) fn shared_tile_members(
         opts,
         key_lo,
         key_hi,
+        None,
         diagnostics,
     );
     let mut left = pieces
@@ -1697,15 +1741,7 @@ pub(super) fn copy_tile_members(
     inputs: TileTarget<'_>,
     out: &mut Vec<(u64, TilePiece)>,
 ) {
-    let TileTarget {
-        zoom,
-        opts,
-        key_lo,
-        key_hi,
-        assume_simple,
-        diagnostics,
-        source,
-    } = inputs;
+    let TileTarget { zoom, opts, .. } = inputs;
     let bbox = *bbox;
     // Target leaf-tile ranges at `zoom` — the authority for which tiles this
     // feature belongs to. Derived from the BUFFER-EXPANDED bbox so a feature
@@ -1735,43 +1771,14 @@ pub(super) fn copy_tile_members(
     // times. The clip output is unchanged — see `clip::clip_geometry_simple`.
     let direct_cost = tile_span(&ranges).saturating_mul(geom.coords_count() as u64);
     if direct_cost <= DIRECT_CLIP_BUDGET {
-        feature_tile_members_direct(
-            geom,
-            &bbox,
-            TileTarget {
-                zoom,
-                opts,
-                key_lo,
-                key_hi,
-                assume_simple,
-                diagnostics,
-                source,
-            },
-            &ranges,
-            out,
-        );
+        feature_tile_members_direct(geom, &bbox, inputs, &ranges, out);
     } else {
         // Start the descent at the feature's covering tile (the deepest tile
         // whose bounds contain the whole feature bbox) rather than the world
         // root: every level above it is a single-child pass-through, so
         // skipping them is free and yields an identical leaf set.
         let root = covering_tile(&ranges, zoom);
-        split_feature_into_tiles(
-            root,
-            geom,
-            &bbox,
-            TileTarget {
-                zoom,
-                opts,
-                key_lo,
-                key_hi,
-                assume_simple,
-                diagnostics,
-                source,
-            },
-            &ranges,
-            out,
-        );
+        split_feature_into_tiles(root, geom, &bbox, inputs, &ranges, out);
     }
 }
 
@@ -1914,15 +1921,13 @@ pub(super) fn feature_tile_members_direct(
     let TileTarget {
         zoom,
         opts,
-        key_lo,
-        key_hi,
         assume_simple,
         diagnostics,
-        source: _,
+        ..
     } = inputs;
     for tc in tiles_in_ranges(ranges, zoom) {
         let key = tile_key(tc.x, tc.y, zoom);
-        if key < key_lo || key > key_hi {
+        if !inputs.wants(key..=key) {
             continue;
         }
         let tb = tc.bounds();
@@ -1995,7 +2000,7 @@ pub(super) fn node_overlaps_ranges(node: TileCoord, zoom: u8, ranges: &BboxTileR
 }
 
 /// `true` when tile node `(x, y, z)`'s descendant-leaf key range overlaps the
-/// partition key window `[key_lo, key_hi]`. Keys are PMTiles tile ids
+/// partition key window `[inputs.key_lo, inputs.key_hi]`. Keys are PMTiles tile ids
 /// (#506), so a node's subtree spans an EXACT contiguous interval at `zoom`
 /// — [`crate::tile::node_id_range`] — rather than the conservative,
 /// gap-riddled bounding box the row-major key used to produce. The test is
@@ -2004,11 +2009,11 @@ pub(super) fn node_overlaps_ranges(node: TileCoord, zoom: u8, ranges: &BboxTileR
 /// longer visits branches whose subtree merely bounds, without overlapping,
 /// the window. It is what keeps a giant feature's per-partition work bounded
 /// to the partition's slice instead of re-walking the whole subtree once per
-/// partition it spans.
+/// partition it spans. With [`TileTarget::wanted`], the subtree must also
+/// hold a wanted key (#919).
 #[inline]
-pub(super) fn node_key_overlaps(node: TileCoord, zoom: u8, key_lo: u64, key_hi: u64) -> bool {
-    let range = crate::tile::node_id_range(node, zoom);
-    *range.start() <= key_hi && key_lo <= *range.end()
+pub(super) fn node_key_overlaps(node: TileCoord, inputs: &TileTarget<'_>) -> bool {
+    inputs.wants(crate::tile::node_id_range(node, inputs.zoom))
 }
 
 pub(super) fn split_feature_into_tiles(
@@ -2022,14 +2027,13 @@ pub(super) fn split_feature_into_tiles(
     let TileTarget {
         zoom,
         opts,
-        key_lo,
-        key_hi,
         assume_simple,
         diagnostics,
         source,
+        ..
     } = inputs;
     // Prune: outside the feature's target tiles, or outside this partition.
-    if !node_overlaps_ranges(node, zoom, ranges) || !node_key_overlaps(node, zoom, key_lo, key_hi) {
+    if !node_overlaps_ranges(node, zoom, ranges) || !node_key_overlaps(node, &inputs) {
         return;
     }
 
@@ -2040,7 +2044,7 @@ pub(super) fn split_feature_into_tiles(
         // Leaf tile. The prune above already proved this tile is in the
         // feature's target set; enforce the exact partition key window here.
         let key = tile_key(node.x, node.y, zoom);
-        if key < key_lo || key > key_hi {
+        if !inputs.wants(key..=key) {
             return;
         }
         // Fast path (H3(c) lever 4): a feature whose bbox lies entirely within
@@ -2077,23 +2081,7 @@ pub(super) fn split_feature_into_tiles(
         // Feature already inside this node's buffered bounds — no clip needed;
         // descend with the same geometry (this is what makes the coarse top of
         // the pyramid essentially free).
-        fanout_children(
-            children,
-            node.z,
-            cur,
-            cur_bbox,
-            TileTarget {
-                zoom,
-                opts,
-                key_lo,
-                key_hi,
-                assume_simple,
-                diagnostics,
-                source,
-            },
-            ranges,
-            out,
-        );
+        fanout_children(children, node.z, cur, cur_bbox, inputs, ranges, out);
     } else if let Some(clipped) = clip_geometry_simple(
         cur,
         &tb,
@@ -2106,23 +2094,7 @@ pub(super) fn split_feature_into_tiles(
             Some(r) => TileBounds::new(r.min().x, r.min().y, r.max().x, r.max().y),
             None => return,
         };
-        fanout_children(
-            children,
-            node.z,
-            &clipped,
-            &cbbox,
-            TileTarget {
-                zoom,
-                opts,
-                key_lo,
-                key_hi,
-                assume_simple,
-                diagnostics,
-                source,
-            },
-            ranges,
-            out,
-        );
+        fanout_children(children, node.z, &clipped, &cbbox, inputs, ranges, out);
     }
     // else: `cur` does not intersect this node's buffered bounds — whole
     // subtree pruned.
@@ -2143,15 +2115,7 @@ pub(super) fn fanout_children(
     ranges: &BboxTileRanges,
     out: &mut Vec<(u64, TilePiece)>,
 ) {
-    let TileTarget {
-        zoom,
-        opts,
-        key_lo,
-        key_hi,
-        assume_simple,
-        diagnostics,
-        source,
-    } = inputs;
+    let TileTarget { zoom, .. } = inputs;
     // M1 (#817): each child clips the whole parent piece, so a huge piece
     // forks at any depth; the four subtrees' members are appended in child
     // order, as the sequential loop emits them.
@@ -2168,15 +2132,7 @@ pub(super) fn fanout_children(
                     child,
                     child_geom,
                     child_bbox,
-                    TileTarget {
-                        zoom,
-                        opts,
-                        key_lo,
-                        key_hi,
-                        assume_simple,
-                        diagnostics,
-                        source,
-                    },
+                    inputs,
                     ranges,
                     &mut members,
                 );
@@ -2188,22 +2144,7 @@ pub(super) fn fanout_children(
         }
     } else {
         for child in children {
-            split_feature_into_tiles(
-                child,
-                child_geom,
-                child_bbox,
-                TileTarget {
-                    zoom,
-                    opts,
-                    key_lo,
-                    key_hi,
-                    assume_simple,
-                    diagnostics,
-                    source,
-                },
-                ranges,
-                out,
-            );
+            split_feature_into_tiles(child, child_geom, child_bbox, inputs, ranges, out);
         }
     }
 }
@@ -2237,6 +2178,7 @@ pub(super) fn members_direct_vec(
             assume_simple,
             diagnostics: &crate::diagnostics::Diagnostics::default(),
             source: geom,
+            wanted: None,
         },
         &ranges,
         &mut out,
@@ -2281,6 +2223,7 @@ pub(super) fn members_recursive_vec(
             assume_simple,
             diagnostics: &crate::diagnostics::Diagnostics::default(),
             source: geom,
+            wanted: None,
         },
         &ranges,
         &mut out,

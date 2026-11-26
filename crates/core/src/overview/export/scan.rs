@@ -942,6 +942,13 @@ fn predict_floors(
          rows: &dyn Fn(&[valve_predict::SampleAt]) -> Result<SampleRows, ExportError>| {
             let price = Price::model(member.saturating_mul(members as u64));
             let chunk = budget.affordable(options.profile, MemoryPhase::ExportCollect, price);
+            // #919: a row sampled by tiles in several chunks is clipped once
+            // a chunk, so a tight budget can still make this slow; say so.
+            log::info!(
+                "[export] valve predictor: pricing {} tiles by samples of {members} members, in {} chunks (--valve-scope tile skips this)",
+                tiles.len(),
+                tiles.len().div_ceil(chunk),
+            );
             let mut bytes = HashMap::new();
             for tiles in tiles.chunks(chunk) {
                 #[cfg(test)]
@@ -1005,6 +1012,9 @@ thread_local! {
     /// Chunks this thread's [`predict_floors`] sampled tiles in (test
     /// counter, #768).
     pub(super) static SAMPLE_CHUNKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Vertices of the geometries this thread's [`valve_sample_bytes`]
+    /// clipped (test counter, #919).
+    pub(super) static SAMPLE_CLIP_COORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// #768 predict: members in the larger price sample of a tile its first
@@ -1199,6 +1209,12 @@ fn valve_sample_bytes(
     let diagnostics = crate::diagnostics::Diagnostics::default();
     // Read 2: whole rows, only the chosen ones decoded.
     let timers = ExportTimers::default();
+    #[cfg(test)]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#919: test counter summed over the row groups' workers"
+    )]
+    let clipped = std::sync::atomic::AtomicUsize::new(0);
     let per_rg = chosen
         .into_par_iter()
         .map(
@@ -1243,23 +1259,52 @@ fn valve_sample_bytes(
                         // Built once per row: two tiles can sample the same row.
                         let props: Vec<SharedProps> =
                             (0..rows.len()).map(|k| attrs.props(k)).collect();
+                        let at = |r: &u32| {
+                            let at = (u64::from(*r) - base) as u32;
+                            rows.binary_search(&at).expect("taken above")
+                        };
+                        // #919: each row is clipped once a level, into the
+                        // tiles sampling it there alone; a tile takes its own
+                        // piece. A piece does not depend on the other tiles
+                        // clipped with it, so the samples are those of a clip
+                        // per tile, which clipped a large row whole per tile.
+                        let mut keys: HashMap<(usize, usize), Vec<u64>> = HashMap::new();
+                        for (i, wanted_rows) in &wanted {
+                            for r in wanted_rows.iter().filter(in_batch) {
+                                let t = tiles[*i];
+                                keys.entry((at(r), t.level)).or_default().push(t.key);
+                            }
+                        }
+                        let mut pieces: HashMap<(usize, usize, u64), Geometry<f64>> = keys
+                            .into_par_iter()
+                            .flat_map_iter(|((k, level), mut keys)| {
+                                keys.sort_unstable();
+                                keys.dedup();
+                                #[cfg(test)]
+                                clipped.fetch_add(
+                                    geoms[k].coords_count(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                feature_tile_members_of(
+                                    &geoms[k],
+                                    zooms[level],
+                                    opts,
+                                    &keys,
+                                    &diagnostics,
+                                )
+                                .into_iter()
+                                .map(move |(key, g)| ((k, level, key), g))
+                            })
+                            .collect();
                         for (w, (i, wanted_rows)) in wanted.iter().enumerate() {
                             let t = tiles[*i];
                             for r in wanted_rows.iter().filter(in_batch) {
-                                let at = (u64::from(*r) - base) as u32;
-                                let k = rows.binary_search(&at).expect("taken above");
-                                let pieces = feature_tile_members(
-                                    &geoms[k],
-                                    zooms[t.level],
-                                    opts,
-                                    t.key,
-                                    t.key,
-                                    &diagnostics,
-                                );
+                                let k = at(r);
+                                let piece = pieces.remove(&(k, t.level, t.key));
                                 let props = &props[k];
                                 let id = attrs.id(k)?;
-                                members[w].extend(pieces.into_iter().map(|(key, g)| Member {
-                                    key,
+                                members[w].extend(piece.map(|g| Member {
+                                    key: t.key,
                                     seq: u64::from(*r),
                                     rank: attrs.rank(k, u64::from(*r)),
                                     geom: g.into(),
@@ -1280,6 +1325,8 @@ fn valve_sample_bytes(
             },
         )
         .collect::<Result<Vec<_>, ExportError>>()?;
+    #[cfg(test)]
+    SAMPLE_CLIP_COORDS.with(|n| n.set(n.get() + clipped.into_inner()));
     let mut samples: Vec<Vec<Member>> = tiles.iter().map(|_| Vec::new()).collect();
     for (i, m) in per_rg.into_iter().flatten() {
         samples[i].extend(m);
