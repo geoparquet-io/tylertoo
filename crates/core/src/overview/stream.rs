@@ -362,9 +362,7 @@ fn resolve_and_log_in_flight_batches(
     let in_flight = cap(super::convert::resolve_in_flight_batches(requested));
     log::info!(
         "[convert] {phase} parallelism: {in_flight} read batch(es) in flight ({} core(s) detected)",
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(0)
+        super::convert::run_cores().unwrap_or(0)
     );
     in_flight
 }

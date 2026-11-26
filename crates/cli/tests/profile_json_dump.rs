@@ -1397,6 +1397,47 @@ fn cli_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set() {
     assert_eq!(threads(Some("48"), &["--workers", "3"]), 3);
 }
 
+/// #876: `--workers` lowers every width sized from the core count, not only
+/// the pool: the run's convert and export use 2 threads, and the partition
+/// wave and in-flight batches are sized for a 2-core host.
+#[test]
+fn cli_workers_lower_every_core_derived_width() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile.jsonl");
+    let output = Command::new(tylertoo_bin())
+        .args(["tiles", fixture.to_str().unwrap()])
+        .arg(dir.path().join("out.pmtiles"))
+        .args(["--max-zoom", "2", "--workers", "2"])
+        .env("TYLERTOO_PROFILE_JSON", &profile)
+        .env_remove("RAYON_NUM_THREADS")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run tylertoo tiles");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let run_cores = cores.min(2);
+    let contents = std::fs::read_to_string(&profile).expect("profile");
+    let lines: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+    assert_eq!(lines[0]["threads"], 2, "convert: {}", lines[0]);
+    let export = &lines[1]["export"];
+    assert_eq!(export["threads"], 2, "export: {export}");
+    // A 2-core host's auto wave: its cores, floored at PARTITION_WAVE_MIN (6).
+    let wave = run_cores.max(6);
+    assert_eq!(export["partition_wave_width"], wave, "export: {export}");
+    for needle in [
+        format!("partition wave: {wave} partition(s) per band read (auto: {run_cores} core(s)"),
+        format!("read batch(es) in flight ({run_cores} core(s) detected)"),
+    ] {
+        assert!(stderr.contains(&needle), "missing {needle:?}:\n{stderr}");
+    }
+}
+
 /// #876: `TYLERTOO_TILE_TRACE` writes one JSONL event per line, one `tile`
 /// event per written tile (the profile's per-zoom counts), valve passes and
 /// waits, and an archive byte-identical to the untraced run's.

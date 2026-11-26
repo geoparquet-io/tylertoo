@@ -144,7 +144,10 @@ whole run. Without it, a positive `RAYON_NUM_THREADS` sets it; otherwise
 `auto` and `speed` use every core the process may use (CPU affinity and a
 cgroup CPU quota count), and `bounded` uses at most 40. `0` is an error. The
 pool is process-wide: in Python the first call sets it, and later calls keep
-it.
+it. A count you set (`--workers` or `RAYON_NUM_THREADS`) also caps the core
+count that the read workers, in-flight batches, and partition wave are sized
+from, so `--workers 12` on a 64-core host sizes them as a 12-core host would.
+`bounded`'s own limit of 40 caps only the pool.
 
 Measured on a 64-core, 123 GB aarch64 host with an EBS disk, with N cores
 given N workers, one run each; the output was byte-identical at every width.

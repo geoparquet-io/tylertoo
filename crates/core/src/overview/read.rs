@@ -317,7 +317,7 @@ fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     let decode = tuning.budget.read_decode_plan(
         tuning.profile,
         workers,
-        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        super::convert::run_cores().unwrap_or(1),
         read_batch_price(tuning),
         workers.saturating_mul(depth.saturating_add(reader)),
     );

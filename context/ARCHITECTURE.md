@@ -108,8 +108,12 @@ later call without `memory_limit` keeps an earlier call's.
 The same validation builds the global Rayon pool on a library caller's
 first run (#876): `workers` when set, else a positive `RAYON_NUM_THREADS`,
 else every core under `auto` and `speed` and `min(cores, 40)` under
-`bounded` (`resolve_worker_threads`). The CLI builds it at startup, and
-Python on its first call, with the same rule.
+`bounded` (`resolve_worker_threads`). The CLI and Python reach it through
+the same validation. A count the caller chose (`workers` or
+`RAYON_NUM_THREADS`) also caps the cores every core-derived width is sized
+from (`run_cores`: read workers, in-flight batches, the partition wave, the
+read's decode plan); `bounded`'s own 40 caps only the pool, so default
+widths are unchanged.
 
 `--max-zoom auto` also stages its sample through a throwaway
 `MemoryBudget::probe()` (`auto_zoom.rs`), before `preflight()` builds the

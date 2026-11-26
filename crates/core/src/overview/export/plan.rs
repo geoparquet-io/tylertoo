@@ -474,7 +474,7 @@ pub(super) fn check_levels_fit(
 /// Resolve a requested partition-wave width to a concrete value.
 ///
 /// [`PARTITION_WAVE_AUTO`] (0) runs the memory-budget preflight (#303): the
-/// width is the machine's [`std::thread::available_parallelism`], capped by
+/// width is the run's cores (`run_cores`), capped by
 /// how many per-partition transients (estimated
 /// `PARTITION_SLOT_TRANSIENT_BYTES` each) fit in
 /// the export collection phase's share of available RAM (probe shared with the
@@ -503,9 +503,7 @@ pub(super) fn resolve_partition_wave_under(
     budget: &MemoryBudget,
 ) -> usize {
     if requested == PARTITION_WAVE_AUTO {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(PARTITION_WAVE_MIN);
+        let cores = crate::overview::convert::run_cores().unwrap_or(PARTITION_WAVE_MIN);
         auto_partition_wave(cores, profile, budget)
     } else {
         requested
@@ -524,9 +522,7 @@ pub(super) fn resolve_and_log_partition_wave(
     budget: &MemoryBudget,
 ) -> usize {
     let wave = resolve_partition_wave_under(requested, profile, budget);
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(0);
+    let cores = crate::overview::convert::run_cores().unwrap_or(0);
     if requested == PARTITION_WAVE_AUTO {
         let avail_str = budget.available().map_or_else(
             || "unknown".to_string(),

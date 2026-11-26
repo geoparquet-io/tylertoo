@@ -772,7 +772,9 @@ pub struct ExportOptions {
     /// `speed` and at most [`WORKER_THREADS_MAX`] under `bounded`
     /// ([`resolve_worker_threads`]). `0` is refused. The pool is
     /// process-wide: the first run in a process sizes it, and later runs
-    /// keep it. Changes speed and peak memory only.
+    /// keep it. A set count also caps the core count the read workers,
+    /// in-flight batches and partition wave are sized from. Changes speed
+    /// and peak memory only.
     ///
     /// [`WORKER_THREADS_MAX`]: super::convert::WORKER_THREADS_MAX
     /// [`resolve_worker_threads`]: super::convert::resolve_worker_threads
