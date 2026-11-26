@@ -214,11 +214,37 @@ pub(super) struct GroupSpan {
     pub(super) bounds: Option<[f64; 4]>,
 }
 
-/// A cell or patch scheduled to close after a row group.
+/// A cell or patch scheduled to close after a row group: 24 bytes, one
+/// per live cell or patch.
 #[derive(Clone, Copy)]
-enum Due {
-    Cell(u8, CellKey),
-    Patch(u8, (i64, i64)),
+struct Due {
+    level: u8,
+    /// The cell key's kind byte, or [`Due::PATCH`] for a carrier patch.
+    kind: u8,
+    ix: i64,
+    iy: i64,
+}
+
+impl Due {
+    const PATCH: u8 = u8::MAX;
+
+    fn cell(level: u8, (kind, ix, iy): CellKey) -> Self {
+        Self {
+            level,
+            kind,
+            ix,
+            iy,
+        }
+    }
+
+    fn patch(level: u8, (ix, iy): (i64, i64)) -> Self {
+        Self {
+            level,
+            kind: Self::PATCH,
+            ix,
+            iy,
+        }
+    }
 }
 
 /// The conservative eviction contract (#928 design step 4). A cell or patch
@@ -239,8 +265,9 @@ struct Eviction {
     /// The group the stream is in.
     current: usize,
     due: Vec<Vec<Due>>,
-    live: usize,
-    peak_live: usize,
+    /// Entries the due lists have capacity for, now and at their peak.
+    live_cap: usize,
+    peak_cap: usize,
 }
 
 impl Eviction {
@@ -298,8 +325,8 @@ impl Eviction {
             tree,
             last_unbounded,
             current: 0,
-            live: 0,
-            peak_live: 0,
+            live_cap: 0,
+            peak_cap: 0,
         })
     }
 
@@ -333,20 +360,26 @@ impl Eviction {
             .max()
             .unwrap_or(current)
             .max(current);
-        self.due[last].push(due);
-        self.live += 1;
-        self.peak_live = self.peak_live.max(self.live);
+        let list = &mut self.due[last];
+        let before = list.capacity();
+        list.push(due);
+        self.live_cap += list.capacity() - before;
+        self.peak_cap = self.peak_cap.max(self.live_cap);
     }
 
     fn take_due(&mut self, group: usize) -> Vec<Due> {
         let due = std::mem::take(&mut self.due[group]);
-        self.live -= due.len();
+        self.live_cap -= due.capacity();
         due
     }
 
+    /// Peak schedule bytes: the due lists at their peak capacity, plus the
+    /// per-group index (ends, bounds, the unbounded suffix, empty list
+    /// heads, and the R-tree's leaves).
     fn peak_bytes(&self) -> u64 {
-        let index = self.ends.len() * (8 + 8 + 33 + 8 + 24) + self.tree.size() * 48;
-        (self.peak_live * std::mem::size_of::<Due>() + index) as u64
+        let per_group = 8 + 40 + 16 + 24;
+        let index = self.ends.len() * per_group + self.tree.size() * 48;
+        (self.peak_cap * std::mem::size_of::<Due>() + index) as u64
     }
 }
 
@@ -449,19 +482,20 @@ impl StreamAssigner {
         };
         for group in evict.advance(row) {
             for due in evict.take_due(group) {
-                match due {
-                    Due::Cell(li, key) => {
+                let li = due.level;
+                match due.kind {
+                    Due::PATCH => {
+                        self.accs[usize::from(li)].close_patch((due.ix, due.iy));
+                        self.live_patches -= 1;
+                    }
+                    kind => {
                         let inc = self.grids[usize::from(li)]
-                            .remove(&key)
+                            .remove(&(kind, due.ix, due.iy))
                             .expect("a scheduled cell is live");
                         // `fold_wave_winners`: the coarsest level a row wins.
                         let slot = &mut self.min_levels[inc.index];
                         *slot = (*slot).min(li);
                         self.live_cells -= 1;
-                    }
-                    Due::Patch(li, key) => {
-                        self.accs[usize::from(li)].close_patch(key);
-                        self.live_patches -= 1;
                     }
                 }
             }
@@ -540,7 +574,7 @@ impl StreamAssigner {
                                     let cs = self.gsd_units[li] * self.config.line_thinning;
                                     let (_, ix, iy) = key;
                                     let rect = grown_cell(ix, iy, cs);
-                                    evict.schedule(Due::Cell(li as u8, key), rect);
+                                    evict.schedule(Due::cell(li as u8, key), rect);
                                 }
                             }
                         }
@@ -562,7 +596,7 @@ impl StreamAssigner {
                             self.peak_patches = self.peak_patches.max(self.live_patches);
                             if let (Some(evict), Some(w)) = (&mut self.evict, acc.patch_width()) {
                                 evict.schedule(
-                                    Due::Patch(li as u8, (ix, iy)),
+                                    Due::patch(li as u8, (ix, iy)),
                                     grown_cell(ix, iy, w),
                                 );
                             }
@@ -727,6 +761,11 @@ mod tests {
         assert!(push(1.0).is_ok());
         let err = push(500.0).unwrap_err().to_string();
         assert!(err.contains("outside its row group"), "{err}");
+    }
+
+    #[test]
+    fn a_due_entry_is_24_bytes() {
+        assert_eq!(std::mem::size_of::<Due>(), 24);
     }
 
     #[test]
