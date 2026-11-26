@@ -773,11 +773,19 @@ uses the same `gap_to_world_box` on the same values, so the gaps are bit
 for bit those of before. It is serial rather than `owner_map` because a
 row costs a few sums, less than claiming a batch.
 
-The fill's groups are 4x #817's under `auto` and `speed` (2,048 rows per
-pool thread, 4 batch byte caps, `CollectGroup::sized`), as fewer joins and
-ordered finishes took FTW Brazil MT's export 7.7% faster for +0.25 GB peak
-RSS; `auto` cuts them back toward #817's size when its read share cannot
-hold the two groups a fill keeps at once.
+The fill's groups can be 4x #817's (2,048 rows per pool thread, 4 batch
+byte caps), as fewer joins and ordered finishes took FTW Brazil MT's export
+7.7% faster for +0.25 GB peak RSS. `speed` takes that size. `auto` starts at
+#817's and grows one step per finished group while two groups at the next
+size fit its read share, priced at the bytes per row the last group
+measured: its Arrow batches plus its clipped members (the store's
+`member_bytes_estimate`). A polygon spanning many tiles holds many times its
+Arrow bytes in members, so such an input stays at #817's size on a small
+budget. The bound is measured, so it is late: a heavier group is caught
+when it finishes, after the next group is built, and the size then drops at
+once (`CollectGroup::rescale`). The read share is a query on the levels'
+starting budget, not a grant, and #817's size itself is not priced. Under
+`auto` the band read-ahead stays at #817's depth.
 
 Border duplication is the expected delta between overview level counts and
 export per-zoom feature totals (a feature spanning a tile seam appears in
