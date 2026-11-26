@@ -244,8 +244,9 @@ struct Eviction {
 }
 
 impl Eviction {
-    /// `None` when the spans do not add up to the stream's rows (the
-    /// eviction then stays off and every cell closes at the end).
+    /// `None` when the spans do not add up to the stream's rows, or no group
+    /// has bounds (the eviction then stays off and every cell closes at the
+    /// end).
     fn new(spans: &[GroupSpan], rows: usize) -> Option<Self> {
         let mut ends = Vec::with_capacity(spans.len());
         let mut end = 0usize;
@@ -253,7 +254,9 @@ impl Eviction {
             end += s.rows;
             ends.push(end);
         }
-        if end != rows || spans.is_empty() {
+        // With no bounds anywhere nothing could close before the end, and
+        // the schedule would be pure cost.
+        if end != rows || spans.iter().all(|s| s.bounds.is_none()) {
             return None;
         }
         // Covering bboxes are often f32, rounded either way: grow by a
