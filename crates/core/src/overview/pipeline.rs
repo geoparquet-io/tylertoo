@@ -1941,7 +1941,7 @@ fn process_levels_apart(
 }
 
 pub(super) fn run_pass2_buffered(
-    writer: &mut OverviewWriter<File>,
+    writer: &mut OverviewWriter<super::chunked::OverviewSink>,
     ctxs: &[LevelStreamCtx<'_>],
     hints: &[usize],
     read: StreamRead<'_>,
@@ -2224,7 +2224,7 @@ fn drain_headroom() -> u64 {
 /// `write_level_streaming` because `write_level` consumes an infallible
 /// iterator but Arrow IPC read-back can fail.
 fn drain_sink(
-    writer: &mut OverviewWriter<File>,
+    writer: &mut OverviewWriter<super::chunked::OverviewSink>,
     level_idx: usize,
     hint: usize,
     sink: LevelSink,
@@ -2552,7 +2552,8 @@ mod spill_tests {
                             options.encode_concurrency = 1;
                             options.max_row_group_size = 3;
                             let mut writer =
-                                OverviewWriter::create(&output, &schema, options).unwrap();
+                                OverviewWriter::create_sink(&output, None, &schema, options)
+                                    .unwrap();
                             DECODES
                                 .lock()
                                 .unwrap()
@@ -2602,7 +2603,8 @@ mod spill_tests {
                     vec![LevelSpec::new(super::super::level::gsd(2), Some(2))],
                 );
                 let output = dir.path().join("overview.parquet");
-                let mut writer = OverviewWriter::create(&output, &schema, options).unwrap();
+                let mut writer =
+                    OverviewWriter::create_sink(&output, None, &schema, options).unwrap();
                 DECODES
                     .lock()
                     .unwrap()
@@ -3726,7 +3728,8 @@ mod drain_tests {
                 );
                 options.encode_concurrency = 2;
                 options.max_row_group_size = 3;
-                let mut writer = OverviewWriter::create(tmp.path(), &schema, options).unwrap();
+                let mut writer =
+                    OverviewWriter::create_sink(tmp.path(), None, &schema, options).unwrap();
                 let _ = drain_sink(
                     &mut writer,
                     0,
@@ -3814,7 +3817,8 @@ mod drain_tests {
                     Mode::Duplicating,
                     vec![LevelSpec::new(gsd(2), Some(2))],
                 );
-                let mut writer = OverviewWriter::create(tmp.path(), &schema, options).unwrap();
+                let mut writer =
+                    OverviewWriter::create_sink(tmp.path(), None, &schema, options).unwrap();
                 let error = drain_sink(
                     &mut writer,
                     0,
@@ -3880,7 +3884,7 @@ mod drain_tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let options =
             OverviewWriterOptions::new(Mode::Duplicating, vec![LevelSpec::new(gsd(2), Some(2))]);
-        let mut writer = OverviewWriter::create(tmp.path(), &schema, options).unwrap();
+        let mut writer = OverviewWriter::create_sink(tmp.path(), None, &schema, options).unwrap();
         let drained = drain_sink(
             &mut writer,
             0,

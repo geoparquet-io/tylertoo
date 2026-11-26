@@ -47,6 +47,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use serde::Serialize;
@@ -283,6 +284,10 @@ pub struct FetchStats {
 pub enum InputSource {
     /// A local filesystem path (the historical behavior).
     Local(PathBuf),
+    /// The temporary overview `tiles` holds in memory (#923), read back
+    /// by its export.
+    #[doc(hidden)]
+    Overview(Arc<crate::overview::chunked::OverviewStore>),
     /// A remote object read over range requests.
     #[cfg(feature = "remote")]
     Remote(remote::RemoteSource),
@@ -343,7 +348,7 @@ impl InputSource {
     /// Whether this source is remote.
     pub fn is_remote(&self) -> bool {
         match self {
-            InputSource::Local(_) => false,
+            InputSource::Local(_) | InputSource::Overview(_) => false,
             #[cfg(feature = "remote")]
             InputSource::Remote(_) => true,
         }
@@ -353,7 +358,7 @@ impl InputSource {
     /// Local files continue to use filesystem metadata for plan binding.
     pub fn remote_meta(&self) -> Option<&tylertoo_io::RemoteObjectMeta> {
         match self {
-            Self::Local(_) => None,
+            Self::Local(_) | Self::Overview(_) => None,
             #[cfg(feature = "remote")]
             Self::Remote(source) => Some(&source.object_meta),
         }
@@ -363,6 +368,7 @@ impl InputSource {
     pub fn display_name(&self) -> String {
         match self {
             InputSource::Local(p) => p.display().to_string(),
+            InputSource::Overview(_) => "the in-memory overview".to_string(),
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => r.url().to_string(),
         }
@@ -385,6 +391,14 @@ impl InputSource {
     /// footer cannot be read or fetched.
     pub fn open(&self) -> Result<ParquetSource<InputReader>, InputError> {
         match self {
+            InputSource::Overview(s) => {
+                tylertoo_io::open_parquet(InputReader::Overview(Arc::clone(s))).map_err(|error| {
+                    InputError::Footer {
+                        input: self.display_name(),
+                        error,
+                    }
+                })
+            }
             InputSource::Local(p) => {
                 tylertoo_io::open_parquet(self.open_local(p)?).map_err(|error| InputError::Footer {
                     input: self.display_name(),
@@ -424,6 +438,10 @@ impl InputSource {
         meta: &ReaderMetadata,
     ) -> Result<ParquetSource<InputReader>, InputError> {
         match self {
+            InputSource::Overview(s) => Ok(tylertoo_io::open_parquet_with_metadata(
+                InputReader::Overview(Arc::clone(s)),
+                meta.clone(),
+            )),
             InputSource::Local(p) => Ok(tylertoo_io::open_parquet_with_metadata(
                 self.open_local(p)?,
                 meta.clone(),
@@ -436,7 +454,7 @@ impl InputSource {
     /// Fetch counters for a remote source (`None` for local inputs).
     pub fn fetch_stats(&self) -> Option<FetchStats> {
         match self {
-            InputSource::Local(_) => None,
+            InputSource::Local(_) | InputSource::Overview(_) => None,
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => Some(r.fetch_stats()),
         }
@@ -447,7 +465,7 @@ impl InputSource {
     /// bbox-pruned row groups are never downloaded.
     pub fn fetched_ranges(&self) -> Option<Vec<std::ops::Range<u64>>> {
         match self {
-            InputSource::Local(_) => None,
+            InputSource::Local(_) | InputSource::Overview(_) => None,
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => Some(r.fetched_ranges()),
         }
@@ -475,7 +493,7 @@ impl InputSource {
     /// working set.
     pub fn release_read_cache(&self) {
         match self {
-            InputSource::Local(_) => {}
+            InputSource::Local(_) | InputSource::Overview(_) => {}
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => r.release_read_cache(),
         }
@@ -485,7 +503,7 @@ impl InputSource {
     /// it, from the kept encoded tail when there is one.
     pub(crate) fn release_footer(&self) {
         match self {
-            InputSource::Local(_) => {}
+            InputSource::Local(_) | InputSource::Overview(_) => {}
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => r.release_footer(),
         }
@@ -495,7 +513,7 @@ impl InputSource {
     /// run never reads (#815); a later open re-fetches it.
     pub(crate) fn forget_footer(&self) {
         match self {
-            InputSource::Local(_) => {}
+            InputSource::Local(_) | InputSource::Overview(_) => {}
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => r.forget_footer(),
         }
@@ -541,7 +559,7 @@ impl InputSource {
         #[cfg(not(feature = "remote"))]
         let _ = (selected, roots);
         match self {
-            InputSource::Local(_) => Ok(PartStaging::default()),
+            InputSource::Local(_) | InputSource::Overview(_) => Ok(PartStaging::default()),
             // A part the run reads nothing of stages nothing, and needs no
             // footer (#815 releases it).
             #[cfg(feature = "remote")]
@@ -591,7 +609,7 @@ pub(crate) fn stage_parts(
             .iter()
             .filter_map(|&(source, plan)| match source {
                 InputSource::Remote(r) => Some((r, &plan.remote)),
-                InputSource::Local(_) => None,
+                InputSource::Local(_) | InputSource::Overview(_) => None,
             })
             .collect();
         remote::stage_parts(&remote, budget)
@@ -893,6 +911,8 @@ fn param_name(param: &str) -> String {
 pub enum InputReader {
     /// Local file (delegates to parquet's own `File` impl).
     Local(File),
+    /// The temporary overview `tiles` holds in memory (#923).
+    Overview(Arc<crate::overview::chunked::OverviewStore>),
     /// Remote object; every `get_bytes` is one range request.
     #[cfg(feature = "remote")]
     Remote(remote::RemoteReader),
@@ -902,6 +922,7 @@ impl Length for InputReader {
     fn len(&self) -> u64 {
         match self {
             InputReader::Local(f) => f.len(),
+            InputReader::Overview(s) => s.len(),
             #[cfg(feature = "remote")]
             InputReader::Remote(r) => r.object_size(),
         }
@@ -919,6 +940,10 @@ impl ChunkReader for InputReader {
                 file: f.try_clone()?,
                 pos: start,
             }))),
+            InputReader::Overview(s) => Ok(Box::new(std::io::BufReader::new(OverviewRead {
+                store: Arc::clone(s),
+                pos: start,
+            }))),
             #[cfg(feature = "remote")]
             InputReader::Remote(r) => Ok(Box::new(r.sequential_reader(start))),
         }
@@ -928,19 +953,12 @@ impl ChunkReader for InputReader {
         match self {
             InputReader::Local(f) => {
                 let mut buf = vec![0; length];
-                let mut done = 0;
-                while done < length {
-                    match read_at(f, &mut buf[done..], start.saturating_add(done as u64))? {
-                        0 => {
-                            return Err(ParquetError::EOF(format!(
-                                "Expected to read {length} bytes, read only {done}"
-                            )))
-                        }
-                        n => done += n,
-                    }
-                }
+                read_exact_at(f, &mut buf, start).map_err(|e| ParquetError::EOF(e.to_string()))?;
                 Ok(buf.into())
             }
+            InputReader::Overview(s) => s
+                .read(start, length)
+                .map_err(|e| ParquetError::External(Box::new(e))),
             #[cfg(feature = "remote")]
             InputReader::Remote(r) => r.get_bytes_range(start, length),
         }
@@ -967,6 +985,42 @@ impl Read for LocalRead {
 }
 
 /// One positional read of `file` at `at`, leaving any file offset alone.
+/// Fill `buf` from `file` at `at`, or fail with what was short.
+pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        match read_at(file, &mut buf[done..], at.saturating_add(done as u64))? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("Expected to read {} bytes, read only {done}", buf.len()),
+                ))
+            }
+            n => done += n,
+        }
+    }
+    Ok(())
+}
+
+/// A sequential read of the in-memory overview from `pos`.
+struct OverviewRead {
+    store: Arc<crate::overview::chunked::OverviewStore>,
+    pos: u64,
+}
+
+impl Read for OverviewRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf
+            .len()
+            .min(usize::try_from(self.store.len().saturating_sub(self.pos)).unwrap_or(usize::MAX));
+        if n > 0 {
+            buf[..n].copy_from_slice(&self.store.read(self.pos, n)?);
+            self.pos += n as u64;
+        }
+        Ok(n)
+    }
+}
+
 fn read_at(file: &File, buf: &mut [u8], at: u64) -> std::io::Result<usize> {
     #[cfg(unix)]
     return std::os::unix::fs::FileExt::read_at(file, buf, at);
@@ -5179,6 +5233,7 @@ mod tests {
     fn file_url_maps_to_local() {
         let s = InputSource::from_str_input("file:///tmp/foo.parquet").unwrap();
         match s {
+            InputSource::Overview(_) => panic!("file:// must be local"),
             InputSource::Local(p) => assert_eq!(p, PathBuf::from("/tmp/foo.parquet")),
             #[cfg(feature = "remote")]
             InputSource::Remote(_) => panic!("file:// must be local"),
@@ -5505,7 +5560,7 @@ mod tests {
                 .collect();
             let tail = |s: &InputSource| match s {
                 InputSource::Remote(r) => r.footer_tail_len(),
-                InputSource::Local(_) => unreachable!(),
+                InputSource::Local(_) | InputSource::Overview(_) => unreachable!(),
             };
             let bytes = tiny_parquet();
             let footer = u64::from(u32::from_le_bytes(

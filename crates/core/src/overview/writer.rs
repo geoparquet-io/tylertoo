@@ -572,6 +572,25 @@ impl OverviewWriter<File> {
     }
 }
 
+impl OverviewWriter<super::chunked::OverviewSink> {
+    /// [`Self::create`] at `path`, or into `store` (#923) when given.
+    pub(crate) fn create_sink(
+        path: &Path,
+        store: Option<&std::sync::Arc<super::chunked::OverviewStore>>,
+        source_schema: &Schema,
+        options: OverviewWriterOptions,
+    ) -> Result<Self, WriterError> {
+        use super::chunked::OverviewSink;
+        if let Some(store) = store {
+            return Self::try_new(OverviewSink::Store(store.clone()), source_schema, options);
+        }
+        let (file, pending) = crate::atomic_output::create(path)?;
+        let mut writer = Self::try_new(OverviewSink::File(file), source_schema, options)?;
+        writer.pending_output = Some(pending);
+        Ok(writer)
+    }
+}
+
 impl<W: Write + Send> OverviewWriter<W> {
     /// Create an overview writer over an arbitrary sink.
     ///
@@ -1130,6 +1149,8 @@ impl<W: Write + Send> OverviewWriter<W> {
             }
             rg_writer.close()?;
             writer.row_groups_written += 1;
+            // #923: the in-memory overview cuts a chunk at each row group.
+            writer.writer.flush()?;
             Ok(())
         })
     }

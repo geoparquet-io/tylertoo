@@ -2839,6 +2839,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::GeneralizationOv
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::GeneralizationOverrides
 #[non_exhaustive] pub struct tylertoo_core::IntermediateOverview
 pub tylertoo_core::IntermediateOverview::bytes: u64
+pub tylertoo_core::IntermediateOverview::in_memory_bytes: core::option::Option<u64>
 pub tylertoo_core::IntermediateOverview::path: std::path::PathBuf
 pub tylertoo_core::IntermediateOverview::retained: bool
 pub tylertoo_core::IntermediateOverview::space_warning: core::option::Option<alloc::string::String>

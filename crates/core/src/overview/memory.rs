@@ -22,9 +22,11 @@
 //! Every profile gets at least the phase's floor.
 
 use super::assign::FeatureTable;
+use super::chunked::{OverviewStore, StoreId};
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
 use super::pipeline::{probe_preflight_memory_limit, MemoryLimit};
+use std::sync::Arc;
 
 pub(super) const SINK_ROW_ALLOC_OVERHEAD_BYTES: u64 = 256;
 /// What a shared output row (#852) holds besides its geometry: its `u32`
@@ -251,6 +253,10 @@ pub(super) struct MemoryBudget {
     /// The staging knobs [`stage_requests`](Self::stage_requests) and
     /// `bounded`'s staging cap read (#788).
     stage: crate::input::StageAdmission,
+    /// The temporary overview the export reads (#923): its resident chunks
+    /// count as a reservation, read live, and a grant or requirement that
+    /// would not fit evicts them before it shrinks or fails.
+    overview: Option<StoreId>,
 }
 
 fn sum(ledger: &[u64; MemoryPhase::COUNT]) -> u64 {
@@ -267,6 +273,41 @@ impl MemoryBudget {
             reserved: [0; MemoryPhase::COUNT],
             granted: [0; MemoryPhase::COUNT],
             stage: crate::input::stage_admission(),
+            overview: None,
+        }
+    }
+    /// Hold `store`'s resident chunks in this budget, and let a grant that
+    /// does not fit evict them (#923).
+    pub(super) fn hold_overview(&mut self, store: &Arc<OverviewStore>) {
+        self.overview = Some(store.id());
+    }
+    fn overview_store(&self) -> Option<Arc<OverviewStore>> {
+        self.overview.and_then(StoreId::get)
+    }
+    /// Every grant, the overview's resident chunks included: they come
+    /// out of the allowance one for one, as the writer's grants did.
+    fn granted_total(&self) -> u64 {
+        sum(&self.granted).saturating_add(self.overview_store().map_or(0, |s| s.resident_bytes()))
+    }
+    /// Evict overview chunks while `short()` says how many more bytes are
+    /// needed, until it says none or nothing is left resident.
+    fn reclaim(&self, mut short: impl FnMut(&Self) -> u64) {
+        let Some(store) = self.overview_store() else {
+            return;
+        };
+        loop {
+            let want = short(self);
+            if want == 0 || store.resident_bytes() == 0 {
+                return;
+            }
+            match store.evict(want) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("[memory] cannot evict the overview to disk: {e}");
+                    return;
+                }
+            }
         }
     }
     pub(super) fn with_available(available: Option<u64>) -> Self {
@@ -278,7 +319,7 @@ impl MemoryBudget {
     /// The probed figure minus every reservation and grant. `None` when
     /// nothing could be probed.
     pub(super) fn available(&self) -> Option<u64> {
-        let held = sum(&self.reserved).saturating_add(sum(&self.granted));
+        let held = sum(&self.reserved).saturating_add(self.granted_total());
         self.limit.map(|l| l.bytes.saturating_sub(held))
     }
     /// Python list allowance; exact Rust reports always stream from spill.
@@ -302,7 +343,7 @@ impl MemoryBudget {
         let base = self.limit.map_or(FALLBACK_ALLOWANCE_BYTES, |l| {
             (l.bytes.saturating_sub(sum(&self.reserved)) as f64 * ALLOWANCE_FRACTION) as u64
         });
-        base.saturating_sub(sum(&self.granted))
+        base.saturating_sub(self.granted_total())
     }
     #[expect(
         clippy::unused_self,
@@ -470,6 +511,16 @@ impl MemoryBudget {
         want: usize,
         floor: usize,
     ) -> Grant {
+        let want_bytes = (want.max(floor) as u64).saturating_mul(price.bytes);
+        match profile {
+            MemoryProfile::Speed => {
+                self.reclaim(|b| b.available().map_or(0, |a| want_bytes.saturating_sub(a)))
+            }
+            MemoryProfile::Auto | MemoryProfile::Bounded => self.reclaim(|b| {
+                let short = want.saturating_sub(b.affordable(profile, phase, price));
+                ((short as u64).saturating_mul(price.bytes) as f64 / phase.share()).ceil() as u64
+            }),
+        }
         let units = match profile {
             MemoryProfile::Bounded => self
                 .affordable(profile, phase, price)
@@ -665,6 +716,7 @@ impl MemoryBudget {
     }
 
     pub(super) fn require(&self, phase: MemoryPhase, needed: u64) -> Result<(), ConvertError> {
+        self.reclaim(|b| b.available().map_or(0, |a| needed.saturating_sub(a)));
         if let Some(available) = self.available() {
             if needed > available {
                 return Err(ConvertError::BudgetExceeded {
@@ -695,6 +747,7 @@ impl MemoryBudget {
             "total_reserved": sum(&self.reserved),
             "total_granted": sum(&self.granted),
             "remaining": self.remaining(),
+            "overview_resident": self.overview_store().map_or(0, |s| s.resident_bytes()),
         })
     }
 
@@ -712,6 +765,7 @@ impl MemoryBudget {
         if self.limit.is_none() {
             return Ok(());
         }
+        self.reclaim(|b| needed.saturating_sub(b.room(profile)));
         let available = self.room(profile);
         if needed > available {
             return Err(ConvertError::BudgetExceeded {
@@ -754,6 +808,38 @@ impl MemoryBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #923: the in-memory overview's resident chunks are held like a
+    /// reservation; a grant that does not fit evicts them and then fits,
+    /// and the ledger is whole again once the store is gone.
+    #[test]
+    fn a_refused_grant_evicts_the_overview_and_then_fits() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::super::chunked::OverviewStore::new(dir.path().to_path_buf());
+        let mut sink = super::super::chunked::OverviewSink::Store(Arc::clone(&store));
+        for _ in 0..8 {
+            sink.write_all(&vec![7; 1 << 20]).unwrap();
+            sink.flush().unwrap();
+        }
+        let mut budget = MemoryBudget::with_available(Some(10 << 20));
+        let full = budget.remaining();
+        budget.hold_overview(&store);
+        assert_eq!(budget.granted_total(), 8 << 20);
+        assert!(budget.remaining() < full);
+        let price = Price::new(1 << 20, PriceBasis::Measured);
+        let grant = budget.fit(MemoryProfile::Auto, MemoryPhase::Fill, price, 4, 1);
+        assert_eq!(grant.units, 4, "the grant fits once chunks are evicted");
+        assert!(store.resident_bytes() < 8 << 20 && store.disk_bytes() > 0);
+        assert_eq!(&store.read(0, 4).unwrap()[..], &[7; 4]);
+        budget.require(MemoryPhase::ExportCollect, 3 << 20).unwrap();
+        budget.release(grant);
+        drop(sink);
+        drop(store);
+        assert_eq!(budget.granted_total(), 0);
+        assert_eq!(budget.remaining(), full);
+        assert_eq!(budget.ledger_json()["overview_resident"], 0);
+    }
 
     #[test]
     fn bounded_holds_pass2_in_flight_to_its_cap_and_others_do_not() {

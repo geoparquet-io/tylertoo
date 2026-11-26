@@ -4255,6 +4255,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         strategy,
         &crate::diagnostics::Diagnostics::default(),
         None,
+        None,
     )
 }
 
@@ -4275,6 +4276,7 @@ pub(crate) fn convert_to_overviews_for_archive(
         super::stream::Pass2Strategy::Pipelined,
         &crate::diagnostics::Diagnostics::default(),
         Some(archive),
+        None,
     )
 }
 
@@ -4285,6 +4287,7 @@ pub(crate) fn convert_to_overviews_source_diagnostics(
     strategy: super::stream::Pass2Strategy,
     diagnostics: &crate::diagnostics::Diagnostics,
     archive: Option<&Path>,
+    store: Option<&std::sync::Arc<super::chunked::OverviewStore>>,
 ) -> Result<ConvertReport, ConvertError> {
     options.validate()?;
     let adjusted = normalize_convert_options(source, options, Some(output_path), diagnostics)?;
@@ -4297,6 +4300,7 @@ pub(crate) fn convert_to_overviews_source_diagnostics(
         strategy,
         diagnostics,
         archive,
+        store,
     )
 }
 
@@ -4307,10 +4311,18 @@ fn convert_to_overviews_validated(
     strategy: super::stream::Pass2Strategy,
     diagnostics: &crate::diagnostics::Diagnostics,
     archive: Option<&Path>,
+    store: Option<&std::sync::Arc<super::chunked::OverviewStore>>,
 ) -> Result<ConvertReport, ConvertError> {
     source.record_diagnostics(diagnostics);
     crate::atomic_output::check_writable(output_path)?;
-    super::stream::run_stages(source, output_path, config, strategy, diagnostics, archive)
+    super::stream::run_stages(
+        source,
+        (output_path, store),
+        config,
+        strategy,
+        diagnostics,
+        archive,
+    )
 }
 
 /// Snapshot (and `log::info!`) the remote fetch counters at the end of a
@@ -7595,12 +7607,19 @@ fn find_confidence_column(
 /// Fill each level report's byte sizes by summing its row-group band from the
 /// output file's Parquet footer.
 pub(super) fn fill_level_bytes(
-    output_path: &Path,
+    (output_path, store): (
+        &Path,
+        Option<&std::sync::Arc<super::chunked::OverviewStore>>,
+    ),
     meta: &super::level::OverviewsMeta,
     reports: &mut [LevelReport],
 ) -> Result<(), ConvertError> {
-    let file = std::fs::File::open(output_path)?;
-    let pmeta = tylertoo_io::read_parquet_metadata(&file)?;
+    let pmeta = match store {
+        Some(store) => {
+            tylertoo_io::read_parquet_metadata(&crate::input::InputReader::Overview(store.clone()))?
+        }
+        None => tylertoo_io::read_parquet_metadata(&std::fs::File::open(output_path)?)?,
+    };
 
     let mut start = 0usize;
     for (level, report) in meta.levels.iter().zip(reports.iter_mut()) {

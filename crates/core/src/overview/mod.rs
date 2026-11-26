@@ -38,6 +38,7 @@ mod read;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use plan_state::fuzz_convert_plan;
+pub mod chunked;
 mod procmem;
 mod procstat;
 pub mod properties;

@@ -141,12 +141,42 @@ impl OverviewReader {
     /// footer cannot be parsed, as well as the two cases above.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ReaderError> {
         let path = path.as_ref().to_path_buf();
-        let shown = || path.display().to_string();
         let file = File::open(&path).map_err(|error| ReaderError::Open {
-            path: shown(),
+            path: path.display().to_string(),
             error,
         })?;
-        let builder = tylertoo_io::open_parquet(file).map_err(|error| ReaderError::Footer {
+        let input = crate::input::InputSource::Local(path.clone());
+        Self::open_reader(file, path, input)
+    }
+
+    /// [`Self::open`] over the overview `tiles` holds in memory (#923),
+    /// named `path` in messages.
+    pub(crate) fn open_store(
+        store: &Arc<super::chunked::OverviewStore>,
+        path: PathBuf,
+    ) -> Result<Self, ReaderError> {
+        Self::open_reader(
+            crate::input::InputReader::Overview(Arc::clone(store)),
+            path,
+            crate::input::InputSource::Overview(Arc::clone(store)),
+        )
+    }
+
+    /// The in-memory overview this reader reads (#923), if it is one.
+    pub(crate) fn store(&self) -> Option<&Arc<super::chunked::OverviewStore>> {
+        match self.source.parts().first() {
+            Some(crate::input::InputSource::Overview(store)) => Some(store),
+            _ => None,
+        }
+    }
+
+    fn open_reader<R: tylertoo_io::ChunkReader + 'static>(
+        reader: R,
+        path: PathBuf,
+        input: crate::input::InputSource,
+    ) -> Result<Self, ReaderError> {
+        let shown = || path.display().to_string();
+        let builder = tylertoo_io::open_parquet(reader).map_err(|error| ReaderError::Footer {
             path: shown(),
             error,
         })?;
@@ -172,7 +202,7 @@ impl OverviewReader {
         let resolved = ResolvedSchema::from_parquet(&schema, &metadata)
             .map_err(|e| ReaderError::Conformance(format!("{}: {e}", shown())))?;
         let source = Arc::new(ConvertSource::single_parsed(
-            crate::input::InputSource::Local(path.clone()),
+            input,
             resolved.clone(),
             builder.reader_metadata().clone(),
         ));

@@ -789,10 +789,16 @@ fn resolve_tile_range(
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IntermediateOverview {
-    /// Where the intermediate overview was written.
+    /// Where the intermediate overview was written. For one held in
+    /// memory ([`Self::in_memory_bytes`]), the directory its evicted part
+    /// goes to, in an anonymous file.
     pub path: PathBuf,
     /// Its size in bytes right after the convert (0 if unreadable).
     pub bytes: u64,
+    /// `Some` when the run held the overview in memory (#923, `auto` and
+    /// `speed`): the bytes resident right after the convert. The rest of
+    /// [`Self::bytes`] was on disk. `None` for a file.
+    pub in_memory_bytes: Option<u64>,
     /// `true` when [`TilesOptions::keep_overview`] retains it; `false` for a
     /// temp file removed after the export.
     pub retained: bool,
@@ -1163,6 +1169,72 @@ pub(super) fn convert_to_pmtiles_validated(
     convert_to_pmtiles_retaining_overview(input, open, output, config, observer, None)
 }
 
+/// Where the facade puts its intermediate overview, as the path the convert
+/// writes (or names it by), the temp path's guard, and the in-memory store.
+///
+/// Retained at `keep_overview` when given (or at the layered path's
+/// `retained`); otherwise a temp file in the spill dir / $TMPDIR / the
+/// output directory, removed on drop — success or failure alike (#314). A
+/// `TempPath`, not an open `NamedTempFile`: convert publishes by renaming a
+/// sibling over this path, which Windows refuses while a handle to it is
+/// open (#678).
+///
+/// #923: under `auto` and `speed` a temporary overview is held in memory
+/// instead, as far as the budget grants it, and the rest is evicted to an
+/// anonymous file in the same directory. Only the plain one-shot run: shards
+/// and the coverage fill keep the file.
+type Intermediate = (
+    PathBuf,
+    Option<crate::atomic_output::Reserved>,
+    Option<std::sync::Arc<super::chunked::OverviewStore>>,
+);
+
+fn place_intermediate(
+    options: &TilesOptions,
+    output: &Path,
+    retained: Option<&Path>,
+) -> Result<Intermediate, TilesError> {
+    #[cfg(test)]
+    let (force_file, cap) = tests::forced_overview();
+    #[cfg(not(test))]
+    let (force_file, cap) = (false, None::<u64>);
+    let in_memory = !force_file
+        && options.keep_overview.is_none()
+        && retained.is_none()
+        && options.shard.is_none()
+        && !options.export.coverage_fill
+        && !matches!(
+            options.convert.profile,
+            super::level::MemoryProfile::Bounded
+        );
+    let dir = intermediate_dir(options, output);
+    Ok(match options.keep_overview.as_deref().or(retained) {
+        // Its directory was checked above.
+        Some(path) => (path.to_path_buf(), None, None),
+        None if in_memory => {
+            let store = super::chunked::OverviewStore::new(dir.clone());
+            if let Some(cap) = cap {
+                store.admit_under(
+                    super::memory::MemoryBudget::with_available(Some(cap)),
+                    super::level::MemoryProfile::Speed,
+                );
+            }
+            // Never created: it names the overview in messages and puts the
+            // disk preflights on the eviction file's volume.
+            (dir.join("(in-memory overview)"), None, Some(store))
+        }
+        None => {
+            let tmp =
+                crate::atomic_output::reserve_path(".tylertoo-overview-", ".parquet", Some(&dir))
+                    .map_err(|source| TilesError::IntermediateCreate {
+                    dir: dir.clone(),
+                    source,
+                })?;
+            (tmp.to_path_buf(), Some(tmp), None)
+        }
+    })
+}
+
 /// The layered path retains its temporary overview through the join without
 /// changing the temporary codec or the public `keep_overview` contract.
 pub(super) fn convert_to_pmtiles_retaining_overview(
@@ -1224,33 +1296,8 @@ pub(super) fn convert_to_pmtiles_retaining_overview(
     let shard_range = options.shard.as_ref().and_then(|job| job.range);
     let metadata = &options.export.metadata;
 
-    // Intermediate overview file (#314): retained at `keep_overview` when
-    // given; otherwise a temp file in the spill dir / $TMPDIR / the output
-    // directory, removed on drop — success or failure alike. A TempPath, not
-    // an open NamedTempFile: convert publishes by renaming a sibling over
-    // this path, which Windows refuses while a handle to it is open (#678).
-    let (overview_path, overview_tmp): (PathBuf, Option<crate::atomic_output::Reserved>) =
-        match options
-            .keep_overview
-            .as_deref()
-            .or(retained.as_ref().map(|(path, _, _)| *path))
-        {
-            // Its directory was checked above.
-            Some(path) => (path.to_path_buf(), None),
-            None => {
-                let dir = intermediate_dir(options, output);
-                let tmp = crate::atomic_output::reserve_path(
-                    ".tylertoo-overview-",
-                    ".parquet",
-                    Some(&dir),
-                )
-                .map_err(|source| TilesError::IntermediateCreate {
-                    dir: dir.clone(),
-                    source,
-                })?;
-                (tmp.to_path_buf(), Some(tmp))
-            }
-        };
+    let (overview_path, overview_tmp, store) =
+        place_intermediate(options, output, retained.as_ref().map(|(path, _, _)| *path))?;
     // Read once by the export below and removed, so its codec is the
     // caller's choice; a kept overview is a deliverable and keeps ZSTD.
     let mut convert_options = convert_options;
@@ -1282,6 +1329,7 @@ pub(super) fn convert_to_pmtiles_retaining_overview(
         super::stream::Pass2Strategy::Pipelined,
         &diagnostics,
         Some(output),
+        store.as_ref(),
     ) {
         Ok(report) => report,
         Err(e) => {
@@ -1380,13 +1428,22 @@ pub(super) fn convert_to_pmtiles_retaining_overview(
     // #314: the disk cost of the one-shot facade must not be silent — the
     // observer gets the intermediate's path, size and fate before the export
     // starts, so a failed export still named them.
-    let overview_bytes = std::fs::metadata(&overview_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let overview_bytes = store.as_ref().map_or_else(
+        || {
+            std::fs::metadata(&overview_path)
+                .map(|m| m.len())
+                .unwrap_or(0)
+        },
+        |s| s.len(),
+    );
     let intermediate = IntermediateOverview {
-        path: overview_path.clone(),
+        path: match &store {
+            Some(_) => intermediate_dir(options, output),
+            None => overview_path.clone(),
+        },
         bytes: overview_bytes,
-        retained: overview_tmp.is_none() && retained.is_none(),
+        in_memory_bytes: store.as_ref().map(|s| s.resident_bytes()),
+        retained: overview_tmp.is_none() && retained.is_none() && store.is_none(),
         space_warning,
     };
     observer.overview_written(&intermediate, &convert_report);
@@ -1426,12 +1483,22 @@ pub(super) fn convert_to_pmtiles_retaining_overview(
         ..options.export.clone()
     };
     let (export_report, members) = super::export::export_pmtiles_for_join(
-        &overview_path,
+        (&overview_path, store.as_ref()),
         output,
         &export_opts,
         retained.as_ref().map_or(&[], |(_, _, zooms)| *zooms),
     )
     .map_err(TilesError::Export)?;
+    if let (Some(store), Some(resident)) = (&store, intermediate.in_memory_bytes) {
+        log::info!(
+            "[tiles] in-memory overview: {} B, {resident} B resident after the convert, \
+             {} B evicted to disk ({} B of them by the export), {} B released after their last read",
+            intermediate.bytes,
+            store.disk_bytes(),
+            store.disk_bytes().saturating_sub(intermediate.bytes - resident),
+            store.released_bytes(),
+        );
+    }
     if let Some((_, retained_source, _)) = retained {
         *retained_source = Some(super::export::JointSource {
             path: overview_path,
@@ -1916,6 +1983,29 @@ fn resolve_intermediate_dir(
 
 #[cfg(test)]
 mod tests {
+    std::thread_local! {
+        /// #923 test seam: how the next run here places its overview.
+        pub(super) static FORCED_OVERVIEW: std::cell::Cell<Option<Forced>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// How a test forces the intermediate overview (#923).
+    #[derive(Clone, Copy)]
+    pub(super) enum Forced {
+        /// The temp file.
+        File,
+        /// In memory, at most this many bytes resident.
+        Cap(u64),
+    }
+
+    /// `(keep it in a file, cap on the bytes held in memory)`.
+    pub(super) fn forced_overview() -> (bool, Option<u64>) {
+        match FORCED_OVERVIEW.get() {
+            None => (false, None),
+            Some(Forced::File) => (true, None),
+            Some(Forced::Cap(cap)) => (false, Some(cap)),
+        }
+    }
     use super::*;
     use crate::overview::testutil::write_input;
     use crate::TilesetMetadata;
@@ -2444,6 +2534,57 @@ mod tests {
         assert_eq!(convert.zoom_ceiling, None);
     }
 
+    /// #923: the overview held in memory, all of it, none of it, or part of
+    /// it, exports the archive the temp file does, and leaves no
+    /// `.tylertoo-overview-*` file behind.
+    #[test]
+    fn in_memory_overview_writes_the_archive_the_file_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        points_input(&input);
+        for mode in [
+            super::super::level::Mode::Duplicating,
+            super::super::level::Mode::Partitioning,
+        ] {
+            let run = |forced: Option<Forced>, name: &str| {
+                let name = format!("{name}-{mode:?}");
+                let scratch = dir.path().join(&name);
+                std::fs::create_dir(&scratch).unwrap();
+                let output = dir.path().join(format!("{name}.pmtiles"));
+                let mut options = zoomed_options(0, 6);
+                options.convert.mode = mode;
+                options.convert.spill_dir = Some(scratch.clone());
+                FORCED_OVERVIEW.set(forced);
+                let outcome =
+                    convert_to_pmtiles(&TilesInput::Path(input.clone()), &output, &options);
+                FORCED_OVERVIEW.set(None);
+                let TilesOutcome::Converted(report) = outcome.unwrap() else {
+                    panic!("expected a conversion")
+                };
+                assert!(std::fs::read_dir(&scratch).unwrap().all(|e| !e
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tylertoo-overview-")));
+                (std::fs::read(&output).unwrap(), report.intermediate)
+            };
+            let (file, on_disk) = run(Some(Forced::File), "file");
+            assert_eq!(on_disk.in_memory_bytes, None);
+            let (resident, held) = run(None, "resident");
+            assert_eq!(held.in_memory_bytes, Some(held.bytes));
+            assert_eq!(held.bytes, on_disk.bytes);
+            assert!(!held.retained);
+            assert!(resident == file, "resident overview changed the archive");
+            let (evicted, none) = run(Some(Forced::Cap(0)), "evicted");
+            assert_eq!(none.in_memory_bytes, Some(0));
+            assert!(evicted == file, "evicted overview changed the archive");
+            let (mixed, part) = run(Some(Forced::Cap(held.bytes / 2)), "mixed");
+            let kept = part.in_memory_bytes.unwrap();
+            assert!(kept > 0 && kept < part.bytes, "{kept} of {}", part.bytes);
+            assert!(mixed == file, "a part-evicted overview changed the archive");
+        }
+    }
+
     /// The facade's happy path: a PMTiles archive, a combined report whose
     /// JSON is exactly `{"convert", "export"}`, the #380 declared minimum,
     /// and a temp intermediate that is gone afterwards.
@@ -2490,11 +2631,15 @@ mod tests {
         assert!(!seen.retained);
         assert!(seen.bytes > 0, "intermediate size is reported");
         assert_eq!(seen, report.intermediate);
-        assert!(
-            !report.intermediate.path.exists(),
-            "temp intermediate must be removed: {}",
-            report.intermediate.path.display()
-        );
+        // #923: `auto` held it in memory; nothing named it on disk.
+        assert_eq!(seen.in_memory_bytes, Some(seen.bytes));
+        assert!(std::fs::read_dir(&report.intermediate.path)
+            .unwrap()
+            .all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tylertoo-overview-")));
 
         // The combined report serializes to exactly the two halves.
         let json = serde_json::to_value(&*report).unwrap();
@@ -2522,7 +2667,11 @@ mod tests {
         let mut options = zoomed_options(0, 2);
         options.convert.spill_dir = Some(scratch.clone());
 
-        convert_to_pmtiles(&TilesInput::Path(input), &output, &options).expect("must convert");
+        // The temp file's path (`bounded`'s, #923).
+        FORCED_OVERVIEW.set(Some(Forced::File));
+        let converted = convert_to_pmtiles(&TilesInput::Path(input), &output, &options);
+        FORCED_OVERVIEW.set(None);
+        converted.expect("must convert");
 
         let (published, over_existing) =
             crate::atomic_output::renames_over_existing(&scratch, ".tylertoo-overview-");
@@ -2588,6 +2737,8 @@ mod tests {
                 }
             }
         }
+        // Read back from the temp file (`bounded`'s path, #923).
+        FORCED_OVERVIEW.set(Some(Forced::File));
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.parquet");
         points_input(&input);
@@ -2626,6 +2777,7 @@ mod tests {
             assert!(kept);
             assert!(codec.starts_with("ZSTD"), "kept overview: {codec}");
         }
+        FORCED_OVERVIEW.set(None);
     }
 
     /// #433: a `keep_overview` into a missing directory is refused before

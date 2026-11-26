@@ -1125,16 +1125,24 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     }
     impl TilesObserver for Printer {
         fn overview_written(&mut self, intermediate: &IntermediateOverview, c: &ConvertReport) {
-            say!(
-                "  intermediate overview: {} ({}{})",
-                intermediate.path.display(),
-                HumanBytes(intermediate.bytes),
-                if intermediate.retained {
-                    ", retained"
-                } else {
-                    ", removed after export; --keep-overview PATH retains it"
-                }
-            );
+            match intermediate.in_memory_bytes {
+                Some(resident) => say!(
+                    "  intermediate overview: {} in memory, {} on disk in {}, removed after export; --keep-overview PATH retains it",
+                    HumanBytes(resident),
+                    HumanBytes(intermediate.bytes.saturating_sub(resident)),
+                    intermediate.path.display(),
+                ),
+                None => say!(
+                    "  intermediate overview: {} ({}{})",
+                    intermediate.path.display(),
+                    HumanBytes(intermediate.bytes),
+                    if intermediate.retained {
+                        ", retained"
+                    } else {
+                        ", removed after export; --keep-overview PATH retains it"
+                    }
+                ),
+            }
             if self.verbose {
                 say!(
                     "Overview: {} input features → {} rows across {} levels in {:.2}s",
