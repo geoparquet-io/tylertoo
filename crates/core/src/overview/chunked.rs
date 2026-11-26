@@ -82,7 +82,12 @@ struct Inner {
     /// Sealed chunks, in file order.
     chunks: Vec<Chunk>,
     /// Bytes written since the last cut.
-    open: Vec<u8>,
+    /// Each write copied into an allocation of exactly its length: a
+    /// growing buffer would hold up to twice its bytes, and with mimalloc
+    /// shrinking one in place frees nothing.
+    open: Vec<Bytes>,
+    /// Bytes in `open`.
+    open_len: u64,
     /// Bytes written in all.
     len: u64,
     /// The eviction file: anonymous, so nothing is left in `dir`.
@@ -120,7 +125,8 @@ struct Chunk {
 
 #[derive(Debug)]
 enum State {
-    Resident(Bytes),
+    /// The chunk's writes, in order, each held exactly.
+    Resident(Vec<Bytes>),
     Disk,
     /// Dropped after the export's last read of it.
     Freed,
@@ -134,6 +140,15 @@ enum Piece {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Write a chunk's segments at its offset `start`.
+fn write_segments(file: &File, segs: &[Bytes], mut start: u64) -> io::Result<()> {
+    for seg in segs {
+        write_at(file, seg, start)?;
+        start += seg.len() as u64;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -232,7 +247,8 @@ impl OverviewStore {
 
     pub(crate) fn append(&self, buf: &[u8]) {
         let mut inner = lock(&self.inner);
-        inner.open.extend_from_slice(buf);
+        inner.open.push(Bytes::copy_from_slice(buf));
+        inner.open_len += buf.len() as u64;
         inner.len += buf.len() as u64;
     }
 
@@ -252,7 +268,7 @@ impl OverviewStore {
             return Ok(());
         }
         let data = std::mem::take(&mut inner.open);
-        let len = data.len() as u64;
+        let len = std::mem::take(&mut inner.open_len);
         let start = inner.len - len;
         let resident = self.resident_bytes();
         let admitted = match &mut inner.admit {
@@ -273,10 +289,10 @@ impl OverviewStore {
         };
         let state = if admitted {
             self.resident.fetch_add(len, Ordering::AcqRel);
-            State::Resident(Bytes::from(data))
+            State::Resident(data)
         } else {
             let file = self.file(&mut inner)?;
-            write_at(&file, &data, start)?;
+            write_segments(&file, &data, start)?;
             inner.on_disk += len;
             State::Disk
         };
@@ -289,7 +305,7 @@ impl OverviewStore {
         let end = start.saturating_add(length as u64);
         let (pieces, file) = {
             let inner = lock(&self.inner);
-            let sealed = inner.len - inner.open.len() as u64;
+            let sealed = inner.len - inner.open_len;
             if end > sealed {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -301,10 +317,21 @@ impl OverviewStore {
             for c in inner.chunks[first..].iter().take_while(|c| c.start < end) {
                 let lo = start.max(c.start);
                 let hi = end.min(c.start + c.len);
-                pieces.push(match &c.state {
-                    State::Resident(b) => {
-                        Piece::Mem(b.slice((lo - c.start) as usize..(hi - c.start) as usize))
+                if let State::Resident(segs) = &c.state {
+                    let mut at = c.start;
+                    for seg in segs {
+                        let end_at = at + seg.len() as u64;
+                        if end_at > lo && at < hi {
+                            pieces.push(Piece::Mem(seg.slice(
+                                (lo.max(at) - at) as usize..(hi.min(end_at) - at) as usize,
+                            )));
+                        }
+                        at = end_at;
                     }
+                    continue;
+                }
+                pieces.push(match &c.state {
+                    State::Resident(_) => unreachable!("handled above"),
                     State::Disk => Piece::Disk(lo, (hi - lo) as usize),
                     State::Freed => {
                         return Err(io::Error::other(format!(
@@ -355,7 +382,7 @@ impl OverviewStore {
                 };
                 (idx, c.start, data.clone(), file)
             };
-            write_at(&file, &data, start)?;
+            write_segments(&file, &data, start)?;
             let mut inner = lock(&self.inner);
             let c = &mut inner.chunks[idx];
             if matches!(c.state, State::Resident(_)) {
@@ -422,6 +449,25 @@ impl io::Write for OverviewSink {
             Self::File(f) => f.flush(),
             Self::Store(s) => s.cut(),
         }
+    }
+}
+
+#[cfg(test)]
+impl OverviewStore {
+    /// Each resident segment's `(counted, allocated)` bytes.
+    fn resident_allocations(&self) -> Vec<(usize, usize)> {
+        let mut inner = lock(&self.inner);
+        let mut out = Vec::new();
+        for c in &mut inner.chunks {
+            if let State::Resident(segs) = &mut c.state {
+                for seg in segs.iter_mut() {
+                    let owned = std::mem::take(seg).try_into_mut().expect("held once");
+                    out.push((owned.len(), owned.capacity()));
+                    *seg = owned.freeze();
+                }
+            }
+        }
+        out
     }
 }
 
@@ -517,6 +563,26 @@ mod tests {
         store.relieve(u64::MAX);
         assert_eq!(store.resident_bytes(), 0);
         check_reads(&store, &all);
+    }
+
+    /// A resident chunk allocates exactly the bytes it is counted as.
+    #[test]
+    fn resident_chunks_allocate_what_they_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OverviewStore::new(dir.keep());
+        let mut sink = OverviewSink::Store(Arc::clone(&store));
+        // Odd sizes a doubling buffer would round up.
+        for n in [1usize, 4097, 100_003, 3, 65_537] {
+            sink.write_all(&vec![9; n]).unwrap();
+            if n % 2 == 1 {
+                sink.flush().unwrap();
+            }
+        }
+        let allocs = store.resident_allocations();
+        assert!(!allocs.is_empty());
+        assert!(allocs.iter().all(|(len, cap)| len == cap), "{allocs:?}");
+        let counted: usize = allocs.iter().map(|(len, _)| len).sum();
+        assert_eq!(counted as u64, store.resident_bytes());
     }
 
     #[test]
