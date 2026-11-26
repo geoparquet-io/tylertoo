@@ -91,9 +91,9 @@ fn write_points(path: &Path) {
     w.close().expect("close fixture");
 }
 
-/// Run `export-pmtiles` on `overview`, with `mem_limit` as the RAM probe's
-/// override when given. Returns (success, stderr).
-fn export(overview: &Path, out: &Path, mem_limit: Option<&str>) -> (bool, String) {
+/// Run `export-pmtiles` on `overview` with `args`, with `mem_limit` as the
+/// RAM probe's env override when given. Returns (success, stderr).
+fn export(overview: &Path, out: &Path, mem_limit: Option<&str>, args: &[&str]) -> (bool, String) {
     let mut cmd = Command::new(tylertoo_bin());
     cmd.args([
         "export-pmtiles",
@@ -102,6 +102,7 @@ fn export(overview: &Path, out: &Path, mem_limit: Option<&str>) -> (bool, String
         "--max-tile-size",
         "500000",
     ])
+    .args(args)
     .env_remove("TYLERTOO_AUTO_MEM_LIMIT_BYTES");
     if let Some(limit) = mem_limit {
         cmd.env("TYLERTOO_AUTO_MEM_LIMIT_BYTES", limit);
@@ -142,7 +143,7 @@ fn export_warns_when_a_tile_exceeds_the_override() {
     // 5k members at several hundred resident bytes each is a few MB,
     // past a 1 MB override even serially.
     let warned = dir.path().join("warned.pmtiles");
-    let (ok, stderr) = export(&overview, &warned, Some("1000000"));
+    let (ok, stderr) = export(&overview, &warned, Some("1000000"), &[]);
     assert!(ok, "the override only warns:\n{stderr}");
     for needle in [
         "continuing because the memory figure is the TYLERTOO_AUTO_MEM_LIMIT_BYTES override",
@@ -161,11 +162,44 @@ fn export_warns_when_a_tile_exceeds_the_override() {
 
     // The same file exports when the probe is left to the machine.
     let exported = dir.path().join("exported.pmtiles");
-    let (ok, stderr) = export(&overview, &exported, None);
+    let (ok, stderr) = export(&overview, &exported, None, &[]);
     assert!(ok, "export must succeed with real RAM:\n{stderr}");
     assert!(
         !stderr.contains("cannot fit in memory"),
         "5k points fit in real RAM:\n{stderr}"
     );
     assert!(exported.exists());
+}
+
+/// #876: `--workers 0` is refused before any I/O: the input does not exist.
+#[test]
+fn zero_workers_are_refused_before_any_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.parquet");
+    let out = dir.path().join("out.pmtiles");
+    for (command, args, needle) in [
+        (
+            "tiles",
+            &["--workers", "0"][..],
+            "--workers / workers must be at least 1",
+        ),
+        (
+            "export-pmtiles",
+            &["--workers", "0"][..],
+            "--workers / workers must be at least 1",
+        ),
+    ] {
+        let output = Command::new(tylertoo_bin())
+            .args([command, missing.to_str().unwrap(), out.to_str().unwrap()])
+            .args(args)
+            .output()
+            .expect("run tylertoo");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{command} {args:?}");
+        assert!(stderr.contains(needle), "{command} {args:?}: {stderr}");
+        assert!(
+            !stderr.contains("missing.parquet"),
+            "{command} {args:?} read the input: {stderr}"
+        );
+    }
 }

@@ -604,6 +604,21 @@ pub struct ConvertOptions {
     ))]
     #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a `--no-default-features` build uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
     pub profile: MemoryProfile,
+    /// Worker threads in the global Rayon pool (#876). `None` (default):
+    /// a positive `RAYON_NUM_THREADS`, else every core under `auto` and
+    /// `speed` and at most [`WORKER_THREADS_MAX`] under `bounded`
+    /// ([`resolve_worker_threads`]). `0` is refused. The pool is
+    /// process-wide: the first run in a process sizes it, and later runs
+    /// keep it. Changes speed and peak memory only.
+    ///
+    /// [`WORKER_THREADS_MAX`]: WORKER_THREADS_MAX
+    /// [`resolve_worker_threads`]: resolve_worker_threads
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "N", help_heading = "Memory & performance")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Worker threads for the whole run. Default: every core under `auto` and `speed`, at most 40 under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>", long_help = None))]
+    pub workers: Option<usize>,
     /// Number of Arrow read batches allowed in flight through the streaming
     /// pass-2 pipeline at once. Pass 2 splits it in half (#494): one half is
     /// the read-ahead channel, the other the window of batches its consumers
@@ -995,6 +1010,7 @@ with_setters!(ConvertOptions {
     with_full_column_stats => full_column_stats: bool,
     with_read_batch_size => read_batch_size: usize,
     with_profile => profile: MemoryProfile,
+    with_workers => workers: Option<usize>,
     with_in_flight_batches => in_flight_batches: usize,
     with_read_workers => read_workers: usize,
     with_cluster => cluster: bool,
@@ -1099,19 +1115,22 @@ pub const WORKER_THREADS_MAX: usize = 40;
 
 /// Workers the global Rayon pool gets under `profile`.
 ///
-/// An explicit positive `RAYON_NUM_THREADS` wins, else
+/// The `workers` option wins when set (validation refuses `0`), then a
+/// positive `RAYON_NUM_THREADS`, else
 /// [`default_worker_threads`] on the cores this process may use
 /// (`available_parallelism`, which honours affinity and a cgroup CPU
 /// quota). The CLI, the Python module and the core entry points size the
 /// pool with it ([`init_worker_pool`]). Only the pool: knobs that read
 /// `available_parallelism()` (read workers, in-flight batches, partition
 /// wave) keep the core count.
-pub fn resolve_worker_threads(profile: MemoryProfile) -> usize {
-    resolve_worker_threads_with(
-        std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
-        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-        profile,
-    )
+pub fn resolve_worker_threads(profile: MemoryProfile, workers: Option<usize>) -> usize {
+    workers.filter(|&n| n > 0).unwrap_or_else(|| {
+        resolve_worker_threads_with(
+            std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            profile,
+        )
+    })
 }
 
 /// The pool width rule (#876): `auto` and `speed` every core, `bounded` at
@@ -1140,24 +1159,30 @@ pub(super) fn resolve_worker_threads_with(
 }
 
 /// Build the global Rayon pool at [`resolve_worker_threads`] workers for
-/// `profile`, before any parallel work.
+/// `profile` and the `workers` option, before any parallel work.
 ///
 /// # Errors
 ///
 /// When the pool was already built (a host process such as Python may own
 /// it); callers may ignore it.
-pub fn init_worker_pool(profile: MemoryProfile) -> Result<(), rayon::ThreadPoolBuildError> {
+pub fn init_worker_pool(
+    profile: MemoryProfile,
+    workers: Option<usize>,
+) -> Result<(), rayon::ThreadPoolBuildError> {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(resolve_worker_threads(profile))
+        .num_threads(resolve_worker_threads(profile, workers))
         .build_global()
 }
 
-/// [`init_worker_pool`] for the core entry points, so a library caller gets
-/// the profile's pool as the CLI and Python do (#876): each run validates its
-/// options first, and validation calls this. Only the first call off any
-/// Rayon pool tries; a pool a host or an earlier call built is kept, and a
-/// caller already on a pool's worker uses that pool.
-pub(super) fn ensure_worker_pool(profile: MemoryProfile) {
+/// What a run's options set for the whole process (#876), applied by
+/// [`ConvertOptions::validate`] and
+/// [`ExportOptions::validate`](super::export::ExportOptions::validate) once
+/// the options pass, so a library caller gets it as the CLI and Python do,
+/// before any I/O: the global pool, built for `profile` and `workers`
+/// ([`init_worker_pool`]) by the first call off any Rayon pool. A pool a
+/// host or an earlier call built is kept, and a caller already on a pool's
+/// worker uses that pool.
+pub(super) fn apply_run_resources(profile: MemoryProfile, workers: Option<usize>) {
     #[expect(
         clippy::disallowed_types,
         reason = "#876: the global pool is process-wide, so its one build attempt is too"
@@ -1166,7 +1191,7 @@ pub(super) fn ensure_worker_pool(profile: MemoryProfile) {
     if rayon::current_thread_index().is_none()
         && !TRIED.swap(true, std::sync::atomic::Ordering::Relaxed)
     {
-        let _ = init_worker_pool(profile);
+        let _ = init_worker_pool(profile, workers);
     }
 }
 
@@ -1283,7 +1308,7 @@ impl ConvertOptions {
     #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConvertError> {
         let config = super::config::validate_convert(self)?;
-        ensure_worker_pool(self.profile);
+        apply_run_resources(self.profile, self.workers);
         Ok(config)
     }
 
@@ -1307,6 +1332,7 @@ impl ConvertOptions {
     }
 
     pub(crate) fn check(&self) -> Result<(), ConvertError> {
+        super::config::check_run_resources(self.workers)?;
         validate_options(self)?;
         self.levels.resolve(self.gsd_base)?;
         Ok(())
@@ -1705,6 +1731,7 @@ impl Default for ConvertOptions {
             full_column_stats: false,
             read_batch_size: DEFAULT_READ_BATCH_SIZE,
             profile: MemoryProfile::Auto,
+            workers: None,
             in_flight_batches: IN_FLIGHT_BATCHES_AUTO,
             read_workers: READ_WORKERS_AUTO,
             cluster: false,
@@ -13067,6 +13094,39 @@ mod tests {
         assert_eq!(w(Some("4"), 64, Auto), 4);
         assert_eq!(w(Some("0"), 64, Bounded), 40);
         assert_eq!(w(Some("x"), 8, Auto), 8);
+        // #876: the `workers` option wins over everything.
+        assert_eq!(resolve_worker_threads(Bounded, Some(3)), 3);
+        assert_eq!(resolve_worker_threads(Speed, Some(200)), 200);
+    }
+
+    /// #876: `workers` of 0 is refused at validation, on convert and export
+    /// alike; unset and positive values pass.
+    #[test]
+    fn zero_workers_is_refused() {
+        let msg = |e: &dyn std::fmt::Display| e.to_string();
+        let convert = |workers| {
+            let o = ConvertOptions {
+                workers,
+                ..ConvertOptions::default()
+            };
+            o.check().err().map(|e| msg(&e))
+        };
+        let export = |workers| {
+            let o = super::super::export::ExportOptions {
+                workers,
+                ..Default::default()
+            };
+            o.check().err().map(|e| msg(&e))
+        };
+        for check in [&convert as &dyn Fn(_) -> _, &export] {
+            assert_eq!(check(None), None);
+            assert_eq!(check(Some(4)), None);
+            let workers = check(Some(0)).expect("0 workers");
+            assert!(
+                workers.contains("--workers / workers must be at least 1"),
+                "{workers}"
+            );
+        }
     }
 
     #[test]

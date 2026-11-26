@@ -405,6 +405,17 @@ fn command_profile(command: &Command) -> Option<MemoryProfile> {
     }
 }
 
+/// The `--workers` the command passed (#876), for the pool built at startup.
+fn command_workers(command: &Command) -> Option<usize> {
+    match command {
+        Command::Tiles(args) => args.tuning.workers,
+        Command::Overview(args) => args.tuning.workers,
+        Command::ExportPmtiles(args) => args.export.workers,
+        Command::Pyramid(args) => args.workers,
+        _ => None,
+    }
+}
+
 fn run_cli<I>(argv: I) -> u8
 where
     I: IntoIterator<Item = std::ffi::OsString>,
@@ -421,6 +432,7 @@ where
     // Set the allocator policy before starting workers or pipeline work.
     let _ = tylertoo_core::internal::overview::convert::init_worker_pool(
         command_profile(&cli.command).unwrap_or_default(),
+        command_workers(&cli.command).filter(|&n| n > 0),
     );
 
     // Checked here, not with clap's `conflicts_with`: `quiet` is a global

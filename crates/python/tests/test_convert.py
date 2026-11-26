@@ -462,14 +462,13 @@ class TestConvertSpillDir:
             assert "nope" in str(exc_info.value), str(exc_info.value)
 
 
-@pytest.mark.parametrize("env_threads", [None, "48"])
+@pytest.mark.parametrize(("env_threads", "workers"), [(None, None), ("48", None), ("48", 3)])
 def test_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set(
-    tmp_path, env_threads
+    tmp_path, env_threads, workers
 ):
-    """Importing the module sizes the worker pool as the CLI does: the
-    memory budget's width for the profile (#876), an explicit
-    RAYON_NUM_THREADS verbatim. A subprocess, since
-    the pool is process-wide and sized once."""
+    """The first call sizes the worker pool as the CLI does: the profile's
+    rule (#876), an explicit RAYON_NUM_THREADS verbatim, and `workers` over
+    both. A subprocess, since the pool is process-wide and sized once."""
     fixture = FIXTURES_DIR / "streaming" / "multi-rowgroup-small.parquet"
     profile = tmp_path / "profile.jsonl"
     env = {k: v for k, v in os.environ.items() if k != "RAYON_NUM_THREADS"}
@@ -478,7 +477,8 @@ def test_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set(
         env["RAYON_NUM_THREADS"] = env_threads
     code = (
         "import sys, tylertoo; "
-        "tylertoo.convert(input=sys.argv[1], output=sys.argv[2], max_zoom=2)"
+        "tylertoo.convert(input=sys.argv[1], output=sys.argv[2], max_zoom=2, "
+        f"workers={workers!r})"
     )
     subprocess.run(
         [sys.executable, "-c", code, str(fixture), str(tmp_path / "out.pmtiles")],
@@ -486,9 +486,28 @@ def test_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set(
         check=True,
     )
     threads = json.loads(profile.read_text().splitlines()[0])["threads"]
-    if env_threads:
+    if workers:
+        assert threads == workers
+    elif env_threads:
         assert threads == int(env_threads)
     else:
         # Exact sizing is pinned in Rust; os.cpu_count() ignores affinity and
         # cgroup quotas, which Rust's core count honours, so it only bounds.
         assert 1 <= threads <= os.cpu_count()
+
+
+@pytest.mark.parametrize(
+    ("keyword", "message"),
+    [
+        ({"workers": 0}, "--workers / workers must be at least 1"),
+    ],
+)
+def test_zero_workers_is_refused_before_any_io(
+    tmp_path, keyword, message
+):
+    """#876: 0 is refused with a clear message before the input is read."""
+    missing = tmp_path / "missing.parquet"
+    with pytest.raises(ValueError, match=message):
+        tylertoo.convert(
+            input=str(missing), output=str(tmp_path / "o.pmtiles"), **keyword
+        )

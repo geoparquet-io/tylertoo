@@ -1378,7 +1378,8 @@ fn profile_json_reports_cascade_identical_steps() {
 
 /// The CLI sizes the worker pool from core's `resolve_worker_threads` for
 /// the command's profile (#876): `bounded` the cores capped at 40, `auto`
-/// every core, an explicit `RAYON_NUM_THREADS` verbatim.
+/// every core, an explicit `RAYON_NUM_THREADS` verbatim, and `--workers`
+/// over both.
 #[test]
 fn cli_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1392,6 +1393,8 @@ fn cli_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set() {
     assert_eq!(threads(None, &[]), cores);
     assert_eq!(threads(None, &["--profile", "bounded"]), cores.min(40));
     assert_eq!(threads(Some("48"), &[]), 48);
+    // `--workers` wins over the rule and over `RAYON_NUM_THREADS`.
+    assert_eq!(threads(Some("48"), &["--workers", "3"]), 3);
 }
 
 /// #876: `TYLERTOO_TILE_TRACE` writes one JSONL event per line, one `tile`

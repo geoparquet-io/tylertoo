@@ -2087,9 +2087,6 @@ impl PyramidOptions {
         self.metadata
             .check_size()
             .map_err(crate::overview::config::ConfigError::MetadataTooLarge)?;
-        self.convert.validate().map_err(|e| {
-            PyramidError::InvalidConfig(crate::InvalidConfigError::BandConvertOptions(Box::new(e)))
-        })?;
         // Before the export's own checks, which would name an export option
         // the bands' verbatim defaults turn off.
         if self.export.variable_depth {
@@ -2100,7 +2097,12 @@ impl PyramidOptions {
                 .into(),
             );
         }
+        // Before the bands' convert: the export holds the run's profile and
+        // workers (#876), which its validation applies.
         self.export.validate()?;
+        self.convert.validate().map_err(|e| {
+            PyramidError::InvalidConfig(crate::InvalidConfigError::BandConvertOptions(Box::new(e)))
+        })?;
         check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
         crate::overview::cells::check_rollup_columns(CellRollup {
             accumulate: &self.accumulate,

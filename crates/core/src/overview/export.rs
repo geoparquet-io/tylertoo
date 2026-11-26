@@ -767,6 +767,22 @@ pub struct ExportOptions {
     #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a `--no-default-features` build uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
     #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub profile: MemoryProfile,
+    /// Worker threads in the global Rayon pool (#876). `None` (default):
+    /// a positive `RAYON_NUM_THREADS`, else every core under `auto` and
+    /// `speed` and at most [`WORKER_THREADS_MAX`] under `bounded`
+    /// ([`resolve_worker_threads`]). `0` is refused. The pool is
+    /// process-wide: the first run in a process sizes it, and later runs
+    /// keep it. Changes speed and peak memory only.
+    ///
+    /// [`WORKER_THREADS_MAX`]: super::convert::WORKER_THREADS_MAX
+    /// [`resolve_worker_threads`]: super::convert::resolve_worker_threads
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "N", help_heading = "Memory & performance")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Worker threads for the whole run. Default: every core under `auto` and `speed`, at most 40 under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "export_only"))]
+    pub workers: Option<usize>,
     /// Top-level `name`, `description` and `attribution` written to the
     /// archive metadata (tippecanoe's `-n` / `-N` / `-A`).
     ///
@@ -801,6 +817,7 @@ with_setters!(ExportOptions {
     with_feature_id => feature_id: Option<String>,
     with_spill_dir => spill_dir: Option<PathBuf>,
     with_profile => profile: MemoryProfile,
+    with_workers => workers: Option<usize>,
     with_metadata => metadata: TilesetMetadata,
     with_variable_depth => variable_depth: bool,
 });
@@ -832,6 +849,7 @@ impl Default for ExportOptions {
             feature_id: None,
             spill_dir: None,
             profile: MemoryProfile::Auto,
+            workers: None,
             metadata: TilesetMetadata::default(),
         }
     }
@@ -882,11 +900,12 @@ impl ExportOptions {
     #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConfigError> {
         let config = super::config::validate_export(self)?;
-        super::convert::ensure_worker_pool(self.profile);
+        super::convert::apply_run_resources(self.profile, self.workers);
         Ok(config)
     }
 
     pub(crate) fn check(&self) -> Result<(), ConfigError> {
+        super::config::check_run_resources(self.workers)?;
         for (option, zoom) in [
             ("--min-zoom / min_zoom", self.min_zoom),
             ("--zoom-ceiling / zoom_ceiling", self.zoom_ceiling),

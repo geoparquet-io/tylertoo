@@ -512,6 +512,10 @@ pub struct PyramidArgs {
     )]
     pub profile: crate::overview::level::MemoryProfile,
 
+    /// Worker threads, as for tiles.
+    #[arg(long, value_name = "N", help_heading = "Memory & performance")]
+    pub workers: Option<usize>,
+
     #[command(flatten)]
     pub properties: ExportPropertyArgs,
 
@@ -922,6 +926,7 @@ pub fn pyramid_options(args: &PyramidArgs) -> crate::pyramid::PyramidOptions {
         export: ExportOptions {
             properties: args.properties.clone(),
             profile: args.profile,
+            workers: args.workers,
             ..args.export.apply(base.export)
         },
         // The final archive's overrides; the band exports write none, so
