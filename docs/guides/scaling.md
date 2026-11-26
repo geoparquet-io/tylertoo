@@ -50,14 +50,18 @@ pass-1 or writer tables; measure a representative run before sizing a job.
 
 ### How streaming bounds memory
 
-Convert reads the input twice. Pass 1 records each feature's center and
-squared diagonal, along with its kind and any sort key. Level assignment produces a winner table of
-about 1 byte per feature. Pass 2 simplifies and writes each level in batches.
+Convert reads the input twice. For qualifying polygon and line inputs, pass 1
+assigns levels as it reads, without retaining a whole-input feature table.
+Other inputs keep each feature's center, squared diagonal, kind, and any sort
+key until assignment. Both paths produce a winner table of about 1 byte per
+feature. Pass 2 simplifies and writes each level in batches.
 
 The largest row group affects memory alongside feature count and schema
 width. Active batches and phase workspace add to the per-feature tables.
-Choose the row-group size when preparing input with `gpio`. Pass 1 uses up to 42 bytes per row, reaching
-tens of GiB at a billion rows. See [sizing the coarse job's memory](#sizing-the-coarse-jobs-memory).
+Choose the row-group size when preparing input with `gpio`. Streamed assignment
+measured about 5–6 bytes per row for buildings with default flags and footer
+bounds. The table path uses up to 42 bytes per row for its feature table alone.
+See [sizing the coarse job's memory](#sizing-the-coarse-jobs-memory).
 
 - **`--read-batch-size <rows>`** sets the Arrow batch size for both passes
   (default 8192, maximum 1,048,576). Larger batches run slightly faster at
@@ -498,11 +502,30 @@ Set `SPILL` to an existing directory on real disk. To rerun shard 7, submit
 
 ## Sizing the coarse job's memory
 
-The coarse job holds a column-major feature table through pass 1 and level
-assignment. This memory floor is independent of the shard count. Winner
-grids and pass-2 buffers need additional memory.
+The streamed path runs by default when input footers declare only polygon
+and/or line geometry types, with no `--cluster`, line coalescing, shared-node
+collection, or `--entry-zoom` ladder. Polygons need zero thinning and no point
+representation band; lines need row-group footer bounds and no sort key or
+automatic ranking that applies to them. A density budget that applies to polygons
+or lines also requires the table path, as do inputs above the `u32` carrier-row
+limit. Other cases use the table path; #930 tracks the remaining scope.
+The run logs which path it takes, and output is byte-identical to the table path.
 
-The table's cost per input row depends on its optional columns:
+With a bbox covering and footer statistics, polygon buildings with default
+flags measured about 5–6 B/row at the end of streamed assignment: 1 for
+`min_levels`, 1 for kinds only with `--save-plan` or coalescing, about 2–3 for
+carriers, and under 1 for area maps. With `--no-collapse`, the measured cost
+was about 2 B/row; lines measured about 9 B/row. Polygons without row-group
+footer bounds measured about 10.6 B/row because nothing is freed during the
+read. The run logs a hint to rewrite such input with
+`gpio add bbox --force <input> <output>`. At 2.54 billion rows, planet buildings
+project to about 13 GB with default flags; this is assignment memory, not a
+whole-job peak.
+
+On the table path, the coarse job holds a column-major feature table through
+pass 1 and level assignment. This memory floor is independent of the shard
+count. Winner grids and pass-2 buffers need additional memory. The table's
+cost per input row depends on its optional columns:
 
 | Columns | Bytes per row |
 | --- | --- |
@@ -515,7 +538,7 @@ some rankings from the schema, such as Overture road classes or places
 `confidence`. Pass 1 reduces each bbox to its center and diagonal at scan
 time and keeps neither the bbox nor any padding.
 
-**Budget at least rows × 42 bytes × 3.3**, about 138 bytes per row. For 1.58
+**For the table path, budget at least rows × 42 bytes × 3.3**, about 138 bytes per row. For 1.58
 billion rows, the floor is 61.8 GiB and the budget about 204 GiB. This job ran
 out of memory on a 192 GiB machine and finished on 360 GiB. A `--plan` replay
 skips pass 1, but generating the plan first requires a machine with enough RAM.
@@ -528,10 +551,13 @@ shrink. #541 and #565 had already cut the coarse job's pass-2 buffers and the de
 budget's priority table, so the multiplier is conservative. Tightening it needs
 a fresh billion-row run.
 
-Before pass 1, both convert pipelines estimate rows × 42 bytes from the
-footers and compare it with available memory:
+Before pass 1, both convert pipelines price the path that will run from the
+footers and compare it with available memory. Streamed assignment uses
+`streamed_bytes_per_row` for row tables and working maps, with a 1.5 multiplier
+for headroom; that multiplier has not been calibrated by a billion-row run.
+The table path keeps 42 B/row and a 3.3 multiplier:
 
-- It **warns** when 3.3 times the floor exceeds the figure, naming the
+- It **warns** when the path's multiplier times its floor exceeds the figure, naming the
   figure's source: `MemAvailable`, cgroup `memory.max` or `memory.high`, or
   `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. With `--bbox` or `--filter` the count is an
   upper bound, so this check only warns.
@@ -543,7 +569,7 @@ footers and compare it with available memory:
 into a warning. Off Linux, the check only runs if you set
 `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. A `--plan` replay skips it.
 
-**Wide property schemas need more.** The 3.3 multiplier assumes buffered rows
+**Wide property schemas need more.** The table path's 3.3 multiplier assumes buffered rows
 are mostly geometry. A buffered row also carries every kept property column,
 so a schema with dozens or hundreds of columns can cost far more per row.
 Under `auto`, pass 2 measures this cost and spills mid-pass when it would
@@ -559,7 +585,7 @@ exceed the budget (#626). To size a machine for it:
   after level assignment, so property width costs it nothing. The pass-1
   floor and the preflight still apply.
 
-The pass-1 feature table is still neither measured per schema nor spillable
+On the table path, the pass-1 feature table is still neither measured per schema nor spillable
 (#543).
 
 **Size from the job's own peak, not its `MaxRSS`.** The 64-byte floor that

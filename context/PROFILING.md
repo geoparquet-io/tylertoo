@@ -68,16 +68,29 @@ These are budget calculations, not a promise about total process memory.
 All profiles retain minimum working units. A read or compute window needs
 at least one batch. The writer needs up to 4 encodes, pool permitting.
 Export needs at least one partition, which contains whole tiles. These
-floors can exceed a small allowance. Pass-1 preflight prices the table at
-42 B per input row and warns when 3.3× that estimate exceeds probed memory.
-It fails only when the table alone exceeds a hard cgroup limit and no
+floors can exceed a small allowance. Pass-1 preflight uses `Pass1Price` for
+the selected path: `streamed_bytes_per_row` × 1.5 for streamed row tables and
+working maps, or 42 B/row × 3.3 for the table path. It warns when that estimate
+exceeds probed memory. It fails only when the path's floor exceeds a hard
+cgroup limit and no
 per-feature filter can reduce the row count. `TYLERTOO_SKIP_MEMORY_PREFLIGHT=1`
 downgrades that failure to a warning. Passing preflight does not prove the
 whole run fits.
 
 ### Pass 1: scan and assignment
 
-[`FeatureTable`](../crates/core/src/overview/assign.rs) stores columns,
+Qualifying polygon/line inputs stream assignment during pass 1 (#928),
+without a whole-input feature table; scope is in
+[the architecture notes](ARCHITECTURE.md). Output is byte-identical. At
+assignment end, buildings with default flags and footer bounds measured
+5–6 B/row: `min_levels` 1, kinds 1 only for plan saving or coalescing, carriers
+about 2–3, and area maps under 1. `--no-collapse` measured about 2 B/row,
+lines about 9, and polygons without footer bounds about 10.6 (no eviction
+during the read). The latter logs a `gpio add bbox --force <input> <output>`
+hint. Planet buildings (2.54B rows) project to about 13 GB with default flags.
+These are assignment measurements, not whole-job peaks.
+
+On the table path, [`FeatureTable`](../crates/core/src/overview/assign.rs) stores columns,
 not the old 64-byte `AssignFeature` structs. For `N` retained features:
 
 | Column | Bytes per feature | When allocated |
@@ -128,18 +141,19 @@ Other live allocations in
   Output assignment construction can overlap two 16 B/feature assignment
   vectors. No 40 B/feature priority array remains: comparisons derive keys.
 
-Consider 300 million polygons. Area accumulation needs an extra column. Assume
-ranking and entry ladders are off, so the point budget has no points to thin.
+For a table-path run over 300 million polygons, area accumulation needs an
+extra column. Assume ranking and entry ladders are off, but polygon thinning
+requires the table path; the point budget has no points to thin.
 The feature table plus areas and two assignment vectors come to `300M × (33 + 4 + 16 + 16)` = 20.7 GB (19.28 GiB).
 This excludes grid peaks, batches, capacity slack, and retained allocator
 pages. It is a subtotal for that path, not a universal B/feature rate.
 For 1.58 billion rows the same subtotal is 109.02 GB (101.53 GiB), already
 beyond a 32 GB host. Changing `--profile` cannot spill those arrays.
 
-Before pass 2, the pipeline frees the feature table. The row-indexed minimum-level
+Before pass 2, the table path frees the feature table. The row-indexed minimum-level
 map remains at 1 B per input row, including skipped rows. Kinds add another
 1 B/row when coalescing or plan saving needs them. Carrier positions cost
-8 B each per level; cluster and coalescing tables remain when enabled.
+4 B each per level; cluster and coalescing tables remain when enabled.
 Vector capacity and scan chunks can add transient memory above element sizes.
 
 **Line exception.** Coalescing collects geometry in pass 1 by default.
@@ -508,9 +522,11 @@ a write failure only logs — it never fails the conversion (see
 These two are the memory-sizing pair, and they bracket the run.
 
 `pass1_memory_preflight` is decided **before any data page is read**, from
-footer row counts alone: `rows × 42 B` (the pass-1 feature table's worst case,
-`PASS1_BYTES_PER_ROW`) against a fresh, source-attributed memory probe. A
-`warned` verdict on a job that then died is the single most useful line in
+footer row counts and the selected assignment path: `rows × bytes_per_row`
+against a fresh, source-attributed memory probe. `Pass1Price` uses
+`streamed_bytes_per_row` with a 1.5 recommendation multiplier, or the table
+path's worst case (`PASS1_BYTES_PER_ROW`, 42 B) with 3.3. The dump records
+`bytes_per_row`. A `warned` verdict on a job that then died is the single most useful line in
 this dump. `not_checked` means a
 `--plan` replay, which builds no feature table.
 

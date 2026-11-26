@@ -292,8 +292,20 @@ verbatim (spec §2.4).
    levels that turn out empty, which pass 2 used to skip. Wave size changes
    the peak and the wall time, never the result.
 
-   The **pass-1 feature table is column-major** (#543 item 2). It is the
-   coarse job's irreducible floor — one row per input row, live from the scan
+   Streamed assignment (#928) runs during pass 1 by default within its v1
+   scope: footers declare only polygons and/or lines; no clustering, line
+   coalescing, shared-node collection, or entry-zoom ladder; polygons have
+   zero thinning and no point band; lines have footer bounds and no applicable
+   sort key or auto-ranking. An applicable polygon/line density budget or
+   rows beyond the `u32` carrier limit also selects the table path. The path
+   is logged; output is byte-identical. `min_levels`, optional kinds, carriers,
+   and working maps replace the whole-input table.
+   `Pass1Price` uses `streamed_bytes_per_row` × 1.5 for preflight; the table
+   path retains 42 B/row × 3.3. Remaining scope is tracked in #930.
+
+   The **pass-1 feature table is column-major** (#543 item 2). On the table
+   path, it is the coarse job's irreducible floor — one row per input row,
+   live from the scan
    through the whole assignment — and at 1.58B rows the old
    array-of-`AssignFeature` version was 64 B/row ≈ 94 GiB, which is what
    OOM-killed a 192 GiB coarse job. Three things took it to 42 B/row (41 with

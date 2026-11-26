@@ -2086,7 +2086,8 @@ a bigger footer for that pushdown.
 
 These settings control conversion memory without changing output content.
 [How streaming bounds memory](guides/scaling.md#how-streaming-bounds-memory)
-explains the two-pass pipeline and its pass-1 floor of up to 42 bytes per row.
+explains the two-pass pipeline, streamed assignment, and the fallback feature
+table of up to 42 bytes per row.
 See also the [file layout knobs](#file-layout-knobs-row-group-size-full-column-stats).
 
 | Knob | Default | Units | Direction |
@@ -2107,15 +2108,26 @@ reduce parallelism but never disable it.
 During pass 2, the winner table holds 1 byte per feature, about 0.6 MB for a
 632k-feature file.
 
-The pass-1 feature table is held from pass 1's scan through level
+For qualifying polygon and line inputs, levels are assigned during pass 1
+without a whole-input feature table, with output byte-identical to the table
+path. See [assignment scope and memory](guides/scaling.md#sizing-the-coarse-jobs-memory)
+for the conditions. Buildings with default flags and footer bounds measured
+about 5–6 B/row at the end of assignment, about 2 B/row with `--no-collapse`;
+lines measured about 9 B/row. Polygons without footer bounds measured about
+10.6 B/row; the log recommends `gpio add bbox --force <input> <output>`.
+
+Otherwise, the pass-1 feature table is held from pass 1's scan through level
 assignment. It costs 33 bytes per input row, 41 with a sort key (explicit or
 detected from the schema), and 42 with a sort key and an entry-zoom
 ladder. The transient scan vectors raise the scan-time peak to about 42–80
 bytes per row. The table is the coarse job's memory floor on a
 [sharded build](guides/scaling.md#sizing-the-coarse-jobs-memory) and reaches
 tens of GiB at a billion rows. Before pass 1, tylertoo checks it against the
-footer row counts (#543). It warns when rows × 42 B × 3.3 exceeds the memory
-figure. It fails only when the floor alone exceeds a hard cgroup limit and no
+footer row counts. Preflight prices the path that will run: streamed row
+tables and working maps from `streamed_bytes_per_row`, multiplied by 1.5 for
+headroom, or the table path's 42 B/row × 3.3. It warns when that estimate
+exceeds the memory figure. It fails only when the floor alone exceeds a hard
+cgroup limit and no
 `--bbox` or `--filter` is active. `TYLERTOO_SKIP_MEMORY_PREFLIGHT=1` turns the
 error into a warning.
 
