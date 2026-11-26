@@ -387,15 +387,25 @@ impl Eviction {
     }
 }
 
+/// What one grid or accumulator opened in a segment, with each entry's
+/// expiry group.
+type Opened = Vec<(Due, usize)>;
+
+/// Line grids per level: the contests of one level fan out this wide.
+const GRID_SHARDS: usize = 8;
+
+/// The shard of `key`'s grid within its level.
+fn grid_shard((_, ix, iy): CellKey) -> usize {
+    let h = (ix as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (iy as u64);
+    (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 61) as usize % GRID_SHARDS
+}
+
 /// One scan chunk handed to [`StreamAssigner::push_batch`]: its table,
 /// areas, first row and row count.
 pub(super) type ChunkRef<'a> = (&'a FeatureTable, &'a [f32], usize, usize);
 
 /// A placed row: the row, its area, and the coarsest level it wins.
 type Placed = (FeatureRow, f32, u8);
-
-/// The cells and patches one level opened in a segment.
-type Opened = (Vec<(Due, usize)>, Vec<(Due, usize)>);
 
 /// The streaming assignment's result, row-indexed like `WinnerTables`.
 pub(super) struct StreamAssigned {
@@ -416,6 +426,8 @@ pub(super) struct StreamAssigner {
     /// Per coarse level (all but the finest): GSD in coordinate units.
     gsd_units: Vec<f64>,
     reprs: Vec<Representation>,
+    /// Per coarse level, [`GRID_SHARDS`] grids split by cell key: a cell's
+    /// contests stay in one grid, in row order, so sharding changes nothing.
     grids: Vec<HashMap<CellKey, Incumbent>>,
     /// Per planned level.
     accs: Vec<LevelAccumulator>,
@@ -471,7 +483,9 @@ impl StreamAssigner {
             reprs: (0..finest)
                 .map(|l| level_reprs.get(l).copied().unwrap_or_default())
                 .collect(),
-            grids: (0..finest).map(|_| HashMap::default()).collect(),
+            grids: (0..finest * GRID_SHARDS)
+                .map(|_| HashMap::default())
+                .collect(),
             any_acc: accs.iter().any(LevelAccumulator::is_active),
             accs,
             min_levels,
@@ -492,29 +506,66 @@ impl StreamAssigner {
         self.evict.is_some()
     }
 
-    /// Close everything due after the row groups `row` has moved past.
+    /// Close everything due after the row groups `row` has moved past, each
+    /// level's cells and patches in parallel.
     fn advance(&mut self, row: usize) {
         let Some(evict) = &mut self.evict else {
             return;
         };
-        for group in evict.advance(row) {
+        let groups = evict.advance(row);
+        if groups.is_empty() {
+            return;
+        }
+        let mut cells: Vec<Vec<Due>> = vec![Vec::new(); self.grids.len()];
+        let mut patches: Vec<Vec<Due>> = vec![Vec::new(); self.gsd_units.len()];
+        for group in groups {
             for due in evict.take_due(group) {
-                let li = due.level;
-                match due.kind {
-                    Due::PATCH => {
-                        self.accs[usize::from(li)].close_patch((due.ix, due.iy));
-                        self.live_patches -= 1;
-                    }
-                    kind => {
-                        let inc = self.grids[usize::from(li)]
-                            .remove(&(kind, due.ix, due.iy))
-                            .expect("a scheduled cell is live");
-                        // `fold_wave_winners`: the coarsest level a row wins.
-                        let slot = &mut self.min_levels[inc.index];
-                        *slot = (*slot).min(li);
-                        self.live_cells -= 1;
-                    }
+                let li = usize::from(due.level);
+                if due.kind == Due::PATCH {
+                    patches[li].push(due);
+                } else {
+                    let key = (due.kind, due.ix, due.iy);
+                    cells[li * GRID_SHARDS + grid_shard(key)].push(due);
                 }
+            }
+        }
+        let (won, closed): (Vec<Vec<usize>>, usize) = rayon::join(
+            || {
+                self.grids
+                    .par_iter_mut()
+                    .zip(cells)
+                    .map(|(grid, dues)| {
+                        dues.iter()
+                            .map(|d| {
+                                grid.remove(&(d.kind, d.ix, d.iy))
+                                    .expect("a scheduled cell is live")
+                                    .index
+                            })
+                            .collect()
+                    })
+                    .collect()
+            },
+            || {
+                self.accs
+                    .par_iter_mut()
+                    .zip(patches)
+                    .map(|(acc, dues)| {
+                        for d in &dues {
+                            acc.close_patch((d.ix, d.iy));
+                        }
+                        dues.len()
+                    })
+                    .sum()
+            },
+        );
+        self.live_patches -= closed;
+        for (gi, won) in won.into_iter().enumerate() {
+            self.live_cells -= won.len();
+            // `fold_wave_winners`: the coarsest level a row wins.
+            let level = (gi / GRID_SHARDS) as u8;
+            for index in won {
+                let slot = &mut self.min_levels[index];
+                *slot = (*slot).min(level);
             }
         }
     }
@@ -656,26 +707,36 @@ impl StreamAssigner {
         let any_acc = self.any_acc;
         let t = std::time::Instant::now();
         let evict = self.evict.as_ref();
-        let opened: Vec<Opened> = self
-            .grids
-            .par_iter_mut()
-            .zip(self.accs.par_iter_mut())
-            .zip(self.gsd_units.par_iter().zip(self.reprs.par_iter()))
-            .enumerate()
-            .map(|(li, ((grid, acc), (&gsd, &repr)))| {
-                let level = li as u8;
-                let cs = gsd * config.line_thinning;
-                let width = acc.patch_width();
-                // The R-tree lookups run here, in parallel; only the pushes
-                // onto the due lists stay serial.
-                let expiry = |rect| evict.map_or(0, |e: &Eviction| e.expiry(rect));
-                let (mut cells, mut patches) = (Vec::new(), Vec::new());
-                for &(row, area, ml) in rows {
-                    match row.kind {
-                        FeatureKind::Line => {
-                            let Placement::Cell(key) = place_feature(row, config, gsd, repr) else {
+        // The R-tree lookups run in the tasks; only the due-list pushes stay
+        // serial.
+        let expiry = |rect| evict.map_or(0, |e: &Eviction| e.expiry(rect));
+        let (gsd_units, reprs) = (&self.gsd_units, &self.reprs);
+        let lines = self.allowed.lines;
+        let (cells, patches): (Vec<Opened>, Vec<Opened>) = rayon::join(
+            || {
+                if !lines {
+                    return Vec::new();
+                }
+                self.grids
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(gi, grid)| {
+                        let (li, shard) = (gi / GRID_SHARDS, gi % GRID_SHARDS);
+                        let level = li as u8;
+                        let cs = gsd_units[li] * config.line_thinning;
+                        let mut opened = Vec::new();
+                        for &(row, _, _) in rows {
+                            if row.kind != FeatureKind::Line {
+                                continue;
+                            }
+                            let Placement::Cell(key) =
+                                place_feature(row, config, gsd_units[li], reprs[li])
+                            else {
                                 continue;
                             };
+                            if grid_shard(key) != shard {
+                                continue;
+                            }
                             let challenger = Incumbent {
                                 diag_sq: row.diag_sq,
                                 index: row.index,
@@ -690,35 +751,52 @@ impl StreamAssigner {
                                     slot.insert(challenger);
                                     let (_, ix, iy) = key;
                                     let d = Due::cell(level, key);
-                                    cells.push((d, expiry(grown_cell(ix, iy, cs))));
+                                    opened.push((d, expiry(grown_cell(ix, iy, cs))));
                                 }
                             }
                         }
-                        // The gate keeps every row index within a `CarrierRow`.
-                        FeatureKind::Polygon if any_acc && usize::from(ml) > li => {
+                        opened
+                    })
+                    .collect()
+            },
+            || {
+                if !any_acc {
+                    return Vec::new();
+                }
+                self.accs
+                    .par_iter_mut()
+                    .take(gsd_units.len())
+                    .enumerate()
+                    .map(|(li, acc)| {
+                        let level = li as u8;
+                        let mut opened = Vec::new();
+                        let Some(w) = acc.patch_width() else {
+                            return opened;
+                        };
+                        for &(row, area, ml) in rows {
+                            if row.kind != FeatureKind::Polygon || usize::from(ml) <= li {
+                                continue;
+                            }
+                            // The gate keeps every row index within a `CarrierRow`.
                             if let Some((ix, iy)) =
                                 acc.add(row.index as CarrierRow, row.center, area)
                             {
                                 let d = Due::patch(level, (ix, iy));
-                                let w = width.expect("an open patch has a width");
-                                patches.push((d, expiry(grown_cell(ix, iy, w))));
+                                opened.push((d, expiry(grown_cell(ix, iy, w))));
                             }
                         }
-                        _ => {}
-                    }
-                }
-                (cells, patches)
-            })
-            .collect();
+                        opened
+                    })
+                    .collect()
+            },
+        );
         self.timers[1] += t.elapsed();
         let t = std::time::Instant::now();
-        for (cells, patches) in opened {
-            self.live_cells += cells.len();
-            self.live_patches += patches.len();
-            if let Some(evict) = &mut self.evict {
-                for (d, last) in cells.into_iter().chain(patches) {
-                    evict.schedule(d, last);
-                }
+        self.live_cells += cells.iter().map(Vec::len).sum::<usize>();
+        self.live_patches += patches.iter().map(Vec::len).sum::<usize>();
+        if let Some(evict) = &mut self.evict {
+            for (d, last) in cells.into_iter().chain(patches).flatten() {
+                evict.schedule(d, last);
             }
         }
         self.timers[2] += t.elapsed();
@@ -763,8 +841,8 @@ impl StreamAssigner {
         }
         min_levels.resize(num_rows, super::stream::UNASSIGNED_LEVEL);
         // `fold_wave_winners`: a row takes the coarsest level it wins.
-        for (li, grid) in grids.into_iter().enumerate() {
-            let level = li as u8;
+        for (gi, grid) in grids.into_iter().enumerate() {
+            let level = (gi / GRID_SHARDS) as u8;
             for inc in grid.into_values() {
                 let slot = &mut min_levels[inc.index];
                 if level < *slot {
