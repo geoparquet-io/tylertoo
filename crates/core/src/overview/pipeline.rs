@@ -302,6 +302,12 @@ pub(super) fn set_memory_limit_option(bytes: Option<usize>) {
     }
 }
 
+/// Test seam: the `memory_limit` option's bytes, 0 while unset.
+#[cfg(test)]
+pub(super) fn memory_limit_option() -> u64 {
+    MEMORY_LIMIT_OPTION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The memory override: the `memory_limit` option, else
 /// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` when set to a plain number.
 fn auto_mem_limit_override() -> Option<u64> {

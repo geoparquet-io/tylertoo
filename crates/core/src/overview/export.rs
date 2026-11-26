@@ -917,9 +917,7 @@ impl ExportOptions {
     /// Validate these options and return the immutable engine configuration.
     #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConfigError> {
-        let config = super::config::validate_export(self)?;
-        super::convert::apply_run_resources(self.profile, self.workers, self.memory_limit);
-        Ok(config)
+        super::config::validate_export(self)
     }
 
     pub(crate) fn check(&self) -> Result<(), ConfigError> {
@@ -1681,6 +1679,8 @@ pub fn predicted_valve_floors(
     overview: &Path,
     options: &ExportOptions,
 ) -> Result<BTreeMap<(u8, u64), FloorPair>, ExportError> {
+    // The export it predicts validates and applies these first.
+    options.validate()?;
     let diagnostics = crate::diagnostics::Diagnostics::default();
     let reader = OverviewReader::open(overview)?;
     let crs = crs_from_descriptor(reader.resolved_schema(), overview, &diagnostics)?;

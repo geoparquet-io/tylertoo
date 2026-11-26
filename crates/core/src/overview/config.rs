@@ -31,7 +31,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::convert::{
-    parse_class_rank, parse_entry_zoom, parse_representation_spec, ClassRanking, RepresentationBand,
+    apply_run_resources, parse_class_rank, parse_entry_zoom, parse_representation_spec,
+    ClassRanking, RepresentationBand,
 };
 use super::ladder::{EntryZoomKind, EntryZoomSpec};
 use super::simplify::CollapseMode;
@@ -1251,7 +1252,7 @@ pub(crate) mod accumulation {
 
 /// The `workers` and `memory_limit` rules convert and export share (#876):
 /// unset means the default, and `0` is refused, not read as unset.
-pub(super) fn check_run_resources(
+pub(crate) fn check_run_resources(
     workers: Option<usize>,
     memory_limit: Option<usize>,
 ) -> Result<(), ConfigError> {
@@ -1275,10 +1276,16 @@ pub(super) fn check_run_resources(
 }
 
 /// Validate convert options before they can reach either engine.
+///
+/// The four `validate_*` here (and `TilesOptions::validate_plan_only`) are
+/// where a run's process-wide resources are applied (#876), through
+/// `apply_run_resources`, each after its whole configuration passed; the
+/// `check()`s they call, and that composite checks nest, apply nothing.
 pub(super) fn validate_convert(
     options: &super::convert::ConvertOptions,
 ) -> Result<ValidatedConfig<'_, super::convert::ConvertOptions>, super::convert::ConvertError> {
     options.check()?;
+    apply_run_resources(options.profile, options.workers, options.memory_limit);
     Ok(ValidatedConfig::new(options))
 }
 
@@ -1287,22 +1294,29 @@ pub(super) fn validate_export(
     options: &super::export::ExportOptions,
 ) -> Result<ValidatedConfig<'_, super::export::ExportOptions>, ConfigError> {
     options.check()?;
+    apply_run_resources(options.profile, options.workers, options.memory_limit);
     Ok(ValidatedConfig::new(options))
 }
 
-/// Validate the complete tiles facade configuration.
+/// Validate the complete tiles facade configuration. Its run resources are
+/// convert's; the export's are refused (`FACADE_OWNED_EXPORT_FIELDS`).
 pub(super) fn validate_tiles(
     options: &super::tiles::TilesOptions,
 ) -> Result<ValidatedConfig<'_, super::tiles::TilesOptions>, super::tiles::TilesError> {
     options.check()?;
+    let convert = &options.convert;
+    apply_run_resources(convert.profile, convert.workers, convert.memory_limit);
     Ok(ValidatedConfig::new(options))
 }
 
-/// Validate a complete pyramid before reading any band.
+/// Validate a complete pyramid before reading any band. Its run resources
+/// are the export's; the bands' convert ones are refused.
 pub(crate) fn validate_pyramid(
     options: &crate::pyramid::PyramidOptions,
 ) -> Result<ValidatedConfig<'_, crate::pyramid::PyramidOptions>, crate::pyramid::PyramidError> {
     options.check()?;
+    let export = &options.export;
+    apply_run_resources(export.profile, export.workers, export.memory_limit);
     Ok(ValidatedConfig::new(options))
 }
 

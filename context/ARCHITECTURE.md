@@ -98,8 +98,13 @@ times, through three probes in `pipeline.rs`, each for a reason:
 Every probe above reads one override first (`auto_mem_limit_override`):
 the `memory_limit` option (`--memory-limit`), else
 `TYLERTOO_AUTO_MEM_LIMIT_BYTES` (#876). The option reaches the probes as a
-process-wide value that `ConvertOptions::validate` and
-`ExportOptions::validate` set before any I/O (`apply_run_resources`), not
+process-wide value that the top-level validations (`config::validate_*`
+for convert, export, tiles and pyramid) set once the whole configuration
+passed and before any I/O (`apply_run_resources`); the nested `check()`s
+apply nothing, so a refused call leaves no limit or pool behind. A run has
+one owner of these fields: `tiles` takes convert's and refuses export's,
+and `pyramid` takes export's, refuses convert's and hands them to each
+band's convert. Not
 through the budgets: export's budget readers (the join's fits,
 `resolve_partition_wave`) take no options. An unset option leaves the value
 alone, so a run's internal default options cannot clear it, and in Python a

@@ -268,8 +268,9 @@ impl TilesShard {
 /// `export.layer_name` (set [`TilesOptions::layer_name`]), `export.min_zoom`
 /// (from the level plan), `export.properties` (the selection is applied at
 /// convert: set `convert.properties`), `export.zoom_ceiling` (from the
-/// shard) and `export.spill_dir` (the one scratch knob is
-/// `convert.spill_dir`). `export.tile_range` is the hand-written export
+/// shard), `export.spill_dir` (the one scratch knob is
+/// `convert.spill_dir`), and `export.profile`, `export.workers` and
+/// `export.memory_limit` (the run's are convert's). `export.tile_range` is the hand-written export
 /// range; a data shard's own range replaces it, and the two together are
 /// refused.
 ///
@@ -376,7 +377,7 @@ impl Default for TilesOptions {
 }
 
 /// Export fields the facade derives itself, for
-/// [`check_ignored_export_fields`], with what to set instead. Kept beside [`TilesOptions`]'s docs, which list the same five.
+/// [`check_ignored_export_fields`], with what to set instead. Kept beside [`TilesOptions`]'s docs, which list the same fields.
 const FACADE_OWNED_EXPORT_FIELDS: [(ExportField, &str); 8] = [
     (
         ExportField::LayerName,
@@ -464,7 +465,10 @@ impl TilesOptions {
     /// The first rule broken.
     #[doc(hidden)]
     pub fn validate_plan_only(&self) -> Result<(), TilesError> {
-        self.validate_for(Run::PlanOnly)
+        self.validate_for(Run::PlanOnly)?;
+        let c = &self.convert;
+        super::convert::apply_run_resources(c.profile, c.workers, c.memory_limit);
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -586,8 +590,8 @@ impl TilesOptions {
             memory_limit: self.convert.memory_limit,
             ..self.export.clone()
         }
-        .validate()?;
-        self.convert.validate().map_err(TilesError::Convert)?;
+        .check()?;
+        self.convert.check().map_err(TilesError::Convert)?;
         if self.export.variable_depth {
             super::export::variable_depth::check_convert(&self.convert, self.shard.is_some())?;
         }
@@ -1933,6 +1937,33 @@ fn resolve_intermediate_dir(
 mod tests {
     use super::*;
     use crate::overview::testutil::write_input;
+
+    /// #876: a configuration a later rule refuses leaves the memory limit
+    /// as it was, though its export's rules passed with the limit first.
+    /// The run's resources are convert's: the export's are refused.
+    #[test]
+    fn a_rejected_configuration_sets_no_memory_limit() {
+        const LIMIT: usize = (1 << 40) + 7;
+        let options = TilesOptions {
+            convert: ConvertOptions::default()
+                .with_memory_limit(Some(LIMIT))
+                .with_read_batch_size(0),
+            ..TilesOptions::default()
+        };
+        assert!(options.validate().is_err());
+        assert_ne!(super::super::pipeline::memory_limit_option(), LIMIT as u64);
+        let options = TilesOptions {
+            export: ExportOptions::default().with_workers(Some(2)),
+            ..TilesOptions::default()
+        };
+        assert!(matches!(
+            options.validate().map(|_| ()),
+            Err(TilesError::Config(ConfigError::OptionIgnored {
+                option: "export.workers",
+                ..
+            }))
+        ));
+    }
     use crate::TilesetMetadata;
     use geo::{Geometry, LineString, Point, Polygon};
 

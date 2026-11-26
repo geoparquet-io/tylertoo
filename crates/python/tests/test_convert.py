@@ -506,9 +506,39 @@ def test_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set(
 def test_zero_workers_or_memory_limit_is_refused_before_any_io(
     tmp_path, keyword, message
 ):
-    """#876: 0 is refused with a clear message before the input is read."""
+    """#876: 0 is refused with a clear message before the input is read, as
+    a ConfigError (the CLI's exit 2)."""
     missing = tmp_path / "missing.parquet"
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(tylertoo.ConfigError, match=message):
         tylertoo.convert(
             input=str(missing), output=str(tmp_path / "o.pmtiles"), **keyword
         )
+
+
+def test_a_rejected_call_does_not_size_the_worker_pool(tmp_path):
+    """#876: a call its validation refuses leaves the pool unbuilt, so the
+    next valid call gets the default width, not the refused call's
+    `workers`. A subprocess, since the pool is process-wide and sized once."""
+    fixture = FIXTURES_DIR / "streaming" / "multi-rowgroup-small.parquet"
+    profile = tmp_path / "profile.jsonl"
+    env = {k: v for k, v in os.environ.items() if k != "RAYON_NUM_THREADS"}
+    env["TYLERTOO_PROFILE_JSON"] = str(profile)
+    code = (
+        "import sys, tylertoo\n"
+        "try:\n"
+        "    tylertoo.convert(input=sys.argv[1], output=sys.argv[2], max_zoom=2,"
+        " workers=3, read_batch_size=0)\n"
+        "except tylertoo.ConfigError:\n"
+        "    pass\n"
+        "else:\n"
+        "    sys.exit('read_batch_size=0 was accepted')\n"
+        "tylertoo.convert(input=sys.argv[1], output=sys.argv[2], max_zoom=2)\n"
+    )
+    subprocess.run(
+        [sys.executable, "-c", code, str(fixture), str(tmp_path / "out.pmtiles")],
+        env=env,
+        check=True,
+    )
+    threads = json.loads(profile.read_text().splitlines()[0])["threads"]
+    if (os.cpu_count() or 1) > 3:
+        assert threads != 3

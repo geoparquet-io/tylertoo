@@ -1240,20 +1240,19 @@ pub(super) fn run_cores_with(cores: usize, workers: Option<usize>) -> usize {
 ///   ([`init_worker_pool`]) by the first call off any Rayon pool; a pool a
 ///   host or an earlier call built is kept, and a caller already on a
 ///   pool's worker uses that pool.
+///
+/// shortcut: the pool is process-wide, so in one process (Python) the first
+/// run's profile and `workers` size it for every later run; upgrade to a
+/// per-run scoped pool when callers mix them in one process.
 pub(super) fn apply_run_resources(
     profile: MemoryProfile,
     workers: Option<usize>,
     memory_limit: Option<usize>,
 ) {
-    #[expect(
-        clippy::disallowed_types,
-        reason = "#876: the global pool is process-wide, so its one build attempt is too"
-    )]
-    static TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     super::pipeline::set_memory_limit_option(memory_limit);
-    if rayon::current_thread_index().is_none()
-        && !TRIED.swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
+    // `build_global` is itself once-only and synchronised: a concurrent
+    // second caller waits for the first build, then keeps that pool.
+    if rayon::current_thread_index().is_none() {
         let _ = init_worker_pool(profile, workers);
     }
 }
@@ -1366,9 +1365,7 @@ impl ConvertOptions {
     /// Validate these options and return the immutable engine configuration.
     #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConvertError> {
-        let config = super::config::validate_convert(self)?;
-        apply_run_resources(self.profile, self.workers, self.memory_limit);
-        Ok(config)
+        super::config::validate_convert(self)
     }
 
     pub(super) fn check_finite_numbers(&self) -> Result<(), ConvertError> {

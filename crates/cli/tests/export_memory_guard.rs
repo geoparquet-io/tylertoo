@@ -212,50 +212,60 @@ fn the_memory_limit_flag_overrides_the_env_var() {
 }
 
 /// #876: `--workers 0` and `--memory-limit 0` (or an unparseable size) are
-/// refused before any I/O: the input does not exist.
+/// refused before any I/O, as usage errors (exit 2): the input does not
+/// exist, and pyramid's `--work-dir` is a file its probe would refuse.
 #[test]
 fn zero_workers_and_memory_limit_are_refused_before_any_io() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.parquet");
     let out = dir.path().join("out.pmtiles");
-    for (command, args, needle) in [
+    let not_a_dir = dir.path().join("not-a-dir");
+    std::fs::write(&not_a_dir, b"").unwrap();
+    let (missing, out) = (missing.to_str().unwrap(), out.to_str().unwrap());
+    let band = format!("0-2:{missing}");
+    let pyramid = |flag: &'static str| -> Vec<String> {
+        [
+            "pyramid",
+            out,
+            "--band",
+            band.as_str(),
+            "--work-dir",
+            not_a_dir.to_str().unwrap(),
+            flag,
+            "0",
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    let run = |command: &str, flag: &str, value: &str| -> Vec<String> {
+        [command, missing, out, flag, value]
+            .map(String::from)
+            .to_vec()
+    };
+    let workers = "--workers / workers must be at least 1";
+    let memory = "--memory-limit / memory_limit must be more than 0 bytes";
+    for (args, needle) in [
+        (run("tiles", "--workers", "0"), workers),
+        (run("export-pmtiles", "--workers", "0"), workers),
+        (pyramid("--workers"), workers),
+        (run("tiles", "--memory-limit", "0"), memory),
+        (run("export-pmtiles", "--memory-limit", "0"), memory),
+        (pyramid("--memory-limit"), memory),
         (
-            "tiles",
-            &["--workers", "0"][..],
-            "--workers / workers must be at least 1",
-        ),
-        (
-            "export-pmtiles",
-            &["--workers", "0"][..],
-            "--workers / workers must be at least 1",
-        ),
-        (
-            "tiles",
-            &["--memory-limit", "0"][..],
-            "--memory-limit / memory_limit must be more than 0 bytes",
-        ),
-        (
-            "export-pmtiles",
-            &["--memory-limit", "0"][..],
-            "--memory-limit / memory_limit must be more than 0 bytes",
-        ),
-        (
-            "tiles",
-            &["--memory-limit", "lots"][..],
+            run("tiles", "--memory-limit", "lots"),
             "Invalid size: 'lots'",
         ),
     ] {
         let output = Command::new(tylertoo_bin())
-            .args([command, missing.to_str().unwrap(), out.to_str().unwrap()])
-            .args(args)
+            .args(&args)
             .output()
             .expect("run tylertoo");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{command} {args:?}");
-        assert!(stderr.contains(needle), "{command} {args:?}: {stderr}");
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains(needle), "{args:?}: {stderr}");
         assert!(
-            !stderr.contains("missing.parquet"),
-            "{command} {args:?} read the input: {stderr}"
+            !stderr.contains("missing.parquet") && !stderr.contains("not-a-dir"),
+            "{args:?} touched the input or work dir: {stderr}"
         );
     }
 }
