@@ -2097,8 +2097,8 @@ impl PyramidOptions {
                 .into(),
             );
         }
-        // Before the bands' convert: the export holds the run's profile and
-        // workers (#876), which its validation applies.
+        // Before the bands' convert: the export holds the run's profile,
+        // workers and memory limit (#876), which its validation applies.
         self.export.validate()?;
         self.convert.validate().map_err(|e| {
             PyramidError::InvalidConfig(crate::InvalidConfigError::BandConvertOptions(Box::new(e)))

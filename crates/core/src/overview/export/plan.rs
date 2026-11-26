@@ -459,7 +459,8 @@ pub(super) fn check_levels_fit(
             continue;
         };
         let why = if limit.source == MemoryLimitSource::Override {
-            "the memory figure is the TYLERTOO_AUTO_MEM_LIMIT_BYTES override".to_string()
+            "the memory figure is the --memory-limit / TYLERTOO_AUTO_MEM_LIMIT_BYTES override"
+                .to_string()
         } else if skip {
             format!("{SKIP_MEMORY_PREFLIGHT_ENV} is set")
         } else {

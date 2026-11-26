@@ -500,9 +500,10 @@ def test_worker_pool_caps_the_cores_unless_rayon_num_threads_is_set(
     ("keyword", "message"),
     [
         ({"workers": 0}, "--workers / workers must be at least 1"),
+        ({"memory_limit": 0}, "--memory-limit / memory_limit must be more than 0"),
     ],
 )
-def test_zero_workers_is_refused_before_any_io(
+def test_zero_workers_or_memory_limit_is_refused_before_any_io(
     tmp_path, keyword, message
 ):
     """#876: 0 is refused with a clear message before the input is read."""

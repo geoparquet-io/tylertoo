@@ -377,7 +377,7 @@ impl Default for TilesOptions {
 
 /// Export fields the facade derives itself, for
 /// [`check_ignored_export_fields`], with what to set instead. Kept beside [`TilesOptions`]'s docs, which list the same five.
-const FACADE_OWNED_EXPORT_FIELDS: [(ExportField, &str); 7] = [
+const FACADE_OWNED_EXPORT_FIELDS: [(ExportField, &str); 8] = [
     (
         ExportField::LayerName,
         "the facade names the layer; set TilesOptions::layer_name",
@@ -405,6 +405,10 @@ const FACADE_OWNED_EXPORT_FIELDS: [(ExportField, &str); 7] = [
     (
         ExportField::Workers,
         "the one worker count is convert.workers",
+    ),
+    (
+        ExportField::MemoryLimit,
+        "the one memory limit is convert.memory_limit",
     ),
 ];
 
@@ -579,6 +583,7 @@ impl TilesOptions {
             // The run's resources are convert's, as the export will get them.
             profile: self.convert.profile,
             workers: self.convert.workers,
+            memory_limit: self.convert.memory_limit,
             ..self.export.clone()
         }
         .validate()?;
@@ -1429,9 +1434,10 @@ pub(super) fn convert_to_pmtiles_retaining_overview(
         // convert's spill (and the intermediate overview) go.
         spill_dir: options.convert.spill_dir.clone(),
         // #788: one memory profile governs both halves of the run, and
-        // #876 one worker count.
+        // #876 one worker count and memory limit.
         profile: options.convert.profile,
         workers: options.convert.workers,
+        memory_limit: options.convert.memory_limit,
         ..options.export.clone()
     };
     let (export_report, members) = super::export::export_pmtiles_for_join(

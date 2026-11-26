@@ -146,7 +146,7 @@ fn export_warns_when_a_tile_exceeds_the_override() {
     let (ok, stderr) = export(&overview, &warned, Some("1000000"), &[]);
     assert!(ok, "the override only warns:\n{stderr}");
     for needle in [
-        "continuing because the memory figure is the TYLERTOO_AUTO_MEM_LIMIT_BYTES override",
+        "continuing because the memory figure is the --memory-limit / TYLERTOO_AUTO_MEM_LIMIT_BYTES override",
         "overview level 0 (z0) cannot fit in memory",
         "z0/0/0",
         "--verbatim",
@@ -171,9 +171,50 @@ fn export_warns_when_a_tile_exceeds_the_override() {
     assert!(exported.exists());
 }
 
-/// #876: `--workers 0` is refused before any I/O: the input does not exist.
+/// #876: `--memory-limit` is the same override as the env var and wins over
+/// it, so the export's own memory check reads the flag: 1 MB warns even
+/// with the env var claiming 1 TiB.
 #[test]
-fn zero_workers_are_refused_before_any_io() {
+fn the_memory_limit_flag_overrides_the_env_var() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("points.parquet");
+    write_points(&input);
+    let overview = dir.path().join("overview.parquet");
+    let status = Command::new(tylertoo_bin())
+        .args([
+            "overview",
+            input.to_str().unwrap(),
+            overview.to_str().unwrap(),
+            "--min-zoom",
+            "0",
+            "--max-zoom",
+            "2",
+            "--verbatim",
+        ])
+        .env_remove("TYLERTOO_AUTO_MEM_LIMIT_BYTES")
+        .output()
+        .expect("run tylertoo overview");
+    assert!(status.status.success());
+    for env in [None, Some("1099511627776")] {
+        let out = dir.path().join("flag.pmtiles");
+        let (ok, stderr) = export(
+            &overview,
+            &out,
+            env,
+            &["--memory-limit", "1000000", "--force"],
+        );
+        assert!(ok, "{env:?}: the override only warns:\n{stderr}");
+        assert!(
+            stderr.contains("overview level 0 (z0) cannot fit in memory"),
+            "{env:?}: the flag sets the figure:\n{stderr}"
+        );
+    }
+}
+
+/// #876: `--workers 0` and `--memory-limit 0` (or an unparseable size) are
+/// refused before any I/O: the input does not exist.
+#[test]
+fn zero_workers_and_memory_limit_are_refused_before_any_io() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.parquet");
     let out = dir.path().join("out.pmtiles");
@@ -187,6 +228,21 @@ fn zero_workers_are_refused_before_any_io() {
             "export-pmtiles",
             &["--workers", "0"][..],
             "--workers / workers must be at least 1",
+        ),
+        (
+            "tiles",
+            &["--memory-limit", "0"][..],
+            "--memory-limit / memory_limit must be more than 0 bytes",
+        ),
+        (
+            "export-pmtiles",
+            &["--memory-limit", "0"][..],
+            "--memory-limit / memory_limit must be more than 0 bytes",
+        ),
+        (
+            "tiles",
+            &["--memory-limit", "lots"][..],
+            "Invalid size: 'lots'",
         ),
     ] {
         let output = Command::new(tylertoo_bin())

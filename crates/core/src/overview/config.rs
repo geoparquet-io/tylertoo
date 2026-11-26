@@ -422,6 +422,7 @@ pub(crate) enum ExportField {
     SpillDir,
     Profile,
     Workers,
+    MemoryLimit,
     Metadata,
 }
 
@@ -437,6 +438,7 @@ impl ExportField {
             ExportField::SpillDir => "export.spill_dir",
             ExportField::Profile => "export.profile",
             ExportField::Workers => "export.workers",
+            ExportField::MemoryLimit => "export.memory_limit",
             ExportField::Metadata => "export.metadata",
         }
     }
@@ -453,6 +455,7 @@ impl ExportField {
             ExportField::SpillDir => export.spill_dir.is_some(),
             ExportField::Profile => export.profile != defaults.profile,
             ExportField::Workers => export.workers.is_some(),
+            ExportField::MemoryLimit => export.memory_limit.is_some(),
             ExportField::Metadata => export.metadata != defaults.metadata,
         }
     }
@@ -1246,14 +1249,25 @@ pub(crate) mod accumulation {
     }
 }
 
-/// The `workers` rule convert and export share (#876): unset means the
-/// default, and `0` is refused, not read as unset.
-pub(super) fn check_run_resources(workers: Option<usize>) -> Result<(), ConfigError> {
+/// The `workers` and `memory_limit` rules convert and export share (#876):
+/// unset means the default, and `0` is refused, not read as unset.
+pub(super) fn check_run_resources(
+    workers: Option<usize>,
+    memory_limit: Option<usize>,
+) -> Result<(), ConfigError> {
     if workers == Some(0) {
         return Err(ConfigError::InvalidSpec {
             option: "--workers / workers",
             message: "--workers / workers must be at least 1; leave it unset for the \
                       memory profile's default"
+                .to_string(),
+        });
+    }
+    if memory_limit == Some(0) {
+        return Err(ConfigError::InvalidSpec {
+            option: "--memory-limit / memory_limit",
+            message: "--memory-limit / memory_limit must be more than 0 bytes; leave it \
+                      unset to use the detected memory"
                 .to_string(),
         });
     }

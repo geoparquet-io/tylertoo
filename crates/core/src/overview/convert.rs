@@ -619,6 +619,19 @@ pub struct ConvertOptions {
     )]
     #[cfg_attr(feature = "cli", arg(help = "Worker threads for the whole run. Default: every core under `auto` and `speed`, at most 40 under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>", long_help = None))]
     pub workers: Option<usize>,
+    /// Bytes of memory the run may use (#876), in place of the detected
+    /// figure (the smaller of the cgroup headroom and `MemAvailable`).
+    /// `None` (default): `TYLERTOO_AUTO_MEM_LIMIT_BYTES` if set, else the
+    /// detected figure. `0` is refused. Every memory probe of the run reads
+    /// it, through the process-wide override that options validation sets.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "SIZE",
+        value_parser = super::config::cli::parse_size_bytes,
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory the run may use, such as `24G`, in place of the detected available memory (cgroup limit or `MemAvailable`); overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit>", long_help = None))]
+    pub memory_limit: Option<usize>,
     /// Number of Arrow read batches allowed in flight through the streaming
     /// pass-2 pipeline at once. Pass 2 splits it in half (#494): one half is
     /// the read-ahead channel, the other the window of batches its consumers
@@ -1011,6 +1024,7 @@ with_setters!(ConvertOptions {
     with_read_batch_size => read_batch_size: usize,
     with_profile => profile: MemoryProfile,
     with_workers => workers: Option<usize>,
+    with_memory_limit => memory_limit: Option<usize>,
     with_in_flight_batches => in_flight_batches: usize,
     with_read_workers => read_workers: usize,
     with_cluster => cluster: bool,
@@ -1177,17 +1191,27 @@ pub fn init_worker_pool(
 /// What a run's options set for the whole process (#876), applied by
 /// [`ConvertOptions::validate`] and
 /// [`ExportOptions::validate`](super::export::ExportOptions::validate) once
-/// the options pass, so a library caller gets it as the CLI and Python do,
-/// before any I/O: the global pool, built for `profile` and `workers`
-/// ([`init_worker_pool`]) by the first call off any Rayon pool. A pool a
-/// host or an earlier call built is kept, and a caller already on a pool's
-/// worker uses that pool.
-pub(super) fn apply_run_resources(profile: MemoryProfile, workers: Option<usize>) {
+/// the options pass, so a library caller gets them as the CLI and Python
+/// do, before any I/O:
+///
+/// - `memory_limit`, when set, becomes the memory figure every probe reads
+///   ([`super::pipeline::set_memory_limit_option`]); unset leaves the
+///   figure as it was, so a run's internal options cannot clear it.
+/// - The global pool is built for `profile` and `workers`
+///   ([`init_worker_pool`]) by the first call off any Rayon pool; a pool a
+///   host or an earlier call built is kept, and a caller already on a
+///   pool's worker uses that pool.
+pub(super) fn apply_run_resources(
+    profile: MemoryProfile,
+    workers: Option<usize>,
+    memory_limit: Option<usize>,
+) {
     #[expect(
         clippy::disallowed_types,
         reason = "#876: the global pool is process-wide, so its one build attempt is too"
     )]
     static TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    super::pipeline::set_memory_limit_option(memory_limit);
     if rayon::current_thread_index().is_none()
         && !TRIED.swap(true, std::sync::atomic::Ordering::Relaxed)
     {
@@ -1308,7 +1332,7 @@ impl ConvertOptions {
     #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConvertError> {
         let config = super::config::validate_convert(self)?;
-        apply_run_resources(self.profile, self.workers);
+        apply_run_resources(self.profile, self.workers, self.memory_limit);
         Ok(config)
     }
 
@@ -1332,7 +1356,7 @@ impl ConvertOptions {
     }
 
     pub(crate) fn check(&self) -> Result<(), ConvertError> {
-        super::config::check_run_resources(self.workers)?;
+        super::config::check_run_resources(self.workers, self.memory_limit)?;
         validate_options(self)?;
         self.levels.resolve(self.gsd_base)?;
         Ok(())
@@ -1732,6 +1756,7 @@ impl Default for ConvertOptions {
             read_batch_size: DEFAULT_READ_BATCH_SIZE,
             profile: MemoryProfile::Auto,
             workers: None,
+            memory_limit: None,
             in_flight_batches: IN_FLIGHT_BATCHES_AUTO,
             read_workers: READ_WORKERS_AUTO,
             cluster: false,
@@ -13099,32 +13124,39 @@ mod tests {
         assert_eq!(resolve_worker_threads(Speed, Some(200)), 200);
     }
 
-    /// #876: `workers` of 0 is refused at validation, on convert and export
-    /// alike; unset and positive values pass.
+    /// #876: `workers` and `memory_limit` of 0 are refused at validation, on
+    /// convert and export alike; unset and positive values pass.
     #[test]
-    fn zero_workers_is_refused() {
+    fn zero_workers_or_memory_limit_is_refused() {
         let msg = |e: &dyn std::fmt::Display| e.to_string();
-        let convert = |workers| {
+        let convert = |workers, memory_limit| {
             let o = ConvertOptions {
                 workers,
+                memory_limit,
                 ..ConvertOptions::default()
             };
             o.check().err().map(|e| msg(&e))
         };
-        let export = |workers| {
+        let export = |workers, memory_limit| {
             let o = super::super::export::ExportOptions {
                 workers,
+                memory_limit,
                 ..Default::default()
             };
             o.check().err().map(|e| msg(&e))
         };
-        for check in [&convert as &dyn Fn(_) -> _, &export] {
-            assert_eq!(check(None), None);
-            assert_eq!(check(Some(4)), None);
-            let workers = check(Some(0)).expect("0 workers");
+        for check in [&convert as &dyn Fn(_, _) -> _, &export] {
+            assert_eq!(check(None, None), None);
+            assert_eq!(check(Some(4), Some(1 << 30)), None);
+            let workers = check(Some(0), None).expect("0 workers");
             assert!(
                 workers.contains("--workers / workers must be at least 1"),
                 "{workers}"
+            );
+            let limit = check(None, Some(0)).expect("0 bytes");
+            assert!(
+                limit.contains("--memory-limit / memory_limit must be more than 0"),
+                "{limit}"
             );
         }
     }

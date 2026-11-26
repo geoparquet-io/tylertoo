@@ -783,6 +783,20 @@ pub struct ExportOptions {
     #[cfg_attr(feature = "cli", arg(help = "Worker threads for the whole run. Default: every core under `auto` and `speed`, at most 40 under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>", long_help = None))]
     #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub workers: Option<usize>,
+    /// Bytes of memory the run may use (#876), in place of the detected
+    /// figure (the smaller of the cgroup headroom and `MemAvailable`).
+    /// `None` (default): `TYLERTOO_AUTO_MEM_LIMIT_BYTES` if set, else the
+    /// detected figure. `0` is refused. Every memory probe of the run reads
+    /// it, through the process-wide override that options validation sets.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "SIZE",
+        value_parser = super::config::cli::parse_size_bytes,
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory the run may use, such as `24G`, in place of the detected available memory (cgroup limit or `MemAvailable`); overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "export_only"))]
+    pub memory_limit: Option<usize>,
     /// Top-level `name`, `description` and `attribution` written to the
     /// archive metadata (tippecanoe's `-n` / `-N` / `-A`).
     ///
@@ -818,6 +832,7 @@ with_setters!(ExportOptions {
     with_spill_dir => spill_dir: Option<PathBuf>,
     with_profile => profile: MemoryProfile,
     with_workers => workers: Option<usize>,
+    with_memory_limit => memory_limit: Option<usize>,
     with_metadata => metadata: TilesetMetadata,
     with_variable_depth => variable_depth: bool,
 });
@@ -850,6 +865,7 @@ impl Default for ExportOptions {
             spill_dir: None,
             profile: MemoryProfile::Auto,
             workers: None,
+            memory_limit: None,
             metadata: TilesetMetadata::default(),
         }
     }
@@ -900,12 +916,12 @@ impl ExportOptions {
     #[doc(hidden)]
     pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConfigError> {
         let config = super::config::validate_export(self)?;
-        super::convert::apply_run_resources(self.profile, self.workers);
+        super::convert::apply_run_resources(self.profile, self.workers, self.memory_limit);
         Ok(config)
     }
 
     pub(crate) fn check(&self) -> Result<(), ConfigError> {
-        super::config::check_run_resources(self.workers)?;
+        super::config::check_run_resources(self.workers, self.memory_limit)?;
         for (option, zoom) in [
             ("--min-zoom / min_zoom", self.min_zoom),
             ("--zoom-ceiling / zoom_ceiling", self.zoom_ceiling),

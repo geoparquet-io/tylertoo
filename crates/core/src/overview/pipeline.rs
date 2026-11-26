@@ -278,13 +278,47 @@ pub(super) fn available_memory_bytes_calls_on_this_thread() -> usize {
     AVAILABLE_MEMORY_CALLS.with(std::cell::Cell::get)
 }
 
-/// The `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override, when set to a plain number.
+/// The `memory_limit` option's bytes (#876), 0 while no run has set one.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#876: the memory limit option is process-wide, like the probe it overrides"
+)]
+static MEMORY_LIMIT_OPTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the `memory_limit` option's override, which every memory probe reads
+/// first (#876). Options validation calls it
+/// ([`super::convert::apply_run_resources`]); `None` keeps the current one.
+///
+/// shortcut: process-wide and sticky, so in one process (Python) a later
+/// call without `memory_limit` keeps an earlier call's, and concurrent
+/// runs share one; upgrade to a per-run budget threaded from the options
+/// when callers mix limits in one process.
+pub(super) fn set_memory_limit_option(bytes: Option<usize>) {
+    if let Some(bytes) = bytes {
+        MEMORY_LIMIT_OPTION.store(
+            u64::try_from(bytes).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// The memory override: the `memory_limit` option, else
+/// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` when set to a plain number.
 fn auto_mem_limit_override() -> Option<u64> {
-    std::env::var("TYLERTOO_AUTO_MEM_LIMIT_BYTES")
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
+    mem_limit_override(
+        MEMORY_LIMIT_OPTION.load(std::sync::atomic::Ordering::Relaxed),
+        std::env::var("TYLERTOO_AUTO_MEM_LIMIT_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`auto_mem_limit_override`] on the option's bytes (0: unset) and the env
+/// var's text (test seam).
+fn mem_limit_override(option: u64, env: Option<&str>) -> Option<u64> {
+    (option > 0)
+        .then_some(option)
+        .or_else(|| env?.trim().parse::<u64>().ok())
 }
 
 /// The uncached machine/cgroup probe, without the override: what the
@@ -376,8 +410,8 @@ pub(super) fn gib(bytes: u64) -> f64 {
 /// front; every other figure is advisory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MemoryLimitSource {
-    /// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` — a knob to make `auto` conservative,
-    /// not a statement about the box.
+    /// The `memory_limit` option or `TYLERTOO_AUTO_MEM_LIMIT_BYTES`: what
+    /// the caller lets the run use, not a statement about the box.
     Override,
     /// `/proc/meminfo` `MemAvailable`: momentary, and excludes swap.
     MemAvailable,
@@ -396,7 +430,7 @@ impl MemoryLimitSource {
     /// How user-facing messages name this figure.
     pub(super) fn describe(self) -> &'static str {
         match self {
-            Self::Override => "TYLERTOO_AUTO_MEM_LIMIT_BYTES override",
+            Self::Override => "--memory-limit / TYLERTOO_AUTO_MEM_LIMIT_BYTES override",
             Self::MemAvailable => "available memory (MemAvailable)",
             Self::CgroupMax => "cgroup hard memory limit (memory.max)",
             Self::CgroupHigh => "cgroup memory.high throttle limit",
@@ -5169,6 +5203,16 @@ mod cgroup_tests {
         let released = before.saturating_sub(rss_anon_bytes());
         assert!(released >= TOTAL / 2, "released {} MiB", released >> 20);
         drop(kept);
+    }
+
+    /// #876: the `memory_limit` option wins over the env var, which wins
+    /// over the probe; an env value that is not a number is ignored.
+    #[test]
+    fn the_memory_limit_option_wins_over_the_env_var() {
+        assert_eq!(mem_limit_override(5 << 30, Some("1024")), Some(5 << 30));
+        assert_eq!(mem_limit_override(0, Some(" 1024 ")), Some(1024));
+        assert_eq!(mem_limit_override(0, Some("24G")), None);
+        assert_eq!(mem_limit_override(0, None), None);
     }
 
     /// The env override is not frozen by the cache: set after the cache is
