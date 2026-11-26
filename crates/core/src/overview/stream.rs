@@ -2786,7 +2786,8 @@ fn resolve_streamed_winner_tables(
     log::info!(
         "[assign] streamed assignment memory: min_levels {} B ({:.2} B/row), kinds {} B \
          ({:.2} B/row), carriers {} B ({:.2} B/row, {} row(s)), line cell maps {} B \
-         ({} cell(s), {:.2} B/row), carrier patch maps {} B ({} patch(es), {:.2} B/row)",
+         ({} cell(s), {:.2} B/row), carrier patch maps {} B ({} patch(es), {:.2} B/row), \
+         eviction schedule {} B ({:.2} B/row); maps at peak live size",
         memory.min_levels,
         memory.min_levels as f64 / rows,
         memory.kinds,
@@ -2800,6 +2801,8 @@ fn resolve_streamed_winner_tables(
         memory.patch_maps,
         memory.patches,
         memory.patch_maps as f64 / rows,
+        memory.eviction,
+        memory.eviction as f64 / rows,
     );
     rss.log_phase("assignment+budget (winner tables)");
     let (tally_lines, tally_bytes) = line_tally;
@@ -6876,14 +6879,57 @@ fn stream_assigner(
         "[assign] level assignment path: streamed (#928; {allowed:?}, {} level(s))",
         level_specs.len()
     );
-    Ok(Some(StreamAssigner::new(
+    let spans = stream_group_spans(ctx)?;
+    let assigner = StreamAssigner::new(
         allowed,
         options,
         &level_specs,
         &level_reprs,
         ctx.crs,
-        usize::try_from(rows).unwrap_or(0),
-    )))
+        (usize::try_from(rows).unwrap_or(0), &spans),
+    );
+    log::info!(
+        "[assign] streamed assignment eviction: {} ({} row group(s), {} with usable bounds)",
+        if assigner.evicts() { "on" } else { "off" },
+        spans.len(),
+        spans.iter().filter(|s| s.bounds.is_some()).count()
+    );
+    Ok(Some(assigner))
+}
+
+/// #928: the read stream's row groups, in read order, with the footer
+/// bounds the eviction may trust: none for a reprojected part (its bounds
+/// are a transformed box, not a hull) or for wrapped bounds.
+fn stream_group_spans(
+    ctx: &Pass1Ctx<'_>,
+) -> Result<Vec<super::assign_stream::GroupSpan>, ConvertError> {
+    let counts = ctx.source.part_row_group_row_counts()?;
+    let schemas = ctx.source.resolved_schemas()?;
+    let mut spans = Vec::new();
+    for (part, rows) in counts.iter().enumerate() {
+        let all: Vec<usize>;
+        let groups = match ctx.selected_row_groups {
+            Some(sel) => &sel.parts()[part],
+            None => {
+                all = (0..rows.len()).collect();
+                &all
+            }
+        };
+        let schema = schemas[part];
+        for &rg in groups {
+            let bounds = schema
+                .bounds()
+                .get(rg)
+                .and_then(Option::as_ref)
+                .filter(|b| !schema.reprojects() && b.xmin <= b.xmax)
+                .map(|b| [b.xmin, b.ymin, b.xmax, b.ymax]);
+            spans.push(super::assign_stream::GroupSpan {
+                rows: usize::try_from(rows[rg]).unwrap_or(0),
+                bounds,
+            });
+        }
+    }
+    Ok(spans)
 }
 
 // ============================================================================
@@ -11254,13 +11300,34 @@ pub(super) mod tests {
 
     /// #928: the streamed path's [`WinnerTables`] over the same rows, fed
     /// as pass 1 feeds it: `chunk_rows`-row chunks with chunk-local indices.
+    /// With `evict`, every chunk is one row group whose bounds are its rows'
+    /// centres (group 1 has none, so it touches every cell).
     fn streamed_winner_tables(
         feats: &[AssignFeature],
         areas: &[f32],
         num_rows: usize,
         options: &ConvertOptions,
-        chunk_rows: usize,
-    ) -> WinnerTables {
+        (chunk_rows, evict): (usize, bool),
+    ) -> (WinnerTables, super::super::assign_stream::StreamMemory) {
+        let chunk_rows = chunk_rows.min(num_rows);
+        let groups = num_rows.div_ceil(chunk_rows);
+        let mut bounds: Vec<Option<[f64; 4]>> = vec![None; groups];
+        let centers = table(feats);
+        for (pos, f) in feats.iter().enumerate() {
+            let (x, y) = centers.center(pos);
+            let b = &mut bounds[f.index / chunk_rows];
+            let [x0, y0, x1, y1] = b.unwrap_or([x, y, x, y]);
+            *b = Some([x0.min(x), y0.min(y), x1.max(x), y1.max(y)]);
+        }
+        let spans: Vec<super::super::assign_stream::GroupSpan> = bounds
+            .into_iter()
+            .enumerate()
+            .map(|(g, b)| super::super::assign_stream::GroupSpan {
+                rows: chunk_rows.min(num_rows - g * chunk_rows),
+                bounds: b.filter(|_| g != 1),
+            })
+            .collect();
+        let spans = if evict { spans } else { Vec::new() };
         let level_specs = options.levels.resolve(options.gsd_base).unwrap();
         let reprs =
             super::super::convert::level_representations(&level_specs, &options.representation);
@@ -11273,8 +11340,9 @@ pub(super) mod tests {
             &level_specs,
             &reprs,
             Crs::Epsg3857,
-            num_rows,
+            (num_rows, &spans),
         );
+        assert_eq!(assigner.evicts(), evict);
         let mut next = 0;
         let mut base = 0;
         while base < num_rows {
@@ -11293,16 +11361,19 @@ pub(super) mod tests {
                 .unwrap();
             base += rows;
         }
-        with_assign_ctx(options, |ctx| {
+        let assigned = assigner.finish(num_rows);
+        let memory = assigned.memory;
+        let tables = with_assign_ctx(options, |ctx| {
             resolve_streamed_winner_tables(
                 ctx,
-                assigner.finish(num_rows),
+                assigned,
                 None,
                 (0, 0),
                 &mut RssTracker::new(false, "test"),
             )
             .unwrap()
-        })
+        });
+        (tables, memory)
     }
 
     /// Seeded polygons and lines in EPSG:3857 metres that cross every
@@ -11312,6 +11383,7 @@ pub(super) mod tests {
         n: usize,
         seed: u64,
         finest_gsd: f64,
+        sorted: bool,
     ) -> (Vec<AssignFeature>, Vec<f32>, usize) {
         let mut state = seed | 1;
         let mut rnd = move || {
@@ -11331,7 +11403,13 @@ pub(super) mod tests {
                 AssignFeature { index, ..*prev }
             } else {
                 let size = finest_gsd * 2f64.powf(rnd() * 14.0 - 2.0);
-                let (x, y) = (rnd() * extent - extent / 2.0, rnd() * extent);
+                // Sorted: rows sweep north, as a spatially sorted file does.
+                let y = if sorted {
+                    extent * (i as f64 + rnd() * 50.0) / n as f64
+                } else {
+                    rnd() * extent
+                };
+                let x = rnd() * extent - extent / 2.0;
                 let kind = if rnd() < 0.5 {
                     FeatureKind::Polygon
                 } else {
@@ -11414,6 +11492,7 @@ pub(super) mod tests {
             save_plan: Some("unused.plan".into()),
             ..base.clone()
         };
+        let sorted_base = base.clone();
         let mut coarse_lines = base.clone();
         coarse_lines.assign.line_thinning = 3.0;
         let cases = [
@@ -11425,6 +11504,7 @@ pub(super) mod tests {
             ("no density budget", no_budget),
             ("kinds for --save-plan", plan_kinds),
             ("coarser line cells", coarse_lines),
+            ("spatially sorted", sorted_base),
         ];
         for (seed, (name, options)) in cases.into_iter().enumerate() {
             let finest = *options
@@ -11433,7 +11513,9 @@ pub(super) mod tests {
                 .unwrap()
                 .last()
                 .unwrap();
-            let (feats, areas, rows) = stream_fixture(40_000, 0x928 + seed as u64, finest.0);
+            let sorted = name == "spatially sorted";
+            let (feats, areas, rows) =
+                stream_fixture(40_000, 0x928 + seed as u64, finest.0, sorted);
             let mut reference = None;
             for threads in [1usize, 8] {
                 let pool = rayon::ThreadPoolBuilder::new()
@@ -11462,12 +11544,24 @@ pub(super) mod tests {
                 "{name}: carriers only where the accumulator runs"
             );
             for chunk_rows in [1usize, 777, usize::MAX] {
-                let streamed = streamed_winner_tables(&feats, &areas, rows, &options, chunk_rows);
-                assert_winner_tables_eq(
-                    &reference,
-                    &streamed,
-                    &format!("{name}, chunk {chunk_rows}"),
-                );
+                let (streamed, kept) =
+                    streamed_winner_tables(&feats, &areas, rows, &options, (chunk_rows, false));
+                let what = format!("{name}, chunk {chunk_rows}");
+                assert_winner_tables_eq(&reference, &streamed, &what);
+                let (evicted, closed) =
+                    streamed_winner_tables(&feats, &areas, rows, &options, (chunk_rows, true));
+                assert_winner_tables_eq(&reference, &evicted, &format!("{what}, evicting"));
+                if sorted && chunk_rows == 777 {
+                    assert!(
+                        closed.cells < kept.cells / 2 && closed.patches < kept.patches / 2,
+                        "{what}: eviction must bound the live maps ({} of {} cells, \
+                         {} of {} patches)",
+                        closed.cells,
+                        kept.cells,
+                        closed.patches,
+                        kept.patches
+                    );
+                }
             }
         }
     }

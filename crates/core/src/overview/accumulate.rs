@@ -236,14 +236,18 @@ impl LevelAccumulator {
     }
 
     /// Feed one polygon that is not a member of this level (and not on a
-    /// ladder), with its row `index`, bbox centre and f32 area.
-    pub(super) fn add(&mut self, index: usize, (cx, cy): (f64, f64), area: f32) {
-        let Some(level) = &mut self.active else {
-            return;
-        };
+    /// ladder), with its row `index`, bbox centre and f32 area. Returns the
+    /// patch key when this call opened the patch.
+    pub(super) fn add(
+        &mut self,
+        index: usize,
+        (cx, cy): (f64, f64),
+        area: f32,
+    ) -> Option<(i64, i64)> {
+        let level = self.active.as_mut()?;
         let area = f64::from(area);
         if area.is_nan() || area <= 0.0 {
-            return;
+            return None;
         }
         let threshold = level.threshold;
         // DIVERGENCE FROM TIPPECANOE: tippecanoe only accumulates rings
@@ -268,6 +272,7 @@ impl LevelAccumulator {
             (cx / level.cell).floor() as i64,
             (cy / level.cell).floor() as i64,
         );
+        let opened = !level.acc.contains_key(&key);
         let patch = level.acc.entry(key).or_default();
         patch.total += area;
         if patch.total >= threshold {
@@ -275,6 +280,26 @@ impl LevelAccumulator {
             patch.total -= threshold;
         } else {
             patch.last_free = Some((index, cx, cy));
+        }
+        opened.then_some(key)
+    }
+
+    /// The patch width in coordinate units, when the level accumulates.
+    pub(super) fn patch_width(&self) -> Option<f64> {
+        self.active.as_ref().map(|l| l.cell)
+    }
+
+    /// Close one patch no later row can reach (#928 eviction): its residual
+    /// dither runs now instead of at [`Self::finish`]. The carrier list is
+    /// sorted there, so the order patches close in does not matter.
+    pub(super) fn close_patch(&mut self, key: (i64, i64)) {
+        let Some(level) = &mut self.active else {
+            return;
+        };
+        if let Some(patch) = level.acc.remove(&key) {
+            if level.floored {
+                level.dither(&patch);
+            }
         }
     }
 
@@ -311,17 +336,34 @@ impl LevelAccumulator {
         // keep the plain truncation, byte-identical to before #407.
         if floored {
             for patch in acc.values() {
-                if let Some((index, cx, cy)) = patch.last_free {
-                    if dither_u01(cx, cy) < patch.total / threshold {
-                        out.push(index);
-                    }
+                if let Some(index) = patch.dithered(threshold) {
+                    out.push(index);
                 }
             }
         }
         // `features` is in input order and `index` is monotone in it, but
         // sort anyway: the lookup is a binary search.
         out.sort_unstable();
+        // Doubling slack would sit resident through pass 2.
+        out.shrink_to_fit();
         (out, self.floored_zoom)
+    }
+}
+
+impl ActiveLevel {
+    fn dither(&mut self, patch: &Patch) {
+        if let Some(index) = patch.dithered(self.threshold) {
+            self.out.push(index);
+        }
+    }
+}
+
+impl Patch {
+    /// The residual dither's carrier, if the patch's last free contributor
+    /// becomes one.
+    fn dithered(&self, threshold: f64) -> Option<usize> {
+        let (index, cx, cy) = self.last_free?;
+        (dither_u01(cx, cy) < self.total / threshold).then_some(index)
     }
 }
 

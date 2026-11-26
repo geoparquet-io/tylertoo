@@ -17,7 +17,11 @@
 //! The path is chosen before the scan ([`stream_path`]) and never switched:
 //! rows already folded into `min_levels` cannot be recovered.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+
+use rstar::primitives::{GeomWithData, Rectangle};
+use rstar::{RTree, AABB};
 
 use super::accumulate::{log_floored_zooms, LevelAccumulator};
 use super::assign::{
@@ -184,16 +188,163 @@ impl Incumbent {
     }
 }
 
-/// Bytes of the resident assignment state, measured from capacities.
+/// Bytes of the resident assignment state, measured from capacities. The
+/// maps never shrink, so their capacity at the end is their peak.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct StreamMemory {
     pub(super) min_levels: u64,
     pub(super) kinds: u64,
     pub(super) carriers: u64,
+    /// Peak live line cells, and the cell maps' bytes.
     pub(super) cells: usize,
     pub(super) cell_maps: u64,
+    /// Peak live carrier patches, and the patch maps' bytes.
     pub(super) patches: usize,
     pub(super) patch_maps: u64,
+    /// Peak bytes of the eviction schedule, plus its row-group index.
+    pub(super) eviction: u64,
+}
+
+/// One row group of the read stream: its row count and footer bounds
+/// (`[xmin, ymin, xmax, ymax]` in the coordinates the scan sees), `None`
+/// when the footer has none the eviction can trust.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GroupSpan {
+    pub(super) rows: usize,
+    pub(super) bounds: Option<[f64; 4]>,
+}
+
+/// A cell or patch scheduled to close after a row group.
+#[derive(Clone, Copy)]
+enum Due {
+    Cell(u8, CellKey),
+    Patch(u8, (i64, i64)),
+}
+
+/// The conservative eviction contract (#928 design step 4). A cell or patch
+/// closes once every row group that could hold a row landing in it has been
+/// read: the last group whose footer bounds intersect it, grown by one cell
+/// on every side, or any later group without bounds. Each row's centre is
+/// checked against its group's bounds, so a footer that lies stops the run
+/// instead of moving a winner. Nothing here depends on grid nesting, on the
+/// row order, or on enumerating the cells a bbox covers.
+struct Eviction {
+    /// Cumulative row end (exclusive) of each group, in read order.
+    ends: Vec<usize>,
+    /// Each group's bounds, grown by the float tolerance.
+    bounds: Vec<Option<[f64; 4]>>,
+    tree: RTree<GeomWithData<Rectangle<[f64; 2]>, usize>>,
+    /// `last_unbounded[g]`: the last group at or after `g` without bounds.
+    last_unbounded: Vec<Option<usize>>,
+    /// The group the stream is in.
+    current: usize,
+    due: Vec<Vec<Due>>,
+    live: usize,
+    peak_live: usize,
+}
+
+impl Eviction {
+    /// `None` when the spans do not add up to the stream's rows (the
+    /// eviction then stays off and every cell closes at the end).
+    fn new(spans: &[GroupSpan], rows: usize) -> Option<Self> {
+        let mut ends = Vec::with_capacity(spans.len());
+        let mut end = 0usize;
+        for s in spans {
+            end += s.rows;
+            ends.push(end);
+        }
+        if end != rows || spans.is_empty() {
+            return None;
+        }
+        // Covering bboxes are often f32, rounded either way: grow by a
+        // relative 1e-6 so a correct footer never trips the check.
+        let grow = |v: f64| 1e-6 * v.abs().max(1.0);
+        let bounds: Vec<Option<[f64; 4]>> = spans
+            .iter()
+            .map(|s| {
+                s.bounds
+                    .filter(|b| b.iter().all(|v| v.is_finite()) && b[0] <= b[2] && b[1] <= b[3])
+                    .map(|[x0, y0, x1, y1]| {
+                        [x0 - grow(x0), y0 - grow(y0), x1 + grow(x1), y1 + grow(y1)]
+                    })
+            })
+            .collect();
+        let tree = RTree::bulk_load(
+            bounds
+                .iter()
+                .enumerate()
+                .filter_map(|(g, b)| {
+                    b.map(|[x0, y0, x1, y1]| {
+                        GeomWithData::new(Rectangle::from_corners([x0, y0], [x1, y1]), g)
+                    })
+                })
+                .collect(),
+        );
+        let mut last_unbounded = vec![None; bounds.len()];
+        let mut last = None;
+        for g in (0..bounds.len()).rev() {
+            if bounds[g].is_none() && last.is_none() {
+                last = Some(g);
+            }
+            last_unbounded[g] = last;
+        }
+        Some(Self {
+            ends,
+            due: vec![Vec::new(); bounds.len()],
+            bounds,
+            tree,
+            last_unbounded,
+            current: 0,
+            live: 0,
+            peak_live: 0,
+        })
+    }
+
+    /// Move to `row`'s group, returning the groups finished on the way.
+    fn advance(&mut self, row: usize) -> std::ops::Range<usize> {
+        let from = self.current;
+        while self.current < self.ends.len() && row >= self.ends[self.current] {
+            self.current += 1;
+        }
+        from..self.current
+    }
+
+    /// Whether `center` lies inside the current group's footer bounds.
+    fn contains(&self, (x, y): (f64, f64)) -> bool {
+        match self.bounds.get(self.current) {
+            Some(Some([x0, y0, x1, y1])) => x >= *x0 && x <= *x1 && y >= *y0 && y <= *y1,
+            _ => true,
+        }
+    }
+
+    /// Schedule `due`, covering `rect`, to close after the last group that
+    /// can still reach it.
+    fn schedule(&mut self, due: Due, [x0, y0, x1, y1]: [f64; 4]) {
+        let current = self.current.min(self.ends.len() - 1);
+        let envelope = AABB::from_corners([x0, y0], [x1, y1]);
+        let last = self
+            .tree
+            .locate_in_envelope_intersecting(&envelope)
+            .map(|g| g.data)
+            .chain(self.last_unbounded[current])
+            .max()
+            .unwrap_or(current)
+            .max(current);
+        self.due[last].push(due);
+        self.live += 1;
+        self.peak_live = self.peak_live.max(self.live);
+    }
+
+    fn take_due(&mut self, group: usize) -> Vec<Due> {
+        let due = std::mem::take(&mut self.due[group]);
+        self.live -= due.len();
+        due
+    }
+
+    fn peak_bytes(&self) -> u64 {
+        let index = self.ends.len() * (8 + 8 + 33 + 8 + 24) + self.tree.size() * 48;
+        (self.peak_live * std::mem::size_of::<Due>() + index) as u64
+    }
 }
 
 /// The streaming assignment's result, row-indexed like `WinnerTables`.
@@ -223,18 +374,24 @@ pub(super) struct StreamAssigner {
     kinds: Option<Vec<FeatureKind>>,
     features: usize,
     kind_counts: (usize, usize, usize),
+    evict: Option<Eviction>,
+    peak_cells: usize,
+    live_cells: usize,
+    peak_patches: usize,
+    live_patches: usize,
 }
 
 impl StreamAssigner {
     /// The assigner for `options`' resolved plan; `rows` pre-sizes the
-    /// row-indexed tables.
+    /// row-indexed tables. `spans` are the stream's row groups, for the
+    /// eviction; empty keeps every cell and patch to the end.
     pub(super) fn new(
         allowed: KindSet,
         options: &ConvertOptions,
         level_specs: &[(f64, Option<u8>)],
         level_reprs: &[Representation],
         crs: Crs,
-        rows: usize,
+        (rows, spans): (usize, &[GroupSpan]),
     ) -> Self {
         let level_gsds: Vec<f64> = level_specs.iter().map(|(g, _)| *g).collect();
         let finest = level_gsds.len().saturating_sub(1);
@@ -269,6 +426,42 @@ impl StreamAssigner {
             kinds,
             features: 0,
             kind_counts: (0, 0, 0),
+            evict: Eviction::new(spans, rows),
+            peak_cells: 0,
+            live_cells: 0,
+            peak_patches: 0,
+            live_patches: 0,
+        }
+    }
+
+    /// Whether the eviction is on (the stream's row groups are known).
+    pub(super) fn evicts(&self) -> bool {
+        self.evict.is_some()
+    }
+
+    /// Close everything due after the row groups `row` has moved past.
+    fn advance(&mut self, row: usize) {
+        let Some(evict) = &mut self.evict else {
+            return;
+        };
+        for group in evict.advance(row) {
+            for due in evict.take_due(group) {
+                match due {
+                    Due::Cell(li, key) => {
+                        let inc = self.grids[usize::from(li)]
+                            .remove(&key)
+                            .expect("a scheduled cell is live");
+                        // `fold_wave_winners`: the coarsest level a row wins.
+                        let slot = &mut self.min_levels[inc.index];
+                        *slot = (*slot).min(li);
+                        self.live_cells -= 1;
+                    }
+                    Due::Patch(li, key) => {
+                        self.accs[usize::from(li)].close_patch(key);
+                        self.live_patches -= 1;
+                    }
+                }
+            }
         }
     }
 
@@ -304,6 +497,10 @@ impl StreamAssigner {
             if !self.allowed.has(row.kind) {
                 return Err(undeclared(row.index, row.kind));
             }
+            self.advance(row.index);
+            if self.evict.as_ref().is_some_and(|e| !e.contains(row.center)) {
+                return Err(outside_bounds(row.index));
+            }
             debug_assert!(!row.sort_key.is_finite() && row.entry_level.is_none());
             match row.kind {
                 FeatureKind::Point => self.kind_counts.0 += 1,
@@ -326,14 +523,24 @@ impl StreamAssigner {
                             diag_sq: row.diag_sq,
                             index: row.index,
                         };
-                        self.grids[li]
-                            .entry(key)
-                            .and_modify(|slot| {
-                                if challenger.priority(dir).beats(&slot.priority(dir)) {
-                                    *slot = challenger;
+                        match self.grids[li].entry(key) {
+                            Entry::Occupied(mut slot) => {
+                                if challenger.priority(dir).beats(&slot.get().priority(dir)) {
+                                    *slot.get_mut() = challenger;
                                 }
-                            })
-                            .or_insert(challenger);
+                            }
+                            Entry::Vacant(slot) => {
+                                slot.insert(challenger);
+                                self.live_cells += 1;
+                                self.peak_cells = self.peak_cells.max(self.live_cells);
+                                if let Some(evict) = &mut self.evict {
+                                    let cs = self.gsd_units[li] * self.config.line_thinning;
+                                    let (_, ix, iy) = key;
+                                    let rect = grown_cell(ix, iy, cs);
+                                    evict.schedule(Due::Cell(li as u8, key), rect);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -345,7 +552,16 @@ impl StreamAssigner {
                 let area = areas.get(pos).copied().unwrap_or(0.0);
                 for (li, acc) in self.accs.iter_mut().enumerate() {
                     if usize::from(ml) > li {
-                        acc.add(row.index, row.center, area);
+                        if let Some((ix, iy)) = acc.add(row.index, row.center, area) {
+                            self.live_patches += 1;
+                            self.peak_patches = self.peak_patches.max(self.live_patches);
+                            if let (Some(evict), Some(w)) = (&mut self.evict, acc.patch_width()) {
+                                evict.schedule(
+                                    Due::Patch(li as u8, (ix, iy)),
+                                    grown_cell(ix, iy, w),
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -362,18 +578,23 @@ impl StreamAssigner {
             kinds,
             features,
             kind_counts,
+            evict,
+            peak_cells,
+            peak_patches,
             ..
         } = self;
-        let mut memory = StreamMemory::default();
+        let mut memory = StreamMemory {
+            cells: peak_cells,
+            patches: peak_patches,
+            eviction: evict.as_ref().map_or(0, Eviction::peak_bytes),
+            ..StreamMemory::default()
+        };
         let slot = (std::mem::size_of::<(CellKey, Incumbent)>() + 1) as u64;
         for grid in &grids {
-            memory.cells += grid.len();
             memory.cell_maps += grid.capacity() as u64 * slot;
         }
         for acc in &accs {
-            let (n, bytes) = acc.patch_map_bytes();
-            memory.patches += n;
-            memory.patch_maps += bytes;
+            memory.patch_maps += acc.patch_map_bytes().1;
         }
         min_levels.resize(num_rows, super::stream::UNASSIGNED_LEVEL);
         // `fold_wave_winners`: a row takes the coarsest level it wins.
@@ -410,6 +631,24 @@ impl StreamAssigner {
             memory,
         }
     }
+}
+
+/// Cell `(ix, iy)` of width `w`, grown by one cell on every side so float
+/// rounding in `floor(c / w)` can never place a row outside it.
+fn grown_cell(ix: i64, iy: i64, w: f64) -> [f64; 4] {
+    let (x, y) = (ix as f64 * w, iy as f64 * w);
+    [x - w, y - w, x + 2.0 * w, y + 2.0 * w]
+}
+
+fn outside_bounds(row: usize) -> ConvertError {
+    ConvertError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "{STREAM_ASSIGN_ENV}: row {row}'s bbox centre lies outside its row group's \
+             footer bounds, so streamed assignment cannot evict safely; rerun without \
+             {STREAM_ASSIGN_ENV}"
+        ),
+    ))
 }
 
 fn undeclared(row: usize, kind: FeatureKind) -> ConvertError {
@@ -454,6 +693,36 @@ mod tests {
         polygons: true,
         lines: false,
     };
+
+    /// A footer whose bounds do not contain a row's centre stops the run:
+    /// evicting on it could close a cell a later row still contests.
+    #[test]
+    fn rows_outside_their_footer_bounds_stop_the_run() {
+        use super::super::assign::AssignFeature;
+        let options = eligible();
+        let specs = options.levels.resolve(options.gsd_base).unwrap();
+        let reprs = super::super::convert::level_representations(&specs, &options.representation);
+        let line = |x: f64| AssignFeature {
+            index: 0,
+            bbox: [x, x, x + 10.0, x + 10.0],
+            kind: FeatureKind::Line,
+            sort_key: None,
+            entry_level: None,
+        };
+        let spans = [GroupSpan {
+            rows: 1,
+            bounds: Some([0.0, 0.0, 20.0, 20.0]),
+        }];
+        let push = |x: f64| {
+            let mut a =
+                StreamAssigner::new(BOTH, &options, &specs, &reprs, Crs::Epsg3857, (1, &spans));
+            assert!(a.evicts());
+            a.push_chunk(&[line(x)].iter().collect(), &[], 0, 1)
+        };
+        assert!(push(1.0).is_ok());
+        let err = push(500.0).unwrap_err().to_string();
+        assert!(err.contains("outside its row group"), "{err}");
+    }
 
     #[test]
     fn declared_kinds_accept_polygons_and_lines_only() {
