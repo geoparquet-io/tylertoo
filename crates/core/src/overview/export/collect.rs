@@ -242,10 +242,19 @@ pub(super) fn collect_into(
     // Returns what the group finished alongside held (#876), for `group`
     // to resize by.
     let mut step = |batches: Vec<RecordBatch>| -> Result<Option<GroupResidency>, ExportError> {
+        let mut serial = None;
         if !overlap {
             if let Some(c) = clipped.take() {
                 let t = crate::tile_trace::mark();
-                finish_group(ctx, wave, c, rows, sink, &mut tr.finish, diagnostics)?;
+                serial = Some(finish_group(
+                    ctx,
+                    wave,
+                    c,
+                    rows,
+                    sink,
+                    &mut tr.finish,
+                    diagnostics,
+                )?);
                 tr.serial_ns += crate::tile_trace::since(t);
             }
         }
@@ -285,7 +294,7 @@ pub(super) fn collect_into(
             tr.finish_ns += finish_ns;
             tr.clip_ns += clip_ns;
         }
-        let finished = finished?;
+        let finished = finished?.or(serial);
         clipped = Some(next?);
         Ok(finished)
     };
@@ -378,9 +387,9 @@ pub(super) struct FinishTrace {
     append_ns: u64,
 }
 
-/// The batches [`collect_into`] gathers before one [`clip_group`]: up to
-/// `max_rows` rows, and never past `max_bytes` decoded unless a single
-/// batch is that large on its own ([`Self::sized`], [`Self::rescale`]).
+/// The batches [`collect_into`] gathers before one [`clip_group`]: never
+/// past `max_rows` rows or `max_bytes` decoded, unless a single batch is
+/// that large on its own ([`Self::sized`], [`Self::rescale`]).
 pub(super) struct CollectGroup {
     pub(super) batches: Vec<RecordBatch>,
     pub(super) rows: usize,
@@ -510,8 +519,8 @@ impl CollectGroup {
     }
 
     /// Add `batch` (`bytes` decoded), handing each full group to `flush`:
-    /// the gathered batches first when `batch` would take them past the
-    /// byte cap, then the group once it reaches either cap. What `flush`
+    /// the gathered batches first when `batch` would take them past either
+    /// cap, then the group once it reaches one. What `flush`
     /// measured of an earlier group resizes the next ([`Self::rescale`]).
     pub(super) fn push(
         &mut self,
@@ -519,7 +528,12 @@ impl CollectGroup {
         bytes: usize,
         flush: &mut impl FnMut(Vec<RecordBatch>) -> Result<Option<GroupResidency>, ExportError>,
     ) -> Result<(), ExportError> {
-        if !self.batches.is_empty() && self.bytes.saturating_add(bytes) > self.max_bytes {
+        // Either cap closes the group before a batch would pass it, so a
+        // group holds no more than `rescale` priced (or one batch alone).
+        if !self.batches.is_empty()
+            && (self.bytes.saturating_add(bytes) > self.max_bytes
+                || self.rows.saturating_add(batch.num_rows()) > self.max_rows)
+        {
             self.flush(flush)?;
         }
         self.rows += batch.num_rows();

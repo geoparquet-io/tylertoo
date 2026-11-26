@@ -2331,6 +2331,58 @@ fn band_batches_are_collected_in_groups() {
         "bounded held two clipped groups at once"
     );
     assert!(tight_bytes == one_bytes, "bounded changed the archive");
+    // Review of 86c897dc: the serial finish dropped its measures, so the
+    // peak was the last, 3,616-row batch, not a full one.
+    assert_eq!(
+        tight.collect_peak_arrow, one.collect_peak_arrow,
+        "bounded's peak is its largest batch"
+    );
+}
+
+/// #876, review of 86c897dc: a group closes before a batch would take it
+/// past its row cap, so it never holds more rows than `rescale` priced.
+/// At 8 threads the x3 cap is 12,288 rows, 1.5 of the 8,192-row batches:
+/// gathering a second batch made 16,384-row groups, two of which pass
+/// the 24 MiB share that priced two of 12,288 rows at 1 KiB a row, and
+/// the measure, at the same 1 KiB a row, kept x3.
+#[test]
+fn collect_groups_never_pass_the_rows_they_were_priced_at() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        let share = 24 << 20;
+        let mut group = CollectGroup {
+            share: Some(share),
+            ..CollectGroup::sized(MemoryProfile::Auto, &MemoryBudget::with_available(None))
+        };
+        let batch = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int64Array::from((0..8_192).collect::<Vec<i64>>())) as ArrayRef,
+        )])
+        .unwrap();
+        let mut held = Vec::new();
+        for _ in 0..12 {
+            group
+                .push(batch.clone(), 1, &mut |b: Vec<RecordBatch>| {
+                    let rows: usize = b.iter().map(RecordBatch::num_rows).sum();
+                    held.push(rows);
+                    Ok(Some(GroupResidency {
+                        arrow: rows * 1_024,
+                        members: 0,
+                        rows,
+                        max_batch_rows: 8_192,
+                    }))
+                })
+                .unwrap();
+        }
+        assert_eq!(group.peak_scale, 3, "x3 is the largest that fits the share");
+        assert!(
+            held.iter().all(|&rows| 2 * rows * 1_024 <= share),
+            "groups of {held:?} rows"
+        );
+    });
 }
 
 /// #876: the group's size per profile. `speed` gathers 2,048 rows per

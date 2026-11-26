@@ -174,6 +174,8 @@ pub(super) struct ExportWorkTally {
     pub(super) collect_overlaps: u64,
     /// The largest scale a collect group was gathered at, and the most
     /// Arrow and clipped-member bytes one finished group held (#876).
+    /// Member bytes are measured under `auto` only, so they read 0
+    /// under `speed` and `bounded`.
     pub(super) collect_peak_scale: usize,
     pub(super) collect_peak_arrow: u64,
     pub(super) collect_peak_members: u64,
