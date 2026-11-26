@@ -773,6 +773,12 @@ uses the same `gap_to_world_box` on the same values, so the gaps are bit
 for bit those of before. It is serial rather than `owner_map` because a
 row costs a few sums, less than claiming a batch.
 
+The fill's groups are 4x #817's under `auto` and `speed` (2,048 rows per
+pool thread, 4 batch byte caps, `CollectGroup::sized`), as fewer joins and
+ordered finishes took FTW Brazil MT's export 7.7% faster for +0.25 GB peak
+RSS; `auto` cuts them back toward #817's size when its read share cannot
+hold the two groups a fill keeps at once.
+
 Border duplication is the expected delta between overview level counts and
 export per-zoom feature totals (a feature spanning a tile seam appears in
 every tile it touches): 0% while a level fits one tile, ~7% at z14 on

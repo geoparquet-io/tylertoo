@@ -2241,6 +2241,11 @@ fn wave_collect_does_no_per_row_work_on_the_consumer_thread() {
 /// pool joins once per group instead of once per 8,192-row batch. The
 /// grouping is scheduling only: one thread, which collects batch by
 /// batch, writes the same bytes.
+///
+/// #876: `auto` gathers 2,048 rows per thread when the budget holds two
+/// full groups, so 8 threads take two batches a group; on a tight budget
+/// the group falls back to 512 rows per thread, one batch a group. Every
+/// group size writes the same bytes.
 #[test]
 fn band_batches_are_collected_in_groups() {
     let input = tempfile::NamedTempFile::new().unwrap();
@@ -2259,7 +2264,7 @@ fn band_batches_are_collected_in_groups() {
         layer_name: "ref".to_string(),
         ..Default::default()
     };
-    let run = |threads: usize, opts: &ExportOptions| {
+    let run = |threads: usize, opts: &ExportOptions, available: u64| {
         let out = tempfile::NamedTempFile::new().unwrap();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -2271,36 +2276,85 @@ fn band_batches_are_collected_in_groups() {
                 out.path(),
                 opts,
                 DEFAULT_PARTITION_TARGET,
-                &knobs(false, None, false),
+                &Pass2Knobs {
+                    budget_available: Some(available),
+                    ..knobs(false, None, false)
+                },
             )
             .unwrap()
         });
         (run.work, std::fs::read(out.path()).unwrap())
     };
-    let (wide, wide_bytes) = run(64, &opts);
+    let (ample, tight) = (100 << 30, 1 << 30);
+    let (wide, wide_bytes) = run(64, &opts, ample);
     assert_eq!(wide.collect_batches, 3, "20,000 rows in 8,192-row batches");
     assert_eq!(
         wide.collect_groups, 1,
-        "64 threads collect up to 32,768 rows per group"
+        "64 threads collect up to 131,072 rows per group"
     );
     assert_eq!(
         wide.band_reads_on_consumer, 0,
         "a one-segment read ran on the collecting thread"
     );
-    let (one, one_bytes) = run(1, &opts);
+    let (one, one_bytes) = run(1, &opts, ample);
     assert_eq!(one.collect_groups, 3, "one thread collects batch by batch");
     assert!(wide_bytes == one_bytes, "grouping changed the archive");
+    let (eight, eight_bytes) = run(8, &opts, ample);
+    assert_eq!(
+        eight.collect_groups, 2,
+        "8 threads collect 16,384 rows a group"
+    );
+    assert!(
+        eight_bytes == one_bytes,
+        "2,048-row groups changed the archive"
+    );
+    let (small, small_bytes) = run(8, &opts, tight);
+    assert_eq!(
+        small.collect_groups, 3,
+        "a tight auto budget keeps 512 rows per thread a group"
+    );
+    assert!(
+        small_bytes == one_bytes,
+        "512-row groups changed the archive"
+    );
     let bounded = ExportOptions {
         profile: MemoryProfile::Bounded,
         ..opts.clone()
     };
-    let (tight, tight_bytes) = run(64, &bounded);
+    let (tight, tight_bytes) = run(64, &bounded, ample);
     assert_eq!(tight.collect_groups, 3, "bounded collects batch by batch");
     assert_eq!(
         tight.collect_overlaps, 0,
         "bounded held two clipped groups at once"
     );
     assert!(tight_bytes == one_bytes, "bounded changed the archive");
+}
+
+/// #876: the group's size per profile. `speed` and an `auto` budget that
+/// holds two full groups gather 2,048 rows per thread under 4x the reader's
+/// batch byte cap; a tighter `auto` budget scales down to 512 rows per
+/// thread and one batch cap, never below; `bounded` takes one batch.
+#[test]
+fn collect_group_size_follows_the_profile_and_budget() {
+    let threads = rayon::current_num_threads();
+    let limit = usize::try_from(tylertoo_io::decoded_batch_limit()).unwrap();
+    let size = |profile, available: Option<u64>| {
+        let g = CollectGroup::sized(profile, &MemoryBudget::with_available(available));
+        (g.max_rows, g.max_bytes)
+    };
+    let full = (2_048 * threads, 4 * limit);
+    assert_eq!(size(MemoryProfile::Speed, Some(1 << 30)), full);
+    assert_eq!(size(MemoryProfile::Auto, Some(100 << 30)), full);
+    assert_eq!(
+        size(MemoryProfile::Auto, Some(9 << 29)),
+        (1_024 * threads, 2 * limit)
+    );
+    assert_eq!(
+        size(MemoryProfile::Auto, Some(1 << 30)),
+        (512 * threads, limit)
+    );
+    assert_eq!(size(MemoryProfile::Auto, Some(1)), (512 * threads, limit));
+    assert_eq!(size(MemoryProfile::Bounded, Some(100 << 30)), (1, limit));
 }
 
 /// #817: a collect group closes before a batch that would take it past
@@ -2316,8 +2370,11 @@ fn collect_groups_stay_within_the_byte_cap() {
         )])
         .unwrap()
     };
-    let mut group = CollectGroup::new(100);
-    group.max_bytes = 64;
+    let mut group = CollectGroup {
+        max_rows: 100,
+        max_bytes: 64,
+        ..CollectGroup::sized(MemoryProfile::Speed, &MemoryBudget::with_available(None))
+    };
     let mut flushed: Vec<Vec<usize>> = Vec::new();
     let mut flush = |b: Vec<RecordBatch>| {
         flushed.push(b.iter().map(RecordBatch::num_rows).collect());
@@ -2330,7 +2387,7 @@ fn collect_groups_stay_within_the_byte_cap() {
     let pending: Vec<usize> = group.batches.iter().map(RecordBatch::num_rows).collect();
     assert_eq!(pending, [5, 90], "under both caps: still gathering");
     // bounded: one batch a group.
-    let mut one = CollectGroup::new(collect_group_rows(MemoryProfile::Bounded));
+    let mut one = CollectGroup::sized(MemoryProfile::Bounded, &MemoryBudget::with_available(None));
     let mut sizes = Vec::new();
     for rows in [3, 1, 2] {
         one.push(batch(rows), 8, &mut |b| {

@@ -233,11 +233,11 @@ pub(super) fn collect_into(
     // PERF (#817): a group's ordered finish (the gap walk, member routing
     // and the sink appends) runs alongside the next group's decode and clip,
     // so the pool is not idle while this thread walks the rows.
-    let mut group = CollectGroup::new(collect_group_rows(ctx.band.profile));
+    let mut group = CollectGroup::sized(ctx.band.profile, &ctx.band.budget);
     let mut clipped: Option<ClippedGroup> = None;
     let rows = &mut rows;
     // `bounded` finishes each group before clipping the next, so it never
-    // holds two groups' geometry and members: that overlap is not budgeted.
+    // holds two groups' geometry and members ([`COLLECT_GROUPS_HELD`]).
     let overlap = !matches!(ctx.band.profile, MemoryProfile::Bounded);
     let mut step = |batches: Vec<RecordBatch>| -> Result<(), ExportError> {
         if !overlap {
@@ -371,9 +371,8 @@ pub(super) struct FinishTrace {
 }
 
 /// The batches [`collect_into`] gathers before one [`clip_group`]: up to
-/// `max_rows` rows, and never past one reader batch's decoded-byte cap
-/// ([`tylertoo_io::decoded_batch_limit`]) unless a single batch is that
-/// large on its own, so grouping holds no more than the reader allows.
+/// `max_rows` rows, and never past `max_bytes` decoded unless a single
+/// batch is that large on its own ([`Self::sized`]).
 pub(super) struct CollectGroup {
     pub(super) batches: Vec<RecordBatch>,
     pub(super) rows: usize,
@@ -383,13 +382,50 @@ pub(super) struct CollectGroup {
 }
 
 impl CollectGroup {
-    pub(super) fn new(max_rows: usize) -> Self {
+    /// The empty group [`collect_into`] gathers under `profile`, priced
+    /// against `budget`: [`COLLECT_GROUP_ROWS_PER_THREAD`] rows per pool
+    /// thread under [`COLLECT_GROUP_SCALE`] reader batch byte caps
+    /// ([`tylertoo_io::decoded_batch_limit`]) at full size, cut by whole
+    /// steps of a quarter to what the budget holds. `bounded` takes each read
+    /// batch on its own.
+    ///
+    /// The bound (#876): a non-`bounded` fill holds [`COLLECT_GROUPS_HELD`]
+    /// groups at once (one clipped, one gathering), so `auto` sizes them so
+    /// that two groups at their byte cap fit the read share of `budget`'s
+    /// allowance ([`MemoryPhase::Read`]), never below a quarter of full size
+    /// (512 rows per thread under one byte cap, the group before #876);
+    /// `speed` takes full size. Each reader's read-ahead is one group
+    /// ([`read_band`]), which the read shape already fits to the same share.
+    ///
+    /// shortcut: neither the groups nor the read-ahead are charged as a
+    /// grant: they are sized from the band's budget as the levels start,
+    /// so the levels of a group that fill at once each size from the same
+    /// figure; the clipped members' growth past their decoded rows and the
+    /// quarter-size floor are not priced. Charge a grant per fill if a
+    /// tight-budget profile shows the fill's peak RSS past its share.
+    pub(super) fn sized(profile: MemoryProfile, budget: &MemoryBudget) -> Self {
+        let limit = usize::try_from(tylertoo_io::decoded_batch_limit()).unwrap_or(usize::MAX);
+        let (max_rows, max_bytes) = match profile {
+            MemoryProfile::Bounded => (1, limit),
+            MemoryProfile::Auto | MemoryProfile::Speed => {
+                let price = Price::model(limit as u64);
+                let scale = (budget.affordable(profile, MemoryPhase::Read, price)
+                    / COLLECT_GROUPS_HELD)
+                    .clamp(1, COLLECT_GROUP_SCALE);
+                (
+                    (COLLECT_GROUP_ROWS_PER_THREAD / COLLECT_GROUP_SCALE)
+                        .saturating_mul(scale)
+                        .saturating_mul(rayon::current_num_threads()),
+                    limit.saturating_mul(scale),
+                )
+            }
+        };
         Self {
             batches: Vec::new(),
             rows: 0,
             bytes: 0,
             max_rows,
-            max_bytes: usize::try_from(tylertoo_io::decoded_batch_limit()).unwrap_or(usize::MAX),
+            max_bytes,
         }
     }
 
@@ -452,7 +488,9 @@ pub(super) fn read_band(
 ) -> Result<(), ExportError> {
     // The collect takes a group at a time, so each reader needs about one
     // group queued, not the budget's depth: concurrent levels each read.
-    let ahead = collect_group_rows(band.profile).div_ceil(EXPORT_BATCH_SIZE);
+    let ahead = CollectGroup::sized(band.profile, &band.budget)
+        .max_rows
+        .div_ceil(EXPORT_BATCH_SIZE);
     #[cfg(test)]
     let consumer = std::thread::current().id();
     // The read runs on its own thread: with one reader (few cores, a tight
@@ -619,22 +657,29 @@ pub(super) fn read_error(e: ConvertError) -> ExportError {
 }
 
 /// Rows per pool thread that [`collect_into`] gathers, in whole batches,
-/// before one [`clip_group`] and [`finish_group`]: 64 threads collect four
-/// 8,192-row batches at a time, 16 threads one. Each group holds its
-/// batches and their members until it is merged.
-pub(super) const COLLECT_GROUP_ROWS_PER_THREAD: usize = 512;
+/// before one [`clip_group`] and [`finish_group`], at full size
+/// ([`CollectGroup::sized`]): 64 threads collect sixteen 8,192-row batches
+/// at a time, 4 threads one. Each group holds its batches and their
+/// members until it is merged.
+///
+/// PERF (#876): 4x the 512 rows (and [`COLLECT_GROUP_SCALE`] byte caps)
+/// of #817, as fewer, larger groups cut the joins and ordered finishes
+/// per row. Swept at 40 threads under a 100 GiB limit, 4 balanced pairs,
+/// output byte-identical in every run: x4 took FTW Brazil MT 21.13 ->
+/// 19.56 s (-7.7%) and NZ parcels -1.8% for +0.25 / +0.35 GB peak RSS;
+/// x8 gained -8.1% / -2.6% for +0.6 / +0.4 GB and x16 -6.9% / -2.2% for
+/// +1.3 / +0.9 GB, so x4.
+pub(super) const COLLECT_GROUP_ROWS_PER_THREAD: usize = 2_048;
 
-/// The rows [`collect_into`] gathers per group on this pool. `bounded`
-/// takes each read batch on its own: the groups' decoded and clipped rows
-/// are not priced in the budget.
-pub(super) fn collect_group_rows(profile: MemoryProfile) -> usize {
-    match profile {
-        MemoryProfile::Bounded => 1,
-        MemoryProfile::Auto | MemoryProfile::Speed => {
-            COLLECT_GROUP_ROWS_PER_THREAD.saturating_mul(rayon::current_num_threads())
-        }
-    }
-}
+/// Reader batch byte caps ([`tylertoo_io::decoded_batch_limit`]) a
+/// full-size group may hold: 4, raised with
+/// [`COLLECT_GROUP_ROWS_PER_THREAD`] (#876) so the bytes do not close a
+/// group of wide rows first. Also the steps `auto` cuts a group in.
+const COLLECT_GROUP_SCALE: usize = 4;
+
+/// Groups a non-`bounded` [`collect_into`] holds at once: the clipped one
+/// it finishes and the one it gathers and clips meanwhile.
+const COLLECT_GROUPS_HELD: usize = 2;
 
 /// The wave partition owning `key`. The wave's partitions are contiguous,
 /// disjoint, ascending `[key_lo, key_hi]` ranges, and every emitted key was
@@ -876,7 +921,7 @@ pub(super) type TileMembers = Vec<(u64, MemberGeom)>;
 /// merged in row order, so every bucket holds the same members in the same
 /// order as the serial loop gave.
 ///
-/// PERF (#817): the batches of a group ([`COLLECT_GROUP_ROWS_PER_THREAD`])
+/// PERF (#817): the batches of a group ([`CollectGroup::sized`])
 /// share each parallel step, so a 64-thread pool joins once per group, not
 /// once per 8,192-row batch, whose joins would leave the pool spinning.
 /// Batches and their chunks are still merged in row order.
