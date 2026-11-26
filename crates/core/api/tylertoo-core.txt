@@ -620,6 +620,12 @@ pub tylertoo_core::Diagnostic::Advisory::count: usize
 pub tylertoo_core::Diagnostic::Advisory::message: alloc::string::String
 #[non_exhaustive] pub tylertoo_core::Diagnostic::AntimeridianSuspect
 pub tylertoo_core::Diagnostic::AntimeridianSuspect::count: usize
+#[non_exhaustive] pub tylertoo_core::Diagnostic::AssignMemoryUnderestimated
+pub tylertoo_core::Diagnostic::AssignMemoryUnderestimated::count: usize
+pub tylertoo_core::Diagnostic::AssignMemoryUnderestimated::input: alloc::string::String
+pub tylertoo_core::Diagnostic::AssignMemoryUnderestimated::observed_bytes: u64
+pub tylertoo_core::Diagnostic::AssignMemoryUnderestimated::parts: usize
+pub tylertoo_core::Diagnostic::AssignMemoryUnderestimated::predicted_bytes: u64
 #[non_exhaustive] pub tylertoo_core::Diagnostic::ClipGuardDropped
 pub tylertoo_core::Diagnostic::ClipGuardDropped::count: usize
 #[non_exhaustive] pub tylertoo_core::Diagnostic::CoveringRejected

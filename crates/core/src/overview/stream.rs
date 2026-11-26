@@ -142,7 +142,8 @@ type StreamChunk = (FeatureTable, Vec<f32>, usize, usize);
 /// # Errors
 ///
 /// The held batch's assignment error, which comes first in row order.
-fn scan_while_assigning<T: Send>(
+fn scan_and_assign<T: Send>(
+    ctx: &Pass1Ctx<'_>,
     stream: Option<&mut StreamAssigner>,
     held: &mut Vec<StreamChunk>,
     ranges: &[(usize, usize)],
@@ -150,17 +151,19 @@ fn scan_while_assigning<T: Send>(
 ) -> Result<Vec<T>, ConvertError> {
     let (scanned, assigned) = rayon::join(
         || ranges.par_iter().map(scan).collect(),
-        || push_held(stream, held),
+        || push_held(stream, held, ctx.diagnostics),
     );
     assigned?;
     held.clear();
     Ok(scanned)
 }
 
-/// #928: assign the held batch, if the streamed path is on.
+/// #928: assign the held batch, if the streamed path is on, and record
+/// the warning that its maps outgrew the preflight's prediction.
 fn push_held(
     stream: Option<&mut StreamAssigner>,
     held: &[StreamChunk],
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), ConvertError> {
     let Some(stream) = stream else {
         return Ok(());
@@ -169,7 +172,11 @@ fn push_held(
         .iter()
         .map(|(f, a, b, r)| (f, a.as_slice(), *b, *r))
         .collect();
-    stream.push_batch(&refs)
+    let pushed = stream.push_batch(&refs);
+    if let Some(warning) = stream.take_warning() {
+        diagnostics.once(warning);
+    }
+    pushed
 }
 
 struct WriterProvenance<'a> {
@@ -6750,7 +6757,7 @@ fn run_pass1_with_chunk_rows(
                 // bounds that) before the scratch is released.
                 let collect_lines = lines.mode;
                 let chunk_results =
-                    scan_while_assigning(stream.as_mut(), &mut held, &ranges, |&(start, len)| {
+                    scan_and_assign(ctx, stream.as_mut(), &mut held, &ranges, |&(start, len)| {
                         // Slice only the geometry column: slicing the batch
                         // would touch every column's offsets for nothing.
                         let gcol = batch.column(gcol_idx).slice(start, len);
@@ -6829,7 +6836,7 @@ fn run_pass1_with_chunk_rows(
                 )?;
                 Pass1Timers::add(&timers_ref.keys, t_keys);
             }
-            push_held(stream.as_mut(), &held)
+            push_held(stream.as_mut(), &held, ctx.diagnostics)
         },
     )?;
 
@@ -6925,7 +6932,7 @@ fn pass1_tables(
 /// taken, once.
 fn stream_assigner(ctx: &Pass1Ctx<'_>, rows: u64) -> Result<Option<StreamAssigner>, ConvertError> {
     use super::assign_stream as sa;
-    let (kinds, spans, bytes_per_row) = match ctx.assign {
+    let (kinds, spans, bytes_per_row, map_bytes) = match ctx.assign {
         AssignPath::Table(reason) => {
             sa::record_path(false);
             log::info!("[assign] level assignment path: table ({reason})");
@@ -6935,7 +6942,8 @@ fn stream_assigner(ctx: &Pass1Ctx<'_>, rows: u64) -> Result<Option<StreamAssigne
             kinds,
             spans,
             bytes_per_row,
-        } => (*kinds, spans, *bytes_per_row),
+            map_bytes,
+        } => (*kinds, spans, *bytes_per_row, *map_bytes),
     };
     let options = ctx.config.options();
     let level_specs = options.levels.resolve(options.gsd_base)?;
@@ -6945,7 +6953,7 @@ fn stream_assigner(ctx: &Pass1Ctx<'_>, rows: u64) -> Result<Option<StreamAssigne
         "[assign] level assignment path: streamed ({kinds:?}, {} level(s), priced at {bytes_per_row} B/row)",
         level_specs.len()
     );
-    let assigner = StreamAssigner::new(
+    let mut assigner = StreamAssigner::new(
         kinds,
         options,
         &level_specs,
@@ -6953,6 +6961,7 @@ fn stream_assigner(ctx: &Pass1Ctx<'_>, rows: u64) -> Result<Option<StreamAssigne
         ctx.crs,
         (usize::try_from(rows).unwrap_or(0), spans),
     );
+    assigner.watch_estimate(map_bytes, ctx.source.root_path(), ctx.source.parts().len());
     let bounded = spans.iter().filter(|s| s.bounds.is_some()).count();
     if assigner.evicts() {
         log::info!(
@@ -11625,6 +11634,136 @@ pub(super) mod tests {
     /// every v1 config shape, whatever the chunking and the thread count.
     /// 40 000 features is above the sharded winner build's cutoff
     /// (`WINNER_CHUNK_FEATURES`) and the parallel fold's (4096 rows).
+    /// #928 review: a corridor of dense, sorted lines whose row groups each
+    /// carry one far outlier, then a late long line over the whole
+    /// corridor. The outliers make each group's bounds tall, so the area
+    /// share predicts that almost no corridor cell outlives its group, but
+    /// the late line's bounds keep every one of them open to the end. The
+    /// run must say its memory estimate was low.
+    #[test]
+    fn maps_past_the_prediction_warn_once() {
+        use super::super::assign_stream::{GroupSpan, KindSet, StreamGate};
+        const GROUPS: usize = 40;
+        const PER_GROUP: usize = 10_000;
+        let mut options = ConvertOptions {
+            levels: LevelPlan::Gsds(vec![2.0, 1.0, 0.5]),
+            coalesce_lines: false,
+            ..Default::default()
+        };
+        options.assign.line_visibility = 0.0;
+        let line = |index: usize, bbox: [f64; 4]| AssignFeature {
+            index,
+            bbox,
+            kind: FeatureKind::Line,
+            sort_key: None,
+            entry_level: None,
+        };
+        // Corridor lines 3 m apart, so each holds its own cell at both
+        // coarse levels (2 m and 1 m), plus one outlier 100 km north.
+        let mut groups: Vec<Vec<AssignFeature>> = (0..GROUPS)
+            .map(|g| {
+                let x0 = (g * PER_GROUP) as f64 * 3.0;
+                let mut rows = vec![line(0, [x0, 1e5, x0 + 1.5, 1e5 + 0.5])];
+                rows.extend((0..PER_GROUP).map(|k| {
+                    let x = x0 + k as f64 * 3.0;
+                    line(k + 1, [x, 0.0, x + 1.5, 0.5])
+                }));
+                rows
+            })
+            .collect();
+        let extent = (GROUPS * PER_GROUP) as f64 * 3.0;
+        groups.push(vec![line(0, [0.0, 0.0, extent, 1.0])]);
+        let spans: Vec<GroupSpan> = groups
+            .iter()
+            .map(|rows| GroupSpan {
+                rows: rows.len(),
+                bounds: rows.iter().map(|f| f.bbox).reduce(|a, b| {
+                    [
+                        a[0].min(b[0]),
+                        a[1].min(b[1]),
+                        a[2].max(b[2]),
+                        a[3].max(b[3]),
+                    ]
+                }),
+            })
+            .collect();
+        let rows: usize = spans.iter().map(|s| s.rows).sum();
+        let level_specs = options.levels.resolve(options.gsd_base).unwrap();
+        let reprs =
+            super::super::convert::level_representations(&level_specs, &options.representation);
+        let lines = KindSet {
+            polygons: false,
+            lines: true,
+        };
+        let gate = StreamGate {
+            options: &options,
+            declared: Some(lines),
+            size_fallback_ranking: true,
+            accumulate_columns: false,
+            shared_nodes: false,
+            level_reprs: &reprs,
+            line_widths: vec![2.0, 1.0],
+            patch_widths: vec![],
+            bounded_profile: false,
+        };
+        let AssignPath::Streamed { map_bytes, .. } =
+            AssignPath::decide(&gate, rows as u64, spans.clone())
+        else {
+            panic!("the corridor's prediction must admit the streamed path");
+        };
+        let mut assigner = StreamAssigner::new(
+            lines,
+            &options,
+            &level_specs,
+            &reprs,
+            Crs::Epsg3857,
+            (rows, &spans),
+        );
+        assigner.watch_estimate(map_bytes, "corridor.parquet".into(), 1);
+        let tables: Vec<FeatureTable> = groups.iter().map(|g| table(g)).collect();
+        let areas = vec![0.0f32; PER_GROUP + 1];
+        let mut warnings = Vec::new();
+        let mut base = 0;
+        for batch in tables.chunks(3) {
+            let refs: Vec<ChunkRef<'_>> = batch
+                .iter()
+                .map(|t| {
+                    let chunk = (t, &areas[..t.len()], base, t.len());
+                    base += t.len();
+                    chunk
+                })
+                .collect();
+            assigner.push_batch(&refs).unwrap();
+            warnings.extend(assigner.take_warning());
+        }
+        let peak_bytes = assigner.finish(rows).memory.cells as u64 * 100;
+        assert!(
+            peak_bytes > 4 * map_bytes,
+            "the corridor must outgrow its prediction: {peak_bytes} B live, {map_bytes} B predicted"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let crate::diagnostics::Diagnostic::AssignMemoryUnderestimated {
+            predicted_bytes,
+            observed_bytes,
+            ..
+        } = &warnings[0]
+        else {
+            panic!("{:?}", warnings[0]);
+        };
+        assert_eq!(*predicted_bytes, map_bytes);
+        assert!(*observed_bytes > 64 << 20 && *observed_bytes <= peak_bytes);
+        assert!(
+            warnings[0].is_user_warning(),
+            "Python raises it as a UserWarning"
+        );
+        let message = warnings[0].to_string();
+        assert!(
+            message.contains("memory estimate was low")
+                && message.contains("gpio sort hilbert 'corridor.parquet'"),
+            "{message}"
+        );
+    }
+
     /// #928 review: at an extreme `line_thinning` the cell index saturates
     /// at `i64::MAX`, so two far-apart lines share a key whose cell cannot
     /// be mapped back to coordinates. Evicting it after the first group

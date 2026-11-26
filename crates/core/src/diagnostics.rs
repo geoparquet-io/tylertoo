@@ -185,6 +185,18 @@ pub enum Diagnostic {
         parts: usize,
         ratio: f64,
     },
+    /// The streamed level assignment's working maps outgrew the preflight's
+    /// prediction from the row-group bounds by 4x or more (#928): rows
+    /// crowd where later row groups' bounds overlap. Both sizes are bytes;
+    /// `input` is the input's root path.
+    #[non_exhaustive]
+    AssignMemoryUnderestimated {
+        count: usize,
+        input: String,
+        parts: usize,
+        predicted_bytes: u64,
+        observed_bytes: u64,
+    },
     /// The `--valve-scope smooth|zoom` predictor (`predictor`), or the
     /// floors it set, outgrew the export's memory budget, and the export
     /// fell back to `tile` (#768). `scope` is the `--valve-scope` asked for.
@@ -324,6 +336,7 @@ macro_rules! event_count {
             | Self::SharedBordersUnpinned { count }
             | Self::ValveFloorsShed { count, .. }
             | Self::UnsortedInput { count, .. }
+            | Self::AssignMemoryUnderestimated { count, .. }
             | Self::PyramidSharedTiles { count }
             | Self::PyramidSkippedTiles { count }
             | Self::PyramidMissingBounds { count }
@@ -351,7 +364,10 @@ impl Diagnostic {
     pub fn is_user_warning(&self) -> bool {
         matches!(
             self,
-            Self::DiskShortage { .. } | Self::UnsortedInput { .. } | Self::ValveFloorsShed { .. }
+            Self::DiskShortage { .. }
+                | Self::UnsortedInput { .. }
+                | Self::ValveFloorsShed { .. }
+                | Self::AssignMemoryUnderestimated { .. }
         )
     }
     fn count_mut(&mut self) -> &mut usize {
@@ -535,11 +551,12 @@ impl fmt::Display for Diagnostic {
             }
             Self::UnsortedInput {input,parts,ratio,..} => {
                 write!(f, "the input is not sorted by location: consecutive rows lie {ratio:.1}x farther apart on average than in spatially sorted data. tylertoo keeps the input's row order, so tiles over the size cap will merge or drop features unevenly and may show stripes. Sort the input first: ")?;
-                if *parts > 1 {
-                    write!(f, "run `gpio sort hilbert <part> <sorted part>` on each of the {parts} files under {}", gpio_inspect_arg(input))
-                } else {
-                    write!(f, "`gpio sort hilbert {} {}`", gpio_inspect_arg(input), gpio_inspect_arg(&hilbert_output(input)))
-                }
+                f.write_str(&sort_advice(input, *parts))
+            }
+            Self::AssignMemoryUnderestimated {input,parts,predicted_bytes,observed_bytes,..} => {
+                let mib = |b: u64| b as f64 / f64::from(1u32 << 20);
+                write!(f, "the level assignment's working maps reached {:.0} MiB, over 4x the {:.0} MiB the preflight predicted from the input's row-group bounds: the memory estimate was low for this input's row-group layout, which crowds rows where later row groups overlap, so the run may need more memory than the preflight priced. Sort the input by location: ", mib(*observed_bytes), mib(*predicted_bytes))?;
+                f.write_str(&sort_advice(input, *parts))
             }
             Self::PyramidSharedTiles {..} => write!(f, "{n} tile(s) shared across bands; counted once in the merged archive"),
             Self::PyramidSkippedTiles {..} => write!(f, "{n} tile(s) outside their band's declared zoom range skipped"),
@@ -797,6 +814,7 @@ impl Diagnostics {
                     Diagnostic::MemoryBudget { .. }
                         | Diagnostic::Advisory { .. }
                         | Diagnostic::DiskShortage { .. }
+                        | Diagnostic::AssignMemoryUnderestimated { .. }
                 )
             })
             .collect()
@@ -938,6 +956,23 @@ pub fn write_report(path: &std::path::Path, report: &impl Serialize) -> Result<(
     writer.flush()?;
     drop(writer);
     pending.publish()
+}
+
+/// The `gpio sort hilbert` command for `input` (#768), per file when it has
+/// several `parts`.
+fn sort_advice(input: &str, parts: usize) -> String {
+    if parts > 1 {
+        format!(
+            "run `gpio sort hilbert <part> <sorted part>` on each of the {parts} files under {}",
+            gpio_inspect_arg(input)
+        )
+    } else {
+        format!(
+            "`gpio sort hilbert {} {}`",
+            gpio_inspect_arg(input),
+            gpio_inspect_arg(&hilbert_output(input))
+        )
+    }
 }
 
 /// Where the `gpio sort hilbert` hint writes: `<stem>-hilbert.parquet`
@@ -1108,13 +1143,22 @@ mod tests {
             limit: 10,
         });
         sink.record(Diagnostic::NonFiniteGeometry { count: 2 });
+        // #928: a streamed run's memory warning, so a plan saved by it
+        // matches the table path's byte for byte.
+        sink.record(Diagnostic::AssignMemoryUnderestimated {
+            count: 1,
+            input: "in.parquet".into(),
+            parts: 1,
+            predicted_bytes: 1,
+            observed_bytes: 2,
+        });
         assert_eq!(
             sink.snapshot_for_plan(),
             vec![Diagnostic::NonFiniteGeometry { count: 2 }]
         );
         assert_eq!(
             sink.snapshot().len(),
-            2,
+            3,
             "reports retain the run's memory advice"
         );
     }

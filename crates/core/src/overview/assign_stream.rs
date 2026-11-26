@@ -32,6 +32,7 @@ use super::assign::{
 use super::convert::{ConvertError, ConvertOptions, Pass1Price};
 use super::level::Crs;
 use super::simplify::Representation;
+use crate::diagnostics::Diagnostic;
 
 #[cfg(test)]
 thread_local! {
@@ -194,6 +195,9 @@ pub(super) enum AssignPath {
         /// What the path keeps resident per input row
         /// ([`streamed_bytes_per_row`]).
         bytes_per_row: u64,
+        /// The predicted peak bytes of the line cell and patch maps, which
+        /// the run checks itself against ([`StreamAssigner::watch_estimate`]).
+        map_bytes: u64,
     },
 }
 
@@ -259,9 +263,16 @@ impl AssignPath {
             kinds,
             spans,
             bytes_per_row: streamed_bytes_per_row(base, per_row(cells), evict.is_some(), carriers),
+            map_bytes: cells
+                .saturating_add(patches)
+                .saturating_mul(MAP_ENTRY_BYTES),
         }
     }
 }
+
+/// The largest cell index [`grown_cell`] maps back exactly: past it, a cell
+/// stays open to the end of the stream.
+const EXACT_INDEX: f64 = (1u64 << 52) as f64;
 
 /// One live cell or patch: its map slot at peak capacity (measured 57 B for
 /// both) and its due-list entry (measured 35 B), rounded up.
@@ -467,9 +478,10 @@ impl Eviction {
     /// its bounds a group's rows lie, so each shared region keeps its share
     /// of the group's rows by area: overlapping, unsorted groups keep about
     /// all of them, sorted groups a thin edge. A group with more than
-    /// [`Self::NEIGHBOURS`] later neighbours at a level, or followed by an
-    /// unbounded group, keeps all its entries to the end, which caps the
-    /// cost on unsorted input; an unbounded group keeps one per row.
+    /// [`Self::NEIGHBOURS`] later neighbours at a level, followed by an
+    /// unbounded group, or with cell indices past [`EXACT_INDEX`] there
+    /// keeps all its entries to the end, which caps the cost on unsorted
+    /// input; an unbounded group keeps one per row.
     fn predicted_peak(&self, widths: &[f64]) -> u64 {
         let n = self.ends.len();
         let widths: Vec<f64> = widths
@@ -512,6 +524,17 @@ impl Eviction {
             let later_unbounded = self.last_unbounded.get(g + 1).copied().flatten();
             for &w in &widths {
                 let (open, kept, last) = match self.bounds[g] {
+                    // Indices past [`EXACT_INDEX`] keep their cells to the end
+                    // (`grown_cell`); one cell of margin covers `floor` and
+                    // the 1e-6 the bounds grew by.
+                    Some(b)
+                        if b.iter().any(|v| {
+                            !(v / w).is_finite() || (v / w).abs() + 2.0 >= EXACT_INDEX
+                        }) =>
+                    {
+                        let open = rows.min(cells(b, w));
+                        (open, open, n - 1)
+                    }
                     Some(b) => {
                         let open = rows.min(cells(b, w));
                         let reach = 3.0 * w;
@@ -677,8 +700,19 @@ pub(super) struct StreamAssigner {
     live_cells: usize,
     peak_patches: usize,
     live_patches: usize,
+    /// The preflight's map prediction, until the maps outgrow it.
+    estimate: Option<Estimate>,
+    /// The warning that they did, until the caller records it.
+    low_estimate: Option<Diagnostic>,
     /// `[profile]` split: placement, level contests, scheduling.
     timers: [std::time::Duration; 3],
+}
+
+/// The preflight's predicted map bytes, and the input the warning names.
+struct Estimate {
+    map_bytes: u64,
+    input: String,
+    parts: usize,
 }
 
 impl StreamAssigner {
@@ -733,7 +767,42 @@ impl StreamAssigner {
             live_cells: 0,
             peak_patches: 0,
             live_patches: 0,
+            estimate: None,
+            low_estimate: None,
             timers: Default::default(),
+        }
+    }
+
+    /// Warn, once, when the live maps outgrow `map_bytes` (the preflight's
+    /// prediction) by 4x and [`SMALL_MAPS`]: the area-share estimate
+    /// ([`Eviction::predicted_peak`]) misread where `input`'s rows lie.
+    pub(super) fn watch_estimate(&mut self, map_bytes: u64, input: String, parts: usize) {
+        self.estimate = Some(Estimate {
+            map_bytes,
+            input,
+            parts,
+        });
+    }
+
+    /// The [`Self::watch_estimate`] warning, once it fired.
+    pub(super) fn take_warning(&mut self) -> Option<Diagnostic> {
+        self.low_estimate.take()
+    }
+
+    fn check_estimate(&mut self) {
+        let Some(estimate) = &self.estimate else {
+            return;
+        };
+        let live = ((self.live_cells + self.live_patches) as u64).saturating_mul(MAP_ENTRY_BYTES);
+        if live > SMALL_MAPS.max(estimate.map_bytes.saturating_mul(4)) {
+            let estimate = self.estimate.take().expect("checked above");
+            self.low_estimate = Some(Diagnostic::AssignMemoryUnderestimated {
+                count: 1,
+                input: estimate.input,
+                parts: estimate.parts,
+                predicted_bytes: estimate.map_bytes,
+                observed_bytes: live,
+            });
         }
     }
 
@@ -900,6 +969,7 @@ impl StreamAssigner {
                 .unwrap_or(usize::MAX);
             let b = a + rows[a..].partition_point(|(r, _, _)| r.index < group_end);
             self.assign_segment(&rows[a..b]);
+            self.check_estimate();
             a = b;
         }
         Ok(())
@@ -1119,7 +1189,7 @@ impl StreamAssigner {
 /// past 2^52 (a saturated `floor(c / w) as i64`, or one `f64` cannot
 /// hold), or a non-finite result. Such a cell then stays open to the end.
 fn grown_cell(ix: i64, iy: i64, w: f64) -> [f64; 4] {
-    const EXACT: u64 = 1 << 52;
+    const EXACT: u64 = EXACT_INDEX as u64;
     let (x, y) = (ix as f64 * w, iy as f64 * w);
     let rect = [x - w, y - w, x + 2.0 * w, y + 2.0 * w];
     if ix.unsigned_abs() >= EXACT
@@ -1252,6 +1322,16 @@ mod tests {
     /// The path for `declared` kinds over `spans`, with one coarse level
     /// whose line cells and patches are 1 unit wide.
     fn decide(declared: KindSet, spans: Vec<GroupSpan>, bounded_profile: bool) -> AssignPath {
+        decide_at(declared, spans, bounded_profile, 1.0)
+    }
+
+    /// [`decide`] with line cells and patches `width` units wide.
+    fn decide_at(
+        declared: KindSet,
+        spans: Vec<GroupSpan>,
+        bounded_profile: bool,
+        width: f64,
+    ) -> AssignPath {
         let options = eligible();
         let gate = StreamGate {
             options: &options,
@@ -1260,8 +1340,8 @@ mod tests {
             accumulate_columns: false,
             shared_nodes: false,
             level_reprs: &[],
-            line_widths: vec![1.0],
-            patch_widths: vec![1.0],
+            line_widths: vec![width],
+            patch_widths: vec![width],
             bounded_profile,
         };
         let rows = spans.iter().map(|s| s.rows as u64).sum();
@@ -1358,6 +1438,25 @@ mod tests {
         assert!(matches!(
             decide(POLYS, big(spans(100, sorted)), true),
             AssignPath::Streamed { .. }
+        ));
+    }
+
+    /// #928 review: cell indices past 2^52 keep every cell open to the end
+    /// (`grown_cell`), so disjoint, sorted groups that would evict at a
+    /// coarser width are priced through EOF and take the table path.
+    #[test]
+    fn cells_past_exact_indices_are_priced_to_the_end() {
+        let sorted = |g: usize| {
+            let x = 1e7 + 10.0 * g as f64;
+            Some([x, 1e7, x + 1.0, 1e7 + 1.0])
+        };
+        assert!(matches!(
+            decide_at(LINES, big(spans(100, sorted)), false, 1.0),
+            AssignPath::Streamed { .. }
+        ));
+        assert!(matches!(
+            decide_at(LINES, big(spans(100, sorted)), false, 1e-9),
+            AssignPath::Table(_)
         ));
     }
 
