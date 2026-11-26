@@ -36,7 +36,10 @@ use crate::batch_processor::{
 };
 use crate::input_set::{ConvertSource, RowGroupSelection};
 
-use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
+use super::accumulate::{
+    carrier_rows_fit, is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel,
+    CarrierRow,
+};
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
 };
@@ -1309,10 +1312,14 @@ fn build_carriers(
     level_specs: &[(f64, Option<u8>)],
     level_reprs: &[Representation],
     crs: Crs,
-) -> Vec<Vec<usize>> {
+) -> Result<Vec<Vec<CarrierRow>>, ConvertError> {
     let acc_levels = accumulate_levels(options, level_specs, level_reprs);
     if !acc_levels.iter().any(|l| l.enabled) {
-        return vec![Vec::new(); level_specs.len()];
+        return Ok(vec![Vec::new(); level_specs.len()]);
+    }
+    let rows = features.indices().last().map_or(0, |&i| i + 1);
+    if !carrier_rows_fit(rows) {
+        return Err(too_many_carrier_rows(rows));
     }
     let t = Instant::now();
     let carriers = tiny_polygon_carriers(
@@ -1330,7 +1337,22 @@ fn build_carriers(
         acc_levels.iter().filter(|l| l.enabled).count(),
         t.elapsed().as_secs_f64()
     );
-    carriers
+    Ok(carriers
+        .into_iter()
+        .map(|level| level.into_iter().map(|r| r as CarrierRow).collect())
+        .collect())
+}
+
+/// The accumulator keys carriers by `u32` row (#928); a longer stream
+/// refuses it rather than wrap.
+fn too_many_carrier_rows(rows: usize) -> ConvertError {
+    ConvertError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "the tiny-polygon accumulator supports up to 2^32 rows, and this input has \
+             {rows}; pass --no-collapse, or split the input"
+        ),
+    ))
 }
 
 /// Whether the tiny-polygon accumulator (#384) is in play for this run:
@@ -1406,7 +1428,7 @@ struct LevelCtxInputs<'a> {
     coalesce_tables: &'a [Option<CoalesceTable>],
     cascade_chains: &'a [Vec<CascadeStep>],
     /// Per planned level, the tiny-polygon accumulator's carrier rows (#384).
-    carriers: &'a [Vec<usize>],
+    carriers: &'a [Vec<CarrierRow>],
     crs: Crs,
     finest: usize,
     duplicating: bool,
@@ -2047,7 +2069,7 @@ fn apply_level_ceiling(
     ceiling_opt: Option<u8>,
     skipped: &mut Vec<SkippedLevelReport>,
     cluster_tables: &mut Option<ClusterTables>,
-    carriers: &mut [Vec<usize>],
+    carriers: &mut [Vec<CarrierRow>],
 ) -> Result<(usize, Option<u8>), ConvertError> {
     let kept = levels_at_or_above_ceiling(planned, ceiling_opt);
     // Whether the ceiling actually truncated the plan: only then is the file
@@ -2323,7 +2345,7 @@ pub(super) struct WinnerTables {
     pub(super) counts: Vec<usize>,
     /// Per planned level, the sorted row indices of the tiny-polygon
     /// accumulator's carriers (#384); empty per level unless it applies.
-    pub(super) carriers: Vec<Vec<usize>>,
+    pub(super) carriers: Vec<Vec<CarrierRow>>,
     pub(super) finest: usize,
     /// #802: the dataset's junction pins; `None` without polygons.
     pub(super) junctions: Option<JunctionNodes>,
@@ -2596,7 +2618,7 @@ fn resolve_winner_tables(
         &level_specs,
         &level_reprs,
         crs,
-    );
+    )?;
     drop(cell_winner_levels);
 
     // Cluster tables (Q4): built from the pass-1 features + final winner
@@ -2670,10 +2692,9 @@ fn resolve_winner_tables(
     }
     // The budget only defers cell winners, so every pre-budget carrier is
     // still a non-member: pass 2's is_carrier_row requires min_level > level.
-    debug_assert!(carriers
+    debug_assert!(carriers.iter().enumerate().all(|(li, rows)| rows
         .iter()
-        .enumerate()
-        .all(|(li, rows)| rows.iter().all(|&row| usize::from(min_levels[row]) > li)));
+        .all(|&row| usize::from(min_levels[row as usize]) > li)));
 
     // Per-level winner counts (exact row counts in partitioning mode; in
     // duplicating mode exact up to simplification drops — used as the writer's
@@ -2718,7 +2739,7 @@ fn resolve_winner_tables(
 fn level_counts(
     ctx: &Pass1Ctx<'_>,
     hist: Vec<usize>,
-    carriers: &[Vec<usize>],
+    carriers: &[Vec<CarrierRow>],
     coalesce_scratch: Option<CoalesceScratch>,
     level_specs: &[(f64, Option<u8>)],
     rss: &mut RssTracker,
@@ -3489,6 +3510,10 @@ fn run_pass1_and_assign(
         total: num_rows,
     });
     // #928: the streamed path's grids fold here, before the counts below.
+    // Sampled first: the fold frees the maps, so later samples miss them.
+    if stream.is_some() {
+        rss.log_phase("pass1 scan (streamed maps live)");
+    }
     let t_fold = Instant::now();
     let stream = stream.map(|s| s.finish(num_rows));
     let fold_wall = t_fold.elapsed();
@@ -6863,7 +6888,11 @@ fn stream_assigner(
         shared_nodes: wants_pins(options),
         level_reprs: &level_reprs,
     };
-    let allowed = match sa::stream_path(&gate) {
+    let fits = carrier_rows_fit(usize::try_from(rows).unwrap_or(usize::MAX));
+    let allowed = match sa::stream_path(&gate).and_then(|k| {
+        fits.then_some(k)
+            .ok_or("the stream has more rows than a u32 carrier row holds")
+    }) {
         Ok(kinds) => kinds,
         Err(reason) => {
             sa::record_path(false);
@@ -7214,7 +7243,7 @@ pub(super) struct LevelStreamCtx<'a> {
     /// indices of polygons that are NOT members (`min_level > orig_level`)
     /// but are emitted as a placeholder square standing in for the dropped
     /// area around them. Empty unless the accumulator applies.
-    carriers: &'a [usize],
+    carriers: &'a [CarrierRow],
     /// #802: the dataset's junction pins, kept by every simplification.
     pins: Option<&'a JunctionNodes>,
 }
@@ -11178,13 +11207,13 @@ pub(super) mod tests {
 
     /// Carriers for a two-level plan (1000 m accumulating, 10 m canonical)
     /// under `--collapse-square` with the given simplify factor.
-    fn carriers_for_factor(factor: f64) -> Vec<Vec<usize>> {
+    fn carriers_for_factor(factor: f64) -> Vec<Vec<CarrierRow>> {
         let (_, _, areas) = ten_dropped_fields();
         carriers_for(factor, areas)
     }
 
     /// [`carriers_for_factor`] with explicit per-field areas (m²).
-    fn carriers_for(factor: f64, areas: Vec<f32>) -> Vec<Vec<usize>> {
+    fn carriers_for(factor: f64, areas: Vec<f32>) -> Vec<Vec<CarrierRow>> {
         let (feats, min_levels, _) = ten_dropped_fields();
         let options = ConvertOptions {
             mode: Mode::Duplicating,
@@ -11204,6 +11233,7 @@ pub(super) mod tests {
             &[Representation::Geometry, Representation::Geometry],
             Crs::Epsg3857,
         )
+        .unwrap()
     }
 
     /// Control for the two #407 cases below: at a 1 × GSD factor
@@ -11551,6 +11581,19 @@ pub(super) mod tests {
                 let (evicted, closed) =
                     streamed_winner_tables(&feats, &areas, rows, &options, (chunk_rows, true));
                 assert_winner_tables_eq(&reference, &evicted, &format!("{what}, evicting"));
+                if name == "default" && chunk_rows == 777 {
+                    // Unsorted rows: every group spans nearly the whole
+                    // extent, so only cells at its edge close early.
+                    assert!(
+                        closed.cells * 100 >= kept.cells * 99 && closed.patches == kept.patches,
+                        "{what}: unsorted input must evict almost nothing \
+                         ({} of {} cells, {} of {} patches)",
+                        closed.cells,
+                        kept.cells,
+                        closed.patches,
+                        kept.patches
+                    );
+                }
                 if sorted && chunk_rows == 777 {
                     assert!(
                         closed.cells < kept.cells / 2 && closed.patches < kept.patches / 2,
@@ -11741,7 +11784,8 @@ pub(super) mod tests {
                 &[(1000.0, None), (10.0, None)],
                 &reprs,
                 Crs::Epsg3857,
-            );
+            )
+            .unwrap();
             assert!(!expected[0].is_empty(), "the accumulator is active");
             if thinning > 0.0 {
                 assert!(expected[0].len() > 500, "thinning losers keep squares");

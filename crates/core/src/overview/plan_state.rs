@@ -722,9 +722,10 @@ pub(super) fn rebase_plan_for_shard(
     // A key outside the shard's runs belongs to a row the shard does not
     // read and is dropped.
     for level in &mut plan.carriers {
-        let mut out: Vec<usize> = level
+        let mut out: Vec<super::accumulate::CarrierRow> = level
             .iter()
-            .filter_map(|&row| shard_row(&runs, row))
+            .filter_map(|&row| shard_row(&runs, row as usize))
+            .map(|row| row as super::accumulate::CarrierRow)
             .collect();
         out.sort_unstable();
         *level = out;
@@ -1175,7 +1176,7 @@ pub(super) struct ConvertPlan {
     /// Per-row geometry kinds for coalescing and exact shard totals.
     pub kinds: Option<Vec<FeatureKind>>,
     /// Per planned level, the tiny-polygon accumulator's carrier rows (#384).
-    pub carriers: Vec<Vec<usize>>,
+    pub carriers: Vec<Vec<super::accumulate::CarrierRow>>,
     /// Cluster tables (Q4), or `None` when clustering is off.
     pub cluster_tables: Option<ClusterTables>,
     /// `--cluster-categories` slot labels, indexed by category slot (#827).
@@ -1998,7 +1999,7 @@ fn rebuild_carriers(
     rows: &[u64],
     num_levels: usize,
     path: &Path,
-) -> Result<Vec<Vec<usize>>, ConvertError> {
+) -> Result<Vec<Vec<super::accumulate::CarrierRow>>, ConvertError> {
     let want = num_levels
         .checked_add(1)
         .ok_or_else(|| plan_err(path, "declares an impossible level count"))?;
@@ -2017,7 +2018,9 @@ fn rebuild_carriers(
         if a > b || b > rows.len() {
             return Err(plan_err(path, "carrier offsets are out of range"));
         }
-        out.push(rows[a..b].iter().map(|&r| r as usize).collect());
+        let level: Option<Vec<super::accumulate::CarrierRow>> =
+            rows[a..b].iter().map(|&r| r.try_into().ok()).collect();
+        out.push(level.ok_or_else(|| plan_err(path, "a carrier row exceeds 2^32"))?);
     }
     Ok(out)
 }

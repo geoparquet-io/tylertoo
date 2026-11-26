@@ -59,6 +59,18 @@ use super::simplify::{
     dither_u01, export_zoom, level_tolerance, placeholder_side, CollapseMode, Representation,
 };
 
+/// A carrier's row index (#928): `u32`, half a `usize`.
+///
+/// The carrier lists stay resident from the assignment through pass 2 and
+/// the plan clone. Runs over `u32::MAX` rows refuse the accumulator
+/// ([`carrier_rows_fit`]).
+pub type CarrierRow = u32;
+
+/// Whether every row index of a `rows`-row stream fits a [`CarrierRow`].
+pub fn carrier_rows_fit(rows: usize) -> bool {
+    rows <= CarrierRow::MAX as usize + 1
+}
+
 /// Accumulation patch width in GSD multiples: 1/32 of a 1024-pixel tile.
 pub const ACCUMULATE_CELL_GSD: f64 = 32.0;
 
@@ -129,6 +141,11 @@ pub fn level_accumulates(collapse: CollapseMode, repr: Representation) -> bool {
 /// DIVERGENCE FROM TIPPECANOE: tippecanoe's placeholder side is a fixed
 /// `tiny_polygon_size` in tile units (clip.cpp `reduce_tiny_poly`); ours is
 /// a fixed one GSD. Neither depends on the simplification setting.
+///
+/// # Panics
+///
+/// When `features` holds more than `u32::MAX + 1` rows and a level
+/// accumulates: the accumulator keys rows by `u32` position.
 pub fn tiny_polygon_carriers(
     features: &FeatureTable,
     min_levels: &[u8],
@@ -168,6 +185,10 @@ fn level_carriers(
     if !level.enabled {
         return (Vec::new(), None);
     }
+    assert!(
+        carrier_rows_fit(features.len()),
+        "the accumulator keys rows by u32 position"
+    );
     #[cfg(test)]
     super::testutil::rendezvous::arrive("accumulate level");
     let mut acc = LevelAccumulator::new(level, crs);
@@ -178,9 +199,16 @@ fn level_carriers(
         if features.entry_level(pos).is_some() {
             continue; // #364: the ladder decides where it first appears
         }
-        acc.add(features.indices()[pos], features.center(pos), area);
+        acc.add(pos as CarrierRow, features.center(pos), area);
     }
-    acc.finish()
+    // Positions, ascending in `index` order: map back and keep them sorted.
+    let (positions, floored) = acc.finish();
+    let mut out: Vec<usize> = positions
+        .into_iter()
+        .map(|p| features.indices()[p as usize])
+        .collect();
+    out.sort_unstable();
+    (out, floored)
 }
 
 /// One level's accumulator, fed one gate/thinning loser at a time in
@@ -199,7 +227,7 @@ struct ActiveLevel {
     cell: f64,
     floored: bool,
     acc: HashMap<(i64, i64), Patch>,
-    out: Vec<usize>,
+    out: Vec<CarrierRow>,
 }
 
 impl LevelAccumulator {
@@ -240,7 +268,7 @@ impl LevelAccumulator {
     /// patch key when this call opened the patch.
     pub(super) fn add(
         &mut self,
-        index: usize,
+        index: CarrierRow,
         (cx, cy): (f64, f64),
         area: f32,
     ) -> Option<(i64, i64)> {
@@ -314,7 +342,7 @@ impl LevelAccumulator {
 
     /// The level's sorted carrier rows, and its export zoom when the
     /// placeholder side is floored there.
-    pub(super) fn finish(self) -> (Vec<usize>, Option<f64>) {
+    pub(super) fn finish(self) -> (Vec<CarrierRow>, Option<f64>) {
         let Some(level) = self.active else {
             return (Vec::new(), self.floored_zoom);
         };
@@ -361,7 +389,7 @@ impl ActiveLevel {
 impl Patch {
     /// The residual dither's carrier, if the patch's last free contributor
     /// becomes one.
-    fn dithered(&self, threshold: f64) -> Option<usize> {
+    fn dithered(&self, threshold: f64) -> Option<CarrierRow> {
         let (index, cx, cy) = self.last_free?;
         (dither_u01(cx, cy) < self.total / threshold).then_some(index)
     }
@@ -386,13 +414,13 @@ struct Patch {
     total: f64,
     /// The latest contributor that did not become a carrier, with its bbox
     /// centre: the residual dither's candidate on a floored level.
-    last_free: Option<(usize, f64, f64)>,
+    last_free: Option<(CarrierRow, f64, f64)>,
 }
 
 /// Whether row `g` is a carrier at a level, given that level's sorted list.
 #[inline]
-pub fn is_carrier(carriers: &[usize], g: usize) -> bool {
-    carriers.binary_search(&g).is_ok()
+pub fn is_carrier(carriers: &[CarrierRow], g: usize) -> bool {
+    CarrierRow::try_from(g).is_ok_and(|g| carriers.binary_search(&g).is_ok())
 }
 
 #[cfg(test)]

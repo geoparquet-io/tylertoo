@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use rstar::primitives::{GeomWithData, Rectangle};
 use rstar::{RTree, AABB};
 
-use super::accumulate::{log_floored_zooms, LevelAccumulator};
+use super::accumulate::{log_floored_zooms, CarrierRow, LevelAccumulator};
 use super::assign::{
     gsd_to_coord_units, place_feature, AssignConfig, CellKey, FeatureKind, FeatureTable, Placement,
     Priority, SortDirection,
@@ -351,7 +351,7 @@ impl Eviction {
 pub(super) struct StreamAssigned {
     pub(super) min_levels: Vec<u8>,
     pub(super) kinds: Option<Vec<FeatureKind>>,
-    pub(super) carriers: Vec<Vec<usize>>,
+    pub(super) carriers: Vec<Vec<CarrierRow>>,
     pub(super) features: usize,
     /// `(points, lines, polygons)`.
     pub(super) kind_counts: (usize, usize, usize),
@@ -552,7 +552,9 @@ impl StreamAssigner {
                 let area = areas.get(pos).copied().unwrap_or(0.0);
                 for (li, acc) in self.accs.iter_mut().enumerate() {
                     if usize::from(ml) > li {
-                        if let Some((ix, iy)) = acc.add(row.index, row.center, area) {
+                        // The gate keeps every row index within a `CarrierRow`.
+                        let index = row.index as CarrierRow;
+                        if let Some((ix, iy)) = acc.add(index, row.center, area) {
                             self.live_patches += 1;
                             self.peak_patches = self.peak_patches.max(self.live_patches);
                             if let (Some(evict), Some(w)) = (&mut self.evict, acc.patch_width()) {
@@ -611,16 +613,16 @@ impl StreamAssigner {
             k.resize(num_rows, FeatureKind::Point);
             k
         });
-        let per_level: Vec<(Vec<usize>, Option<f64>)> =
+        let per_level: Vec<(Vec<CarrierRow>, Option<f64>)> =
             accs.into_iter().map(LevelAccumulator::finish).collect();
         let floored: Vec<f64> = per_level.iter().filter_map(|(_, z)| *z).collect();
         log_floored_zooms(&floored);
-        let carriers: Vec<Vec<usize>> = per_level.into_iter().map(|(c, _)| c).collect();
+        let carriers: Vec<Vec<CarrierRow>> = per_level.into_iter().map(|(c, _)| c).collect();
         memory.min_levels = min_levels.capacity() as u64;
         memory.kinds = kinds.as_ref().map_or(0, |k| k.capacity() as u64);
         memory.carriers = carriers
             .iter()
-            .map(|c| (c.capacity() * std::mem::size_of::<usize>()) as u64)
+            .map(|c| (c.capacity() * std::mem::size_of::<CarrierRow>()) as u64)
             .sum();
         StreamAssigned {
             min_levels,
