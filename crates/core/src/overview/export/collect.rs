@@ -389,7 +389,14 @@ impl CollectGroup {
             rows: 0,
             bytes: 0,
             max_rows,
-            max_bytes: usize::try_from(tylertoo_io::decoded_batch_limit()).unwrap_or(usize::MAX),
+            // shortcut: prototype knob for #876 measurement, remove before landing
+            max_bytes: usize::try_from(tylertoo_io::decoded_batch_limit())
+                .unwrap_or(usize::MAX)
+                .saturating_mul(proto::knob(
+                    &proto::GROUP_BYTES_MULT,
+                    "TYLERTOO_GROUP_BYTES_MULT",
+                    1,
+                )),
         }
     }
 
@@ -631,8 +638,35 @@ pub(super) fn collect_group_rows(profile: MemoryProfile) -> usize {
     match profile {
         MemoryProfile::Bounded => 1,
         MemoryProfile::Auto | MemoryProfile::Speed => {
-            COLLECT_GROUP_ROWS_PER_THREAD.saturating_mul(rayon::current_num_threads())
+            COLLECT_GROUP_ROWS_PER_THREAD
+                .saturating_mul(rayon::current_num_threads())
+                // shortcut: prototype knob for #876 measurement, remove before landing
+                .saturating_mul(proto::knob(&proto::GROUP_MULT, "TYLERTOO_GROUP_MULT", 1))
         }
+    }
+}
+
+// shortcut: prototype knob for #876 measurement, remove before landing
+#[expect(
+    clippy::disallowed_types,
+    reason = "#876 prototype: process-wide env knobs, read once"
+)]
+mod proto {
+    use std::sync::OnceLock;
+
+    pub(super) static GROUP_MULT: OnceLock<usize> = OnceLock::new();
+    pub(super) static GROUP_BYTES_MULT: OnceLock<usize> = OnceLock::new();
+    pub(super) static CHUNK_MIN: OnceLock<usize> = OnceLock::new();
+
+    /// The positive integer in env `name`, read once into `cell`, else `default`.
+    pub(super) fn knob(cell: &OnceLock<usize>, name: &str, default: usize) -> usize {
+        *cell.get_or_init(|| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&v: &usize| v > 0)
+                .unwrap_or(default)
+        })
     }
 }
 
@@ -659,7 +693,12 @@ pub(super) fn route_partition(wave: &[Partition], key: u64) -> usize {
 /// row order.
 pub(super) fn collect_chunk_rows(rows: usize) -> usize {
     rows.div_ceil(rayon::current_num_threads())
-        .max(MIN_COLLECT_CHUNK_ROWS)
+        // shortcut: prototype knob for #876 measurement, remove before landing
+        .max(proto::knob(
+            &proto::CHUNK_MIN,
+            "TYLERTOO_CHUNK_MIN",
+            MIN_COLLECT_CHUNK_ROWS,
+        ))
         .min(rows.max(1))
 }
 
