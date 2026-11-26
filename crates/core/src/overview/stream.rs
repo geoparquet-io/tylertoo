@@ -3154,7 +3154,7 @@ fn preflight_with_memory_limit(
             &descriptor,
             options,
             &acc_cols,
-            (selected_row_groups.as_ref(), selected_rows),
+            (selected_row_groups.as_ref(), selected_rows, crs),
         )?;
         let price = match &assign {
             AssignPath::Table(_) => super::convert::Pass1Price::TABLE,
@@ -6975,11 +6975,13 @@ fn decide_assign_path(
     descriptor: &ResolvedSchema,
     options: &ConvertOptions,
     acc_cols: &[usize],
-    (selected, rows): (Option<&RowGroupSelection>, u64),
+    (selected, rows, crs): (Option<&RowGroupSelection>, u64, Crs),
 ) -> Result<AssignPath, ConvertError> {
     use super::assign_stream as sa;
     let level_specs = options.levels.resolve(options.gsd_base)?;
     let level_reprs = super::convert::level_representations(&level_specs, &options.representation);
+    // The finest level never contests a cell or accumulates.
+    let finest = level_specs.len().saturating_sub(1);
     let declared = sa::declared_kinds(
         source
             .resolved_schemas()?
@@ -6996,9 +6998,16 @@ fn decide_assign_path(
         accumulate_columns: !acc_cols.is_empty(),
         shared_nodes: wants_pins(options),
         level_reprs: &level_reprs,
-        accumulates: accumulate_levels(options, &level_specs, &level_reprs)
+        line_widths: level_specs[..finest]
             .iter()
-            .any(|l| l.enabled),
+            .map(|(g, _)| super::assign::gsd_to_coord_units(*g, crs) * options.assign.line_thinning)
+            .collect(),
+        patch_widths: accumulate_levels(options, &level_specs, &level_reprs)
+            .iter()
+            .take(finest)
+            .filter_map(|l| super::accumulate::LevelAccumulator::new(l, crs).patch_width())
+            .collect(),
+        bounded_profile: options.profile == super::level::MemoryProfile::Bounded,
     };
     Ok(AssignPath::decide(
         &gate,
@@ -11363,7 +11372,11 @@ pub(super) mod tests {
     }
 
     /// Run `f` with a [`Pass1Ctx`] over the preflight fixture, in EPSG:3857.
-    fn with_assign_ctx<R>(options: &ConvertOptions, f: impl FnOnce(&Pass1Ctx<'_>) -> R) -> R {
+    fn with_assign_ctx<R>(
+        options: &ConvertOptions,
+        crs: Crs,
+        f: impl FnOnce(&Pass1Ctx<'_>) -> R,
+    ) -> R {
         let (_input, source, _) = preflight_fixture();
         let config = options.validate().unwrap();
         let budget = MemoryBudget::with_available(None);
@@ -11380,7 +11393,7 @@ pub(super) mod tests {
             bbox_query: None,
             mask: None,
             bound_filter: None,
-            crs: Crs::Epsg3857,
+            crs,
             assign: &AssignPath::Table("a test context"),
         };
         f(&ctx)
@@ -11394,7 +11407,17 @@ pub(super) mod tests {
         num_rows: usize,
         options: &ConvertOptions,
     ) -> WinnerTables {
-        with_assign_ctx(options, |ctx| {
+        table_winner_tables_in(features, areas, num_rows, options, Crs::Epsg3857)
+    }
+
+    fn table_winner_tables_in(
+        features: &mut FeatureTable,
+        areas: Vec<f32>,
+        num_rows: usize,
+        options: &ConvertOptions,
+        crs: Crs,
+    ) -> WinnerTables {
+        with_assign_ctx(options, crs, |ctx| {
             resolve_winner_tables(
                 ctx,
                 AssignmentInputs {
@@ -11423,6 +11446,26 @@ pub(super) mod tests {
         options: &ConvertOptions,
         (chunk_rows, evict): (usize, bool),
     ) -> (WinnerTables, super::super::assign_stream::StreamMemory) {
+        streamed_winner_tables_in(
+            feats,
+            areas,
+            num_rows,
+            options,
+            (chunk_rows, evict, Some(1)),
+            Crs::Epsg3857,
+        )
+    }
+
+    /// [`streamed_winner_tables`] in `crs`, with `unbounded` the group that
+    /// has no bounds (`None`: every group has them).
+    fn streamed_winner_tables_in(
+        feats: &[AssignFeature],
+        areas: &[f32],
+        num_rows: usize,
+        options: &ConvertOptions,
+        (chunk_rows, evict, unbounded): (usize, bool, Option<usize>),
+        crs: Crs,
+    ) -> (WinnerTables, super::super::assign_stream::StreamMemory) {
         let chunk_rows = chunk_rows.min(num_rows);
         let groups = num_rows.div_ceil(chunk_rows);
         let mut bounds: Vec<Option<[f64; 4]>> = vec![None; groups];
@@ -11438,7 +11481,7 @@ pub(super) mod tests {
             .enumerate()
             .map(|(g, b)| super::super::assign_stream::GroupSpan {
                 rows: chunk_rows.min(num_rows - g * chunk_rows),
-                bounds: b.filter(|_| g != 1),
+                bounds: b.filter(|_| Some(g) != unbounded),
             })
             .collect();
         let spans = if evict { spans } else { Vec::new() };
@@ -11453,7 +11496,7 @@ pub(super) mod tests {
             options,
             &level_specs,
             &reprs,
-            Crs::Epsg3857,
+            crs,
             (num_rows, &spans),
         );
         assert_eq!(assigner.evicts(), evict);
@@ -11485,7 +11528,7 @@ pub(super) mod tests {
         }
         let assigned = assigner.finish(num_rows);
         let memory = assigned.memory;
-        let tables = with_assign_ctx(options, |ctx| {
+        let tables = with_assign_ctx(options, crs, |ctx| {
             resolve_streamed_winner_tables(
                 ctx,
                 assigned,
@@ -11578,6 +11621,42 @@ pub(super) mod tests {
     /// every v1 config shape, whatever the chunking and the thread count.
     /// 40 000 features is above the sharded winner build's cutoff
     /// (`WINNER_CHUNK_FEATURES`) and the parallel fold's (4096 rows).
+    /// #928 review: at an extreme `line_thinning` the cell index saturates
+    /// at `i64::MAX`, so two far-apart lines share a key whose cell cannot
+    /// be mapped back to coordinates. Evicting it after the first group
+    /// would let the second line win a fresh copy of the cell.
+    #[test]
+    fn saturated_cell_keys_stay_open_to_the_end() {
+        let mut options = ConvertOptions {
+            levels: LevelPlan::Gsds(vec![1000.0, 10.0]),
+            coalesce_lines: false,
+            ..Default::default()
+        };
+        options.assign.line_thinning = 1e-18;
+        let line = |index: usize, c: f64| AssignFeature {
+            index,
+            bbox: [c, c, c + 1.0, c + 1.0],
+            kind: FeatureKind::Line,
+            sort_key: None,
+            entry_level: None,
+        };
+        let feats = [line(0, 10.0), line(1, 20.0)];
+        let areas = [0.0f32; 2];
+        let reference = table_winner_tables_in(
+            &mut table(&feats),
+            areas.to_vec(),
+            2,
+            &options,
+            Crs::Epsg4326,
+        );
+        let (streamed, _) =
+            streamed_winner_tables_in(&feats, &areas, 2, &options, (1, true, None), Crs::Epsg4326);
+        let mut levels = reference.min_levels.clone();
+        levels.sort_unstable();
+        assert_eq!(levels, [0, 1], "the lines share one saturated cell");
+        assert_winner_tables_eq(&reference, &streamed, "saturated keys");
+    }
+
     #[test]
     fn streamed_winner_tables_match_the_table_path() {
         let base = ConvertOptions {

@@ -5557,6 +5557,11 @@ impl Pass1Price {
         rows.saturating_mul(self.bytes_per_row)
     }
 
+    /// The whole job's modelled bytes per row: the floor × the multiple.
+    pub(super) fn whole_job_per_row(self) -> f64 {
+        self.bytes_per_row as f64 * self.factor
+    }
+
     /// The realistic "this input needs ≳X GiB" total.
     fn recommended_total_gib(self, rows: u64) -> f64 {
         gib(self.floor(rows)) * self.factor
@@ -8701,13 +8706,10 @@ mod tests {
     /// host; the table path's 42 B/row floor does not.
     #[test]
     fn streamed_planet_buildings_pass_the_preflight_at_32_gib() {
-        use super::super::assign_stream::{streamed_bytes_per_row, KindSet};
+        use super::super::assign_stream::streamed_bytes_per_row;
         let rows = 2_540_000_000u64;
-        let polygons = KindSet {
-            polygons: true,
-            lines: false,
-        };
-        let streamed = Pass1Price::streamed(streamed_bytes_per_row(polygons, true, true, true));
+        // `min_levels` 1 + kinds 1 + carriers 4, no line cells, evicted patches.
+        let streamed = Pass1Price::streamed(streamed_bytes_per_row(6, 0, true, true));
         for source in [
             MemoryLimitSource::CgroupMax,
             MemoryLimitSource::MemAvailable,

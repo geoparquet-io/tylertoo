@@ -29,7 +29,7 @@ use super::assign::{
     gsd_to_coord_units, place_feature, AssignConfig, CellKey, FeatureKind, FeatureRow,
     FeatureTable, Placement, Priority, SortDirection,
 };
-use super::convert::{ConvertError, ConvertOptions};
+use super::convert::{ConvertError, ConvertOptions, Pass1Price};
 use super::level::Crs;
 use super::simplify::Representation;
 
@@ -133,9 +133,14 @@ pub(super) struct StreamGate<'a> {
     /// Whether pass 1 collects shared-node pins (#802).
     pub(super) shared_nodes: bool,
     pub(super) level_reprs: &'a [Representation],
-    /// Whether any level accumulates tiny polygons (#384), which keeps
-    /// carrier rows.
-    pub(super) accumulates: bool,
+    /// The line cell width of each coarse level, in coordinate units.
+    pub(super) line_widths: Vec<f64>,
+    /// The patch width of each coarse level that accumulates tiny polygons
+    /// (#384); empty when none does.
+    pub(super) patch_widths: Vec<f64>,
+    /// Whether the table path would accumulate one level at a time
+    /// (`--profile bounded`), holding one level's patch map, not all.
+    pub(super) bounded_profile: bool,
 }
 
 /// The v1 scope: the declared kinds when every row's level can be decided
@@ -206,44 +211,82 @@ impl AssignPath {
         if !carrier_rows_fit(rows) {
             return Self::Table("the stream has more rows than a u32 carrier row holds");
         }
-        let evicts = Eviction::usable(&spans, rows);
-        // Unevicted line grids hold every cell to the end: 160-213 B/row on
-        // Overture segments, far over the table path.
-        if kinds.lines && !evicts {
-            return Self::Table("no row group has footer bounds, which lines need to evict cells");
-        }
+        let evict = Eviction::new(&spans, rows);
+        let carriers = !gate.patch_widths.is_empty() && kinds.polygons;
+        // Line cells and patches the eviction can be shown to bound, from the
+        // footers alone; without an eviction every entry stays to the end.
+        let predict = |widths: &[f64]| {
+            evict.as_ref().map_or_else(
+                || (rows as u64).saturating_mul(widths.len() as u64),
+                |e| e.predicted_peak(widths),
+            )
+        };
+        let cells = if kinds.lines {
+            predict(&gate.line_widths)
+        } else {
+            0
+        };
+        let patches = if carriers {
+            predict(&gate.patch_widths)
+        } else {
+            0
+        };
+        let per_row = |entries: u64| entries.saturating_mul(MAP_ENTRY_BYTES) / rows.max(1) as u64;
         let want_kinds = gate.options.coalesce_lines || gate.options.save_plan.is_some();
+        let base = 1 + u64::from(want_kinds) + if carriers { 4 } else { 0 };
+        // The table path keeps every level's patch map at once too, except
+        // under `--profile bounded`, which runs one level at a time.
+        let patch_excess = if gate.bounded_profile {
+            per_row(patches)
+        } else {
+            0
+        };
+        let worst = base + per_row(cells) + patch_excess;
+        let map_bytes = cells.saturating_add(if gate.bounded_profile { patches } else { 0 });
+        if map_bytes.saturating_mul(MAP_ENTRY_BYTES) > SMALL_MAPS
+            && Pass1Price::streamed(worst).whole_job_per_row()
+                > Pass1Price::TABLE.whole_job_per_row()
+        {
+            return Self::Table(
+                "the footer bounds overlap too much for the eviction to bound the working maps",
+            );
+        }
         Self::Streamed {
             kinds,
             spans,
-            bytes_per_row: streamed_bytes_per_row(
-                kinds,
-                want_kinds,
-                gate.accumulates && kinds.polygons,
-                evicts,
-            ),
+            bytes_per_row: streamed_bytes_per_row(base, per_row(cells), evict.is_some(), carriers),
         }
     }
 }
 
+/// One live cell or patch: its map slot at peak capacity (measured 57 B for
+/// both) and its due-list entry (measured 35 B), rounded up.
+const MAP_ENTRY_BYTES: u64 = 100;
+
+/// Working maps at most this large never decide a run's memory, so a small
+/// input streams however its groups overlap.
+const SMALL_MAPS: u64 = 64 << 20;
+
 /// The streamed path's resident bytes per input row, from the scan through
-/// pass 2, for the #543 preflight: `min_levels` (1), the kinds when a plan
-/// or coalescing reads them (1), the carriers when polygons accumulate (one
-/// `u32` per row, over the 2.1-2.7 B/row measured), and an allowance for the
-/// working maps over their measured peaks: evicted polygon maps 0.6-1.2
-/// B/row (NZ parcels, NL buildings), evicted line maps 7.5 B/row (Overture
-/// segments), unevicted polygon maps 5.9 B/row (NL buildings).
+/// pass 2, for the #543 preflight: `base` (`min_levels`, the kinds when a
+/// plan or coalescing reads them, a `u32` carrier per row when polygons
+/// accumulate, over the 2.1-2.7 B/row measured), the line cells the
+/// eviction is predicted to keep, and an allowance for the patch maps: 2
+/// B/row evicted (measured 0.6-1.2, NZ parcels and NL buildings), 8
+/// unevicted (measured 5.9, NL buildings). The table path keeps the same
+/// patch maps, and its price leaves them out; the allowance keeps them in.
 pub(super) fn streamed_bytes_per_row(
-    kinds: KindSet,
-    want_kinds: bool,
-    carriers: bool,
+    base: u64,
+    line_cells: u64,
     evicts: bool,
+    carriers: bool,
 ) -> u64 {
-    let maps = match (evicts, kinds.lines) {
-        (true, false) => 2,
-        (true, true) | (false, _) => 8,
+    let patches = match (carriers, evicts) {
+        (false, _) => 0,
+        (true, true) => 2,
+        (true, false) => 8,
     };
-    1 + u64::from(want_kinds) + if carriers { 4 } else { 0 } + maps
+    base + line_cells + patches
 }
 
 /// A line grid's incumbent. Its sort key is always missing: the gate
@@ -410,6 +453,44 @@ impl Eviction {
             && spans.iter().any(|s| s.bounds.is_some())
     }
 
+    /// An upper bound on the entries live at once over levels of cell (or
+    /// patch) widths `widths`, from the footers alone. A group's rows open
+    /// at most one entry each per level, and no more than its bounds cover
+    /// (grown by the two cells an entry's own grown cell can reach past
+    /// them); every entry a group opens is due by the last group those
+    /// grown bounds reach. An unbounded group's entries stay to the end.
+    fn predicted_peak(&self, widths: &[f64]) -> u64 {
+        let n = self.ends.len();
+        let mut delta = vec![0i64; n + 1];
+        for &w in widths {
+            for g in 0..n {
+                let rows = self.ends[g] - g.checked_sub(1).map_or(0, |p| self.ends[p]);
+                let (entries, last) = match self.bounds[g] {
+                    Some([x0, y0, x1, y1]) if w.is_finite() && w > 0.0 => {
+                        let grown = [x0 - 2.0 * w, y0 - 2.0 * w, x1 + 2.0 * w, y1 + 2.0 * w];
+                        let cells = (((x1 - x0) / w).ceil() + 3.0) * (((y1 - y0) / w).ceil() + 3.0);
+                        let entries = if cells < rows as f64 {
+                            cells as usize
+                        } else {
+                            rows
+                        };
+                        (entries, self.expiry_at(g, grown))
+                    }
+                    _ => (rows, n - 1),
+                };
+                let entries = i64::try_from(entries).unwrap_or(i64::MAX);
+                delta[g] = delta[g].saturating_add(entries);
+                delta[last + 1] = delta[last + 1].saturating_sub(entries);
+            }
+        }
+        let (mut live, mut peak) = (0i64, 0i64);
+        for d in &delta[..n] {
+            live = live.saturating_add(*d);
+            peak = peak.max(live);
+        }
+        u64::try_from(peak).unwrap_or(0)
+    }
+
     /// Move to `row`'s group, returning the groups finished on the way.
     fn advance(&mut self, row: usize) -> std::ops::Range<usize> {
         let from = self.current;
@@ -429,8 +510,14 @@ impl Eviction {
     }
 
     /// The last group that can still reach `rect`: the one to close it after.
-    fn expiry(&self, [x0, y0, x1, y1]: [f64; 4]) -> usize {
-        let current = self.current.min(self.ends.len() - 1);
+    fn expiry(&self, rect: [f64; 4]) -> usize {
+        self.expiry_at(self.current, rect)
+    }
+
+    /// [`Self::expiry`] for an entry opened while the stream is in group
+    /// `current`.
+    fn expiry_at(&self, current: usize, [x0, y0, x1, y1]: [f64; 4]) -> usize {
+        let current = current.min(self.ends.len() - 1);
         let envelope = AABB::from_corners([x0, y0], [x1, y1]);
         self.tree
             .locate_in_envelope_intersecting(&envelope)
@@ -957,9 +1044,21 @@ impl StreamAssigner {
 
 /// Cell `(ix, iy)` of width `w`, grown by one cell on every side so float
 /// rounding in `floor(c / w)` can never place a row outside it.
+///
+/// Covers everything when the key cannot be mapped back exactly: an index
+/// past 2^52 (a saturated `floor(c / w) as i64`, or one `f64` cannot
+/// hold), or a non-finite result. Such a cell then stays open to the end.
 fn grown_cell(ix: i64, iy: i64, w: f64) -> [f64; 4] {
+    const EXACT: u64 = 1 << 52;
     let (x, y) = (ix as f64 * w, iy as f64 * w);
-    [x - w, y - w, x + 2.0 * w, y + 2.0 * w]
+    let rect = [x - w, y - w, x + 2.0 * w, y + 2.0 * w];
+    if ix.unsigned_abs() >= EXACT
+        || iy.unsigned_abs() >= EXACT
+        || !rect.iter().all(|v| v.is_finite())
+    {
+        return [f64::MIN, f64::MIN, f64::MAX, f64::MAX];
+    }
+    rect
 }
 
 // Both are corrupt-input errors (`ErrorKind::Runtime`): the footers
@@ -1005,12 +1104,18 @@ mod tests {
             accumulate_columns: false,
             shared_nodes: false,
             level_reprs: &[],
-            accumulates: false,
+            line_widths: vec![],
+            patch_widths: vec![],
+            bounded_profile: false,
         })
     }
 
     const BOTH: KindSet = KindSet {
         polygons: true,
+        lines: true,
+    };
+    const LINES: KindSet = KindSet {
+        polygons: false,
         lines: true,
     };
     const POLYS: KindSet = KindSet {
@@ -1074,46 +1179,115 @@ mod tests {
         );
     }
 
-    /// #928: lines stream only when the footers give the eviction bounds;
-    /// unevicted line grids would outgrow the table path.
+    /// The path for `declared` kinds over `spans`, with one coarse level
+    /// whose line cells and patches are 1 unit wide.
+    fn decide(declared: KindSet, spans: Vec<GroupSpan>, bounded_profile: bool) -> AssignPath {
+        let options = eligible();
+        let gate = StreamGate {
+            options: &options,
+            declared: Some(declared),
+            size_fallback_ranking: true,
+            accumulate_columns: false,
+            shared_nodes: false,
+            level_reprs: &[],
+            line_widths: vec![1.0],
+            patch_widths: vec![1.0],
+            bounded_profile,
+        };
+        let rows = spans.iter().map(|s| s.rows as u64).sum();
+        AssignPath::decide(&gate, rows, spans)
+    }
+
+    const ROWS: usize = 1000;
+
+    /// `groups` groups of [`ROWS`] rows; `bounds(g)` gives each group's bounds.
+    fn spans(groups: usize, bounds: impl Fn(usize) -> Option<[f64; 4]>) -> Vec<GroupSpan> {
+        (0..groups)
+            .map(|g| GroupSpan {
+                rows: ROWS,
+                bounds: bounds(g),
+            })
+            .collect()
+    }
+
+    /// `spans` at a million rows a group, so maps that stay open are far
+    /// past [`SMALL_MAPS`].
+    fn big(spans: Vec<GroupSpan>) -> Vec<GroupSpan> {
+        spans
+            .into_iter()
+            .map(|s| GroupSpan {
+                rows: 1_000_000,
+                ..s
+            })
+            .collect()
+    }
+
+    /// #928: a large line input streams only when the footers give the
+    /// eviction bounds; unevicted line grids would outgrow the table path.
     #[test]
     fn lines_without_footer_bounds_take_the_table_path() {
-        let options = eligible();
-        let decide = |declared, bounds: Option<[f64; 4]>| {
-            let gate = StreamGate {
-                options: &options,
-                declared: Some(declared),
-                size_fallback_ranking: true,
-                accumulate_columns: false,
-                shared_nodes: false,
-                level_reprs: &[],
-                accumulates: true,
-            };
-            AssignPath::decide(&gate, 10, vec![GroupSpan { rows: 10, bounds }])
-        };
-        let bounds = Some([0.0, 0.0, 1.0, 1.0]);
-        assert!(matches!(decide(BOTH, None), AssignPath::Table(_)));
+        let unit = |_| Some([0.0, 0.0, 1.0, 1.0]);
         assert!(matches!(
-            decide(BOTH, bounds),
+            decide(BOTH, big(spans(1, |_| None)), false),
+            AssignPath::Table(_)
+        ));
+        // 25 predicted cells (the grown bounds span 2 cells a side, plus the
+        // 3 an entry's grown cell reaches) over 1000 rows: 5 + 2 + 2 for the patches.
+        assert!(matches!(
+            decide(BOTH, spans(1, unit), false),
             AssignPath::Streamed {
-                bytes_per_row: 13,
+                bytes_per_row: 9,
                 ..
             }
         ));
         // Polygons stream either way, priced by whether their maps evict.
         assert!(matches!(
-            decide(POLYS, None),
+            decide(POLYS, spans(1, |_| None), false),
             AssignPath::Streamed {
                 bytes_per_row: 13,
                 ..
             }
         ));
         assert!(matches!(
-            decide(POLYS, bounds),
+            decide(POLYS, spans(1, unit), false),
             AssignPath::Streamed {
                 bytes_per_row: 7,
                 ..
             }
+        ));
+    }
+
+    /// #928 review: footer bounds that all overlap keep every group's cells
+    /// live to the end, as no bounds would, so the table path runs; the same
+    /// rows in disjoint, sorted groups stream.
+    #[test]
+    fn overlapping_footer_bounds_take_the_table_path() {
+        let overlapping = |_| Some([0.0, 0.0, 1000.0, 1000.0]);
+        let sorted = |g: usize| {
+            let x = 10.0 * g as f64;
+            Some([x, 0.0, x + 1.0, 1.0])
+        };
+        assert!(matches!(
+            decide(LINES, big(spans(100, overlapping)), false),
+            AssignPath::Table(_)
+        ));
+        assert!(matches!(
+            decide(LINES, big(spans(100, sorted)), false),
+            AssignPath::Streamed { .. }
+        ));
+        // Polygons hold the table path's own patch maps, except under
+        // `--profile bounded`, whose table path holds one level at a time.
+        assert!(matches!(
+            decide(POLYS, big(spans(100, overlapping)), false),
+            AssignPath::Streamed { .. }
+        ));
+        assert!(matches!(
+            decide(POLYS, big(spans(100, overlapping)), true),
+            AssignPath::Table(_)
+        ));
+        assert!(matches!(
+            decide(POLYS, big(spans(100, sorted)), true),
+            AssignPath::Streamed { .. }
         ));
     }
 
@@ -1174,7 +1348,9 @@ mod tests {
                 accumulate_columns: false,
                 shared_nodes: false,
                 level_reprs: &[],
-                accumulates: false,
+                line_widths: vec![],
+                patch_widths: vec![],
+                bounded_profile: false,
             };
             f(&mut g);
             stream_path(&g)
