@@ -3430,6 +3430,38 @@ fn a_range_clip_gives_each_tile_the_piece_of_its_own_clip() {
     }
 }
 
+/// #919: the cascade prunes a subtree that holds no wanted tile, not only
+/// one outside the key window, so the sampler's clip into a few distant
+/// tiles does not clip the tiles between them.
+#[test]
+fn the_cascade_prunes_a_subtree_without_a_wanted_tile() {
+    let opts = ExportOptions::default();
+    let d = crate::diagnostics::Diagnostics::default();
+    let geom = Geometry::Point(Point::new(0.0, 0.0));
+    let (node, zoom) = (TileCoord::new(1, 0, 1), 4);
+    let ids = crate::tile::node_id_range(node, zoom);
+    let (first, last) = (*ids.start(), *ids.end());
+    let wants = |wanted: Option<&[u64]>| {
+        let target = TileTarget {
+            zoom,
+            opts: &opts,
+            key_lo: 0,
+            key_hi: u64::MAX,
+            assume_simple: true,
+            diagnostics: &d,
+            source: &geom,
+            wanted,
+        };
+        node_key_overlaps(node, &target)
+    };
+    assert!(wants(None));
+    assert!(wants(Some(&[first])));
+    assert!(wants(Some(&[0, last])));
+    assert!(wants(Some(&[first + 1, u64::MAX])));
+    assert!(!wants(Some(&[first - 1, last + 1])));
+    assert!(!wants(Some(&[])));
+}
+
 /// #768: a predictor over the scan's budget drops its dense state and
 /// says so; the export goes on as under `--valve-scope tile`, with the
 /// same tile counts.

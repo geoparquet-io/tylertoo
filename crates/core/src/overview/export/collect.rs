@@ -1734,7 +1734,7 @@ pub(super) fn node_overlaps_ranges(node: TileCoord, zoom: u8, ranges: &BboxTileR
 /// partition it spans. With [`TileTarget::wanted`], the subtree must also
 /// hold a wanted key (#919).
 #[inline]
-fn node_key_overlaps(node: TileCoord, inputs: &TileTarget<'_>) -> bool {
+pub(super) fn node_key_overlaps(node: TileCoord, inputs: &TileTarget<'_>) -> bool {
     inputs.wants(crate::tile::node_id_range(node, inputs.zoom))
 }
 
