@@ -76,9 +76,19 @@ times, through three probes in `pipeline.rs`, each for a reason:
 - **convert:** `MemoryBudget::probe()` in `preflight()`, uncached, before
   pass 1 reads anything;
 - **export:** `export_budget()`, from `available_memory_bytes()`. That
-  figure is cached process-wide on its first call after convert's pass 1,
-  so it is the cgroup's headroom with pass 1's usage already charged
-  (#485). The widths of export's waves have used it since #303;
+  figure is cached process-wide on its first call, which export makes
+  before its work starts; convert never reads it, so in a `tiles` run it is
+  the cgroup's headroom after the convert returned (#485). The widths of
+  export's waves have used it since #303. On Linux that first call first
+  returns the allocator's freed pages to the OS (`release_retained_memory`):
+  one `mi_collect(true)` on the calling thread, which frees that thread's
+  heap and purges the shared arenas' purgeable pages, and glibc's
+  `malloc_trim`. Pages still owned by a live pool worker's heap can stay.
+  mimalloc purges freed pages only after its 1 s purge delay under `auto`
+  and `speed`: on Mato Grosso under a 24 GiB cgroup the probe otherwise
+  counted 1-1.8 GiB the convert had just freed, and the z13 level store
+  spilled 2 GiB in 5 of 10 runs. The release costs every run ~50 ms, as the
+  export re-faults the pages (#876);
 - **export's dense-tile refusal** (`check_levels_fit`, #665): it uses
   `probe_oom_memory_limit()`, fresh and without `memory.high`, because that
   check measures what would kill the process, not what the run may hold;

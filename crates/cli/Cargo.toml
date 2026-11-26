@@ -32,7 +32,7 @@ gen-docs = ["dep:clap-markdown"]
 # Moldova, -23% on NZ, -12% on Mato Grosso, and a bounded run under a 4 GiB
 # cap completed. musl uses mimalloc unconditionally (#480) whatever this
 # says. Ignored under `dhat-heap` (dhat owns the allocator).
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "tylertoo-core/mimalloc"]
 
 # The whole CLI is `tylertoo_cli::run`, so the Python wheel runs the same
 # code as the binary (#819); main.rs adds only the allocator and profiler.
@@ -79,9 +79,13 @@ mimalloc = { version = "0.1", optional = true }
 # release.yml.
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = "0.1"
+# Its memory probe releases mimalloc's freed pages (#876) there too.
+tylertoo-core = { workspace = true, features = ["mimalloc"] }
 
 [dev-dependencies]
 serde_json = "1"
+# The memory-probe release test (#876) frees on the pool, as convert does.
+rayon = { workspace = true }
 tempfile = "3"
 # Synthetic GeoParquet fixtures written by the CLI integration tests.
 arrow-array = { workspace = true }

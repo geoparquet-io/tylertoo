@@ -2357,7 +2357,9 @@ processed at once, and how many row groups the writer encodes at once.
 Export applies the same rule. `speed` keeps every level's tile members in
 RAM and sizes the partition wave from the cores alone; `bounded` spills them
 and keeps the wave caps export always had; `auto` keeps them in RAM when they
-fit the allowance and narrows the wave to fit it. Under every profile, export
+fit the allowance and narrows the wave to fit it. Export probes memory once,
+after the allocator returns its freed pages to the OS, so in `tiles` the
+memory the convert has just freed counts as available (#876). Under every profile, export
 still refuses a tile that alone needs more than the machine's memory
 ([Export waves](guides/scaling.md#export-waves)).
 

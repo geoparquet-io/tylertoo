@@ -111,7 +111,9 @@ can still add memory overhead. A build with `--no-default-features` uses the
 system allocator, except on musl targets, which always use mimalloc.
 
 tylertoo reads cgroup v2 `memory.max` and `memory.high` or the cgroup v1 limit,
-subtracting memory the cgroup cannot reclaim. Slurm, Docker, and Kubernetes
+subtracting memory the cgroup cannot reclaim. Before export probes it, the
+allocator returns its freed pages to the OS, so memory the convert has
+already freed is not counted against the export. Slurm, Docker, and Kubernetes
 jobs use this limit to size buffers. `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides
 both `MemAvailable` and the cgroup figure. Use it to reserve headroom, but
 avoid setting it cluster-wide to the node's RAM: it disables the cgroup check.

@@ -224,16 +224,18 @@ pub(super) fn auto_backing(
 ///
 /// The machine/cgroup probe is computed once per process and cached (the
 /// `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override is not: it is read on every call,
-/// so set it before a run starts, not during one). The probe is called ~5×
-/// per run (convert's pass-1 grid budget and pass-2 backing decision, export's
-/// wave preflight and its log line), every input is process-global, and a
-/// cached figure also keeps the paired "decide" and "log/assert" calls from
-/// disagreeing when `MemAvailable` drifts between them.
+/// so set it before a run starts, not during one). Only export reads it
+/// (`export_budget`: its waves, its valve floors and the join's fits),
+/// every input is process-global, and a cached figure also keeps the paired
+/// "decide" and "log/assert" calls from disagreeing when `MemAvailable`
+/// drifts between them. Convert sizes from its own uncached
+/// `MemoryBudget::probe`.
 ///
-/// Must NOT be called before pass 1 has run: the first call freezes the
-/// figure, and a pre-scan call would cache a near-empty-cgroup headroom that
-/// inflates every later `auto` decision. Pre-scan checks (the #543 pass-1
-/// memory preflight) use the uncached [`probe_preflight_memory_limit`].
+/// Must NOT be called before the memory it should count as free is freed:
+/// the first call freezes the figure, and a pre-scan call would cache a
+/// near-empty-cgroup headroom that inflates every later `auto` decision.
+/// Pre-scan checks (the #543 pass-1 memory preflight) use the uncached
+/// [`probe_preflight_memory_limit`].
 pub(super) fn available_memory_bytes() -> Option<u64> {
     #[cfg(test)]
     AVAILABLE_MEMORY_CALLS.with(|c| c.set(c.get() + 1));
@@ -288,9 +290,41 @@ fn auto_mem_limit_override() -> Option<u64> {
 /// The uncached machine/cgroup probe, without the override: what the
 /// process-wide cache holds.
 fn probe_machine_memory_bytes() -> Option<u64> {
+    release_retained_memory();
     let machine = read_proc_mem_available();
     let cgroup = cgroup_memory_limit_bytes();
     effective_available(machine, cgroup)
+}
+
+/// Return the allocator's freed but retained pages to the OS, so the probe
+/// does not count memory the process has already let go (#876). mimalloc
+/// (the CLI's and the wheel's allocator) purges freed pages only after its
+/// 1 s purge delay under `auto` and `speed`, so a `tiles` export probed
+/// right after the convert freed its pass-2 state counted 1-1.8 GiB of free
+/// memory as held. glibc keeps freed chunks in its arenas until trimmed.
+/// It runs once per process, with the cached probe; the export re-faults
+/// what it releases (~50 ms a run).
+///
+/// One `mi_collect(true)`, on the calling thread: it frees that thread's
+/// heap and purges the shared arenas' purgeable pages. Pages still owned by
+/// a live pool worker's heap can stay until that worker reuses or collects
+/// them. Linux only, the one platform whose probe reads anything.
+fn release_retained_memory() {
+    #[cfg(all(target_os = "linux", feature = "mimalloc", not(feature = "dhat-heap")))]
+    {
+        use libmimalloc_sys as _;
+        extern "C" {
+            fn mi_collect(force: bool);
+        }
+        // SAFETY: plain FFI call into mimalloc's own state; it takes no
+        // pointers.
+        unsafe { mi_collect(true) };
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: plain FFI call; it only returns free heap pages to the kernel.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 /// Combine the machine-wide availability figure with the cgroup limit: the
@@ -395,8 +429,8 @@ pub(super) fn probe_preflight_memory_limit() -> Option<MemoryLimit> {
 /// for export's dense-tile refusal (#665): the override, else the smaller of
 /// `MemAvailable` and the cgroup hard-limit headroom.
 ///
-/// Uncached because in a `tiles` run [`available_memory_bytes`] was frozen
-/// during convert's pass 1, before convert freed that memory. cgroup
+/// Uncached because [`available_memory_bytes`] is frozen at its first call
+/// and the refusal must see what the process holds when it checks. cgroup
 /// `memory.high` is left out: going over it throttles and reclaims, it does
 /// not kill.
 pub(super) fn probe_oom_memory_limit() -> Option<MemoryLimit> {
@@ -931,11 +965,8 @@ impl SinkAutoTuner {
     }
 
     /// A downgrade can only apply to a [`MemoryProfile::Auto`] run that
-    /// started in [`SinkBacking::Ram`], so only that case probes a budget.
-    ///
-    /// The probe is skipped outright otherwise: `available_memory_bytes`
-    /// caches process-wide on its first call, and a `bounded`/`speed` run must
-    /// not have that call moved here (#485).
+    /// started in [`SinkBacking::Ram`], so only that case reads `memory`, the
+    /// convert's own budget (never `available_memory_bytes`' cache, #485).
     fn new(
         profile: MemoryProfile,
         backing: SinkBacking,
@@ -5092,6 +5123,53 @@ mod cgroup_tests {
     use tempfile::TempDir;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// This process's `RssAnon`, in bytes.
+    fn rss_anon_bytes() -> u64 {
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let kib = status
+            .lines()
+            .find_map(|l| l.strip_prefix("RssAnon:"))
+            .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+            .unwrap();
+        kib << 10
+    }
+
+    /// #876: a `tiles` run probes its export budget just after the convert
+    /// freed its pass-2 state, and the allocator still held those pages, so
+    /// up to ~1.8 GiB of free memory counted as used and z13 spilled. The
+    /// probe returns them first. 128 MiB of 32 KiB chunks, each pinned by a
+    /// kept 64 B neighbour so glibc cannot trim them on free. When the
+    /// allocator returned them anyway (glibc serving the chunks by `mmap`),
+    /// there is nothing to check.
+    #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn the_probe_returns_freed_heap_pages_before_it_reads() {
+        const TOTAL: u64 = 128 << 20;
+        let base = rss_anon_bytes();
+        let mut kept = Vec::new();
+        let freed: Vec<Vec<u8>> = (0..TOTAL / (32 << 10))
+            .map(|_| {
+                let chunk = vec![1u8; 32 << 10];
+                kept.push(vec![1u8; 64]);
+                chunk
+            })
+            .collect();
+        drop(freed);
+        let before = rss_anon_bytes();
+        let retained = before.saturating_sub(base);
+        if retained < TOTAL / 2 {
+            eprintln!(
+                "the allocator kept {} MiB after the free; nothing to release",
+                retained >> 20
+            );
+            return;
+        }
+        let _ = probe_machine_memory_bytes();
+        let released = before.saturating_sub(rss_anon_bytes());
+        assert!(released >= TOTAL / 2, "released {} MiB", released >> 20);
+        drop(kept);
+    }
 
     /// The env override is not frozen by the cache: set after the cache is
     /// populated it wins, and cleared again the cached figure returns. This

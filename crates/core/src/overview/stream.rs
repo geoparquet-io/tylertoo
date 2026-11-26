@@ -8233,7 +8233,7 @@ mod tests {
 
     /// #543 review (S1-1): the production preflight must not touch
     /// `pipeline::available_memory_bytes` — its process-wide cache is meant
-    /// to hold post-pass-1 headroom, and a pre-scan call would freeze a
+    /// to hold export-start headroom, and a pre-scan call would freeze a
     /// near-empty-cgroup figure for every later `auto` decision. Counted
     /// per thread, so parallel tests warming the cache cannot race this.
     #[test]

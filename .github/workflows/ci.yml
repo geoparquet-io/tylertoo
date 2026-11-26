@@ -417,6 +417,12 @@ jobs:
         # nextest does not run doctests.
         run: cargo test --locked --all-features --doc
 
+      - name: Run the mimalloc memory-probe test (default features)
+        # `--all-features` enables dhat-heap, which compiles this test out;
+        # it pins the CLI allocator's release before the export probe (#876).
+        if: runner.os == 'Linux'
+        run: cargo nextest run --locked -p tylertoo --test memory_probe_release --profile quick
+
       # Main only; see CACHES in the header.
       - name: Save cargo build cache
         if: always() && github.ref == 'refs/heads/main' && matrix.rust == 'stable' && steps.build-cache.outputs.cache-hit != 'true'

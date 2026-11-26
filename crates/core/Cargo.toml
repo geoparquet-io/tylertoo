@@ -38,6 +38,10 @@ serve = ["dep:tiny_http", "dep:percent-encoding"]
 # Remote input support: read GeoParquet directly from s3://, https://,
 # and gs:// URLs via range requests (issue #210). Off by default to keep
 # the pure-local library build dependency-light; the CLI enables it.
+# The process's global allocator is mimalloc (the CLI and the Python wheel
+# install it): the memory probe returns its freed pages to the OS before it
+# reads what the process holds (#876).
+mimalloc = ["dep:libmimalloc-sys"]
 remote = [
     "tylertoo-io/remote",
     "dep:object_store",
@@ -54,6 +58,7 @@ remote = [
 [dependencies]
 clap = { workspace = true, optional = true }
 dhat = { version = "0.3", optional = true }
+libmimalloc-sys = { version = "0.1.49", default-features = false, optional = true }
 geoarrow = { workspace = true }
 geoarrow-array = { workspace = true }
 geo-traits = { workspace = true }
