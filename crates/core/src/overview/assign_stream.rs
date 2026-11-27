@@ -70,11 +70,12 @@ pub(super) fn record_path(streamed: bool) {
 pub(super) fn record_path(_streamed: bool) {}
 
 /// Whether a test forced the table path.
+#[cfg(test)]
 fn table_forced() -> bool {
-    #[cfg(test)]
-    if FORCE.get() == Some(false) {
-        return true;
-    }
+    FORCE.get() == Some(false)
+}
+#[cfg(not(test))]
+fn table_forced() -> bool {
     false
 }
 
