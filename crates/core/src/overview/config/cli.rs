@@ -725,7 +725,7 @@ pub struct TilesArgs {
     /// Build one shard: `I/N` for data shard I of N, or
     /// `coarse` for the zooms below the pivot. Requires `--shard-plan`, and
     /// data shards also need `--plan`. See
-    /// <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-same-build-into-shard-jobs>.
+    /// <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-build-across-workers>.
     #[arg(
         long,
         value_name = "I/N|coarse",

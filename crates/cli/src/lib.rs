@@ -107,7 +107,7 @@ enum Command {
     /// If many ranges are empty, reduce `--shards` or use a finer `--pivot`.
     /// Choose a pivot with a few populated tiles per shard, within the build's
     /// finest zoom. See
-    /// <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-same-build-into-shard-jobs>.
+    /// <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-build-across-workers>.
     ShardPlan(ShardPlanArgs),
     /// Serve PMTiles archives over HTTP with a map viewer.
     #[command(long_about = format!(r#"Serve PMTiles archives over HTTP with a map viewer.
@@ -205,7 +205,7 @@ fn quoted_preview(value: &str) -> String {
 ///
 /// The merge copies tile bodies unchanged and refuses inputs whose tile
 /// ids overlap. Empty archives are skipped. See
-/// <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-same-build-into-shard-jobs>.
+/// <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-build-across-workers>.
 #[derive(Parser, Debug)]
 pub struct MergeArgs {
     /// Output PMTiles archive.

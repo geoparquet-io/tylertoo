@@ -282,4 +282,4 @@ See the [benchmark method](https://github.com/geoparquet-io/tylertoo/blob/main/b
 
 Reproduce: `benchmarks/release.sh`
 
-For sharded builds, follow the [Brazil tutorial's sharding step](tutorials/brazil.md#2-split-the-same-build-into-shard-jobs).
+For sharded builds, follow the [Brazil tutorial's sharding step](tutorials/brazil.md#2-split-the-build-across-workers).

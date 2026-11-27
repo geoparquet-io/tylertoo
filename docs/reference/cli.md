@@ -106,7 +106,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 
 | Option | Python | Description |
 | --- | --- | --- |
-| <a id="option-shard"></a>`--shard <I/N\|coarse>` | CLI only | Build one shard: `I/N` for data shard I of N, or `coarse` for the zooms below the pivot. Requires `--shard-plan`, and data shards also need `--plan`. See <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-same-build-into-shard-jobs>. |
+| <a id="option-shard"></a>`--shard <I/N\|coarse>` | CLI only | Build one shard: `I/N` for data shard I of N, or `coarse` for the zooms below the pivot. Requires `--shard-plan`, and data shards also need `--plan`. See <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-build-across-workers>. |
 | <a id="option-shard-plan"></a>`--shard-plan <PATH>` | CLI only | The shard plan from `tylertoo shard-plan` that every job shares. Give every job the same inputs and settings. If a saved convert plan no longer matches the inputs or selection settings, rebuild it with `--plan-only` and `--save-plan` before restarting the data jobs. |
 | <a id="option-tile-range"></a>`--tile-range <LO..HI>` | `tile_range` | Emit only the tiles in this tile-id range, `LO..HI`: two tile ids at one zoom, plus their descendants. Prefer `--shard`, which also skips input the range cannot reach. |
 | <a id="option-plan-only"></a>`--plan-only` | CLI only | Write the convert plan (`--save-plan`) and stop, with no export and no OUTPUT. Requires `--save-plan`. Use it when only the data jobs need tiles. The plan still covers the whole input and its selection settings; it does not create the separate `--shard-plan`. |
@@ -382,7 +382,7 @@ tylertoo merge [OPTIONS] <OUTPUT> <INPUT>...
 
 Cut a dataset's tile space into N disjoint shards for a sharded build.
 
-If row groups lack usable bounding-box statistics, or cover too much of the pivot zoom, their rows are spread evenly instead of balanced. Prepare tighter row groups with `gpio sort hilbert --add-bbox`. Empty ranges are legal and produce empty archives that `merge` skips. If many ranges are empty, reduce `--shards` or use a finer `--pivot`. Choose a pivot with a few populated tiles per shard, within the build's finest zoom. See <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-same-build-into-shard-jobs>.
+If row groups lack usable bounding-box statistics, or cover too much of the pivot zoom, their rows are spread evenly instead of balanced. Prepare tighter row groups with `gpio sort hilbert --add-bbox`. Empty ranges are legal and produce empty archives that `merge` skips. If many ranges are empty, reduce `--shards` or use a finer `--pivot`. Choose a pivot with a few populated tiles per shard, within the build's finest zoom. See <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-build-across-workers>.
 
 ```text
 tylertoo shard-plan [OPTIONS] --output <PATH> --shards <N> [INPUT]

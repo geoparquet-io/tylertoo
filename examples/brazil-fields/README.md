@@ -1,77 +1,30 @@
 <!-- --8<-- [start:build] -->
-# Brazil fields: a whole country from cloud data to tiles
+# Build vector tiles from cloud data
 
-Stream Brazil's 2025 field predictions from a cloud bucket into one PMTiles
-archive with one `tylertoo tiles` command. Then split the same build into
-independent jobs that can run at the same time on a cluster.
-
-The input is the 45 GeoParquet files under Brazil's prefix on
-[Source Cooperative](https://source.coop/ftw/global-data): 11.6 GB with
-55,500,520 rows. The data holds about 27.5 million rows for 2024 and
-28.0 million for 2025. The `determination:datetime` column identifies
-each prediction's year. Without the year in the filter, the map draws most fields
-twice, once per year. Keeping only 2025 fields of one hectare or more
-leaves 4,173,713 fields, or 7.5% of the rows, covering 103.3 million hectares.
-The map shows A5 density cells at z0-z7 and field polygons at z8-z14.
-
-Each step is a script in
-[`examples/brazil-fields/`](https://github.com/geoparquet-io/tylertoo/tree/main/examples/brazil-fields).
+In this tutorial, you use tylertoo to build a PMTiles archive of Brazil's
+fields from GeoParquet on Source Cooperative. First, you build the archive
+with one command. Then you split the same build into jobs that can run on
+separate machines and merge their outputs.
 
 ## Before you begin
 
-Install `tylertoo` with `cargo install tylertoo`. You don't need credentials:
-requests are anonymous, and `tylertoo` logs a warning. Run the steps in
-order in an empty working directory. Step 1 downloads about 11.6 GB after
-staging the columns its first pass needs. In step 2, the coarse job and
-each shard download their own input. In the worst case, each of the five
-jobs downloads the full dataset.
+Install tylertoo with `cargo install tylertoo` and run the scripts in an
+empty directory. Source Cooperative lets you read this dataset without
+credentials.
 
-If the default disk is short on space, set `TMPDIR` to a roomier disk.
-Alternatively, pass `--spill-dir PATH` to `tylertoo tiles` to choose a
-directory for staged remote input and the intermediate overview. Step 2
-runs five jobs in sequence, so it takes longer than step 1 on one machine.
+tylertoo streams the input from the bucket. The first build transfers about
+11.6 GB. Allow disk space for staged input, a temporary file of about
+12 GiB, and the 3.1 GB output archive. If you need to use a different disk
+for temporary files, set `TMPDIR` or pass `--spill-dir PATH` to
+`tylertoo tiles`.
 
-The output and timings in both steps are from a run on November 27, 2026.
-The run used a 64-core aarch64 development machine with a 40 GB memory cap.
-The whole tutorial, both steps, took 35 minutes on that machine.
+Together, the two builds took about 35 minutes on a 64-core machine with a
+40 GB memory cap.
 
-## 1. Tile all Brazil straight from the bucket
+## 1. Build tiles from the bucket
 
-Point `AWS_ENDPOINT_URL` at Source Cooperative. tylertoo reads an `s3://`
-prefix ending in `/` as one dataset. The `--filter` keeps 2025
-fields of one hectare or more using `determination:datetime` and
-`metrics:area`, which stores square meters. Enclose the whole filter in
-double quotes, and escape the inner quotes around column names.
-
-This run reads 875 of the 879 row groups. It stages 1.24 GB of the columns
-the first pass needs. Then it fetches 11,062.65 MiB (about 11.6 GB, or 100%
-of the object) in 5,340 range requests. Both years share row groups, so the
-year filter cannot skip most downloads. The command counts the A5 cells
-first and then tiles the fields.
-
-Use `--band 0-7:a5` to draw A5 cells at z0-z7. Each cell holds its ID in
-`cell` and the number of fields whose centroid falls in it in `point_count`.
-Add `--accumulate-attribute metrics:area:sum` to sum the field areas in
-`metrics:area`. At z8-z14, use `--band 8-14:geom` to draw field polygons,
-where `metrics:area` is each field's own area.
-
-Name the shared layer `fields` with `--layer-name`. Style by zoom or by
-whether `point_count` is present.
-
-Choose another cell system by changing `a5` in `--band 0-7:a5`:
-
-| System | Cells |
-| --- | --- |
-| `grid` | Squares aligned to the tile grid at each zoom |
-| `h3` | Hexagons |
-| `s2` | Quadrilaterals on a cube |
-| `a5` | Pentagons with equal areas |
-
-In every system, cell resolution follows the zoom, and each field counts
-in the cell that holds its centroid. This keeps counts exact at every zoom.
-
-Run the script to build the archive. `tylertoo stats` reports tile sizes
-per zoom.
+The input URL ends in `/`, which tells tylertoo to read the GeoParquet files
+under that prefix as one dataset.
 
 File: `01-tiles.sh`
 
@@ -121,42 +74,21 @@ z    tiles        total     mean      p50      p99      max
 14  583,447  986,072,532    1,690    1,282    6,818   12,790
 ```
 
-The archive `brazil.pmtiles` holds 850,534 tiles across z0-z14 and is
-3.1 GB. On the 64-core development machine with a 40 GB memory cap, step 1
-took about 11 minutes 48 seconds. The command writes a 12.33 GiB
-intermediate overview file and removes it after the export.
+The filter keeps about 4.2 million fields. Because both years share row
+groups, tylertoo still reads almost all the input from the bucket.
 
-Across z0-z7, the map has 185,261 A5 cells, including 129,558 at z7,
-counting each cell once. At every cell zoom z0-z7, `point_count` sums to
-4,173,713 and `metrics:area` sums to 103.3 million hectares, also counting
-each cell once. A decoded tile file lists a cell once per tile it touches.
+In the A5 cells, `point_count` stores the number of fields whose center
+falls in the cell, and `metrics:area` stores their combined area. On the
+field boundaries, `metrics:area` stores the area of each field.
 
-Tiles are heaviest at z8-z9, where the map shows whole fields across
-areas with dense soy fields. The size valve merges features to keep tiles near the size cap.
-Two z8 tiles use a reduced extent of 2048 to fit the cap. No tile remains
-over it.
-Drop `brazil.pmtiles` onto [pmtiles.io](https://pmtiles.io/) to inspect it.
+## 2. Split the build across workers
 
-## 2. Split the same build into shard jobs
+The zoom level where `shard-plan` divides the tiles is called the *pivot*.
+Cell bands must end below the pivot.
 
-To distribute the build across a cluster, use `shard-plan` to cut the z10
-tile space, the pivot, into four shards of about 13.9 million rows each.
-The plan counts rows before the filter. The coarse job reads the whole
-prefix and draws z0-z9: the cells and the z8-z9 fields. It saves the
-convert plan with `--save-plan`. Each shard loads that plan with `--plan`
-and draws z10-z14 for its slice.
-
-Give every job the same options through the `OPTIONS` array. The plan's
-fingerprint covers them, including `--band`, and `tylertoo` refuses a
-mismatched job. A cell band must end below the pivot.
-
-The script runs the four shard jobs in sequence. On a cluster, they run on
-separate machines at the same time. Once the jobs finish, `merge`
-concatenates the five archives.
-
-A shard with no rows writes an empty archive and exits 0; `merge` skips empty archives and refuses archives whose tiles overlap.
-
-In this run, shards 0-3 downloaded 11.6, 10.4, 5.2, and 6.8 GB, respectively.
+On a cluster, give every worker the same `OPTIONS` and both plan files, then
+gather the five archives in one directory for `merge`. Each job reads from
+the bucket on its own and can transfer up to 11.6 GB.
 
 File: `02-shard.sh`
 
@@ -221,31 +153,20 @@ Cut 4 shard(s) at pivot z10 for s3://ftw/global-data/predictions/vectors/alpha/r
 ...
 ```
 
-The merged `sharded.pmtiles` has the same 850,534 tiles as step 1.
-A few z10 tiles at the size cap differ between the two builds
-([#854](https://github.com/geoparquet-io/tylertoo/issues/854)). The z10 total
-differs slightly: 234,519,836 bytes in step 1 and 234,519,671 bytes in step 2.
+`sharded.pmtiles` has as many tiles as `brazil.pmtiles`, but a few tiles at
+zoom level 10 differ between the two builds.
 
 <!-- --8<-- [end:build] -->
 <!-- --8<-- [start:run] -->
-## Run the whole workflow
+## Run both builds from scripts
+
+The repository includes a script for each build.
 
 ```bash
 git clone https://github.com/geoparquet-io/tylertoo.git
 mkdir brazil
 cd brazil
-for step in ../tylertoo/examples/brazil-fields/0*.sh; do bash "$step"; done
+bash ../tylertoo/examples/brazil-fields/01-tiles.sh
+bash ../tylertoo/examples/brazil-fields/02-shard.sh
 ```
-
-## Next steps
-
-- The [CLI reference](https://geoparquet-io.github.io/tylertoo/reference/cli/)
-  describes every flag, including `--bbox`, `--filter`, and `--shard`, and
-  the `shard-plan` and `merge` commands.
-- The [tuning reference](https://geoparquet-io.github.io/tylertoo/reference/tuning/)
-  explains every generalization setting, including `--band`.
-- Use `tylertoo pyramid` to combine bands from separate inputs or archives,
-  such as cells from another dataset. See the same tuning reference.
-- The [Python reference](https://geoparquet-io.github.io/tylertoo/reference/python/)
-  lists `convert`, which takes the same bands as `bands=[...]`.
 <!-- --8<-- [end:run] -->
