@@ -25,6 +25,7 @@ Local CI gates (see [ci/README.md](https://github.com/geoparquet-io/tylertoo/blo
       `cargo test` suite locally)
 - [ ] Generated docs regenerated if CLI help/output changed:
       `cargo run -p tylertoo --features gen-docs -- gen-reference-docs > docs/reference/cli.md`
+      and `cargo run -p tylertoo --features gen-docs -- gen-reference-docs tippecanoe > crates/cli/docs/tippecanoe-tables.md`
 - [ ] Version files untouched (or bumped only via `uv run cz bump` from the
       repo root, per CONTRIBUTING.md), if applicable
 - [ ] Rust/Python duplication checks pass (`npx --yes jscpd@4.0.5` and

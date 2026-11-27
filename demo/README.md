@@ -10,9 +10,9 @@ with **centroids at z0–7 and polygons at z8–14** in a single archive
 tippecanoe does not read GeoParquet, let alone filter a remote collection
 while tiling it.
 
-- **Numbers + methodology + findings:** [RESULTS.md](./RESULTS.md). The
-  [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/)
-  summarizes them.
+- **Historical measurements and findings:** see the
+  [archived demo results](../context/archive/bench/demo-RESULTS.md). For current
+  measurements, see the [benchmarks page](https://geoparquet-io.github.io/tylertoo/benchmarks/).
 - The docs site no longer hosts an interactive viewer for this archive. Drop
   the public URL below onto [pmtiles.io](https://pmtiles.io/) to view it.
 

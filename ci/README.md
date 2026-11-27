@@ -75,12 +75,9 @@ pins the entry count, so a new exemption also changes that test.
 | Generated docs | `uv run --no-project python scripts/gen_bench_docs.py --check` |
 | Fixtures | `scripts/ci/verify_fixtures.sh tests/fixtures/realdata` |
 
-`valve-guard.yml` runs nightly on `ubuntu-latest`, where only its merge:drop
-ratio half applies. When the repository variable `TYLERTOO_BENCH_RUNNER` is
-`true`, a second leg runs on the maintainer's self-hosted runner (labels
-`self-hosted`, `tylertoo-bench`), where the baseline half applies too. The
-workflow triggers only on `schedule` and `workflow_dispatch`, never on pull
-requests.
+`bench-nightly.yml` runs nightly on `ubuntu-latest`, where only the valve
+guard's merge:drop ratio half applies. The workflow triggers only on `schedule`
+and `workflow_dispatch`, never on pull requests.
 
 The archive e2e workflow still runs its strict invariant matrix and independent
 readers (`pmtiles verify` and `scripts/verify_archive.py`). Feature accounting

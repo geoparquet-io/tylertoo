@@ -8,6 +8,7 @@ Production data samples for testing tylertoo tiling performance.
 |------|----------|------|--------|----------|
 | `open-buildings.parquet` | 1,000 | 143KB | VIDA Google-Microsoft-OSM Open Buildings (Andorra) | Quick tests, golden comparisons |
 | `fieldmaps-madagascar-adm4.parquet` | 17,465 | 28MB | [FieldMaps](https://fieldmaps.io) | **Parallelization benchmarks** |
+| `fieldmaps-madagascar-adm4-hilbert.parquet` | 17,465 | 18MB | FieldMaps | Tutorial and README input: the file above, Hilbert-sorted by gpio |
 | `fieldmaps-boundaries.parquet` | 3 | 2.2MB | FieldMaps | Large polygon tests |
 | `road-detections.parquet` | ~1,000 | 90KB | Road detection ML | LineString tests |
 | `ftw-moldova-z10.parquet` | 10,931 | 1.9MB | [Fields of The World](https://source.coop/ftw/global-data) | Coverage-fill work ratchets (#750) |
@@ -18,6 +19,15 @@ Production data samples for testing tylertoo tiling performance.
 - **Open buildings**: Andorra subset of [VIDA's Google-Microsoft-OSM Open Buildings](https://source.coop/vida/google-microsoft-osm-open-buildings), ODbL 1.0 (Microsoft and OpenStreetMap footprints)
 - **Road detections**: derived from ML model outputs
 - **FTW Moldova**: field boundaries from [Fields of The World](https://source.coop/ftw/global-data) (Taylor Geospatial Institute and Microsoft AI for Good Research Lab), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The fields of z10 tile 10/593/357 of the `bench-coalesce-v1` Moldova input, cut with `uvx --from geoparquet-io==1.7.0 gpio extract --bbox 28.476562,47.517201,28.828125,47.754098`, then reduced to the geometry and bbox columns.
+- **FieldMaps Madagascar, Hilbert-sorted**: `fieldmaps-madagascar-adm4.parquet` with the geometry column converted from WKB to native geometry and sorted by gpio. The output is deterministic (sha256 in `benchmarks/fixtures.sha256`). Run this in a scratch directory that holds the raw fixture:
+
+  ```bash
+  uvx --from duckdb-cli==1.5.6 duckdb -c "LOAD spatial; COPY (
+    SELECT * EXCLUDE (geometry_bbox) REPLACE (ST_GeomFromWKB(geometry) AS geometry)
+    FROM 'fieldmaps-madagascar-adm4.parquet') TO 'raw.parquet' (FORMAT parquet);"
+  uvx --from geoparquet-io==1.7.0 gpio convert geoparquet raw.parquet fieldmaps-madagascar-adm4-hilbert.parquet
+  uvx --from geoparquet-io==1.7.0 gpio check all fieldmaps-madagascar-adm4-hilbert.parquet --strict
+  ```
 
 The repository-root `NOTICE` file lists the verified licenses.
 

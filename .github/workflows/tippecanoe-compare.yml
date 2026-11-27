@@ -8,7 +8,7 @@
 #
 #   1. builds the release binary and, from source at a pinned tag + commit
 #      SHA (benchmarks/e2e/setup_tippecanoe.sh, cached in .tools/ on the
-#      script's hash, so a re-pin invalidates the cache), tippecanoe 2.79.0;
+#      script's hash, so a re-pin invalidates the cache), tippecanoe 2.82.0;
 #   2. runs benchmarks/e2e/compare_tippecanoe.py: both tools tile every
 #      fixture with matched flags (the README.md "Settings parity" set;
 #      tylertoo in its quality-matched configuration, which is the run
@@ -160,6 +160,11 @@ jobs:
 
       - name: Build tippecanoe (pinned tag + SHA)
         run: benchmarks/e2e/setup_tippecanoe.sh
+
+      - name: Check documented tippecanoe flags
+        run: |
+          eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
+          python3 scripts/ci/check_tippecanoe_flags.py "$TIPPECANOE_BIN" crates/cli/docs/tippecanoe-tables.md
 
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3

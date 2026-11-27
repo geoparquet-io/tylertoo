@@ -223,7 +223,7 @@ is missing prints a message and skips. With
 `TYLERTOO_BENCH_REQUIRE_FIXTURES=1`, which the regression gate sets, it
 panics instead, so a gated run can't compare nothing.
 
-`crates/core/benches/benches.toml` is the one bench list: the weekly
+`crates/core/benches/benches.toml` is the one bench list: the Criterion
 gate, CodSpeed and this table read it, and `ci/exemptions.toml` holds
 each bench a system skips, with the reason. The table below is generated;
 after editing either file, run `scripts/bench_list.py docs`. The Gate
@@ -258,7 +258,7 @@ cargo bench --package tylertoo-core --bench clipping
 open target/criterion/report/index.html
 ```
 
-`scripts/criterion_compare.sh --list` prints the weekly gate's set. Run the
+`scripts/criterion_compare.sh --list` prints the Criterion gate's set. Run the
 whole set:
 
 ```bash
@@ -276,9 +276,11 @@ cargo bench --package tylertoo-core \
   --bench assign_scaling
 ```
 
-`benchmarks/overview/` scripts the corpus-scale storage, access, and
-conversion benchmarks. `context/PROFILING.md` covers profiling, including
-the `profiling` Cargo profile and sampling profilers such as samply.
+Run `benchmarks/release.sh` for the release benchmarks. The
+[archived performance history](context/archive/bench/overview-PROFILE.md)
+records earlier storage, access, and conversion investigations.
+`context/PROFILING.md` covers profiling, including the `profiling` Cargo
+profile and sampling profilers such as samply.
 
 #### CodSpeed
 
@@ -351,30 +353,16 @@ The gate runs in these cases:
   changes threading, I/O, or memory behaviour, which CodSpeed's
   instruction counts can't see. The base is the merge-base with the
   PR's base branch.
-- Every Monday on `main`, against the last `main` commit at least seven
-  days old. The table goes to the pinned "Weekly benchmark comparison"
-  issue as one comment a week. A week with no new commits skips.
 - On `workflow_dispatch`, with an optional `base` input. Without one, a
   run on `main` compares against the newest `v*` release tag, and a run
-  on another branch against its merge-base with `origin/main` (both
-  hosts while the pinned one exists).
-- Every night at 01:00 UTC on `main`, `pipeline` only, on the
-  64-core VM the project runs (the self-hosted `tylertoo-bench` runner, only
-  while the repository variable `TYLERTOO_BENCH_RUNNER` is `true`),
-  against the last `main` commit at least a day old. A failing night
-  comments its table on the "Nightly pipeline benchmark (64-core host)"
-  issue. Pull requests never run on that host. Its numbers are never
-  compared with the 4-core ones: each leg has its own artifact, summary
-  and issue.
+  on another branch against its merge-base with `origin/main`.
 
 The `pipeline` bench is where the gate times `--profile speed`: every
 input runs under `auto` (the bare id) and `speed` (the `-speed` id),
 including a list-heavy and a 100-row-group input that slowed under
 `speed` (#876). Those two read with 2 workers, and pass 2's column-split
 decode then starts at 16 cores (`MemoryBudget::read_decode_plan`). On the
-4-core runner they decode on one thread under either profile; the nightly
-64-core leg times the split, and fails if its host shows fewer than 16
-cores.
+4-core runner they decode on one thread under either profile.
 
 It used to run on every PR that touched `crates/core/`. In 62 runs it
 caught one real change and failed seven times on noise (#759), at about
@@ -659,7 +647,7 @@ own archives go through `pmtiles verify`. The tippecanoe-made
 
 `.github/workflows/tippecanoe-compare.yml` runs on every PR, on each
 push to `main`, and weekly. It tiles the fixtures-v1 inputs with tylertoo
-and with tippecanoe 2.79.0, built from source at a pinned tag and commit.
+and with tippecanoe 2.82.0, built from source at a pinned commit.
 It decodes both archives with independent readers and gates the per-zoom
 ratios of tiles, features, distinct IDs, vertices, and bytes against
 `benchmarks/e2e/tippecanoe_tolerances.toml`.

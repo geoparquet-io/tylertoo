@@ -2980,6 +2980,9 @@ fn preflight_with_memory_limit(
             memory_limit,
             skip_memory_preflight,
             bbox_query.is_some() || mask.is_some() || bound_filter.is_some(),
+            options
+                .coalesce_lines
+                .then_some(options.coalesce_max_level_rows),
             diagnostics,
         )?
     } else {
@@ -5622,7 +5625,7 @@ const MIN_PASS1_CHUNK_ROWS: usize = 256;
 /// A fixed [`PASS1_CHUNK_ROWS`] fans a default 8192-row batch into only 8
 /// chunks — fewer than the cores on a typical machine — and silently
 /// disables chunking entirely for `--read-batch-size` below 1024, which is
-/// exactly what `docs/OVERVIEW_TUNING.md` tells users to do to cut memory.
+/// exactly what `docs/reference/tuning.md` tells users to do to cut memory.
 /// Clamped to [`MIN_PASS1_CHUNK_ROWS`]..=[`PASS1_CHUNK_ROWS`] so neither end
 /// degenerates.
 ///
@@ -8170,20 +8173,37 @@ pub(super) mod tests {
             None,
         ) {
             Err(
-                err @ ConvertError::BudgetExceeded {
-                    phase: "pass-1 scan",
-                    needed: 420,
-                    available: 1,
+                err @ ConvertError::Pass1MemoryExceeded {
+                    rows: 10,
+                    estimated_bytes,
+                    limit_bytes: 1,
+                    coalesce_max_level_rows,
                 },
             ) => {
+                assert_eq!(
+                    estimated_bytes,
+                    10 * super::super::convert::PASS1_BYTES_PER_ROW
+                );
+                assert_eq!(
+                    coalesce_max_level_rows,
+                    Some(options.coalesce_max_level_rows)
+                );
                 let msg = err.to_string();
                 for want in [
-                    "pass-1 scan needs 420 bytes",
-                    "only 1 bytes are available",
-                    "TYLERTOO_SKIP_MEMORY_PREFLIGHT=1",
+                    "rows ×",
+                    "cgroup hard memory limit",
+                    "--coalesce-max-level-rows",
+                    "--no-coalesce-lines",
                 ] {
                     assert!(msg.contains(want), "missing {want:?}: {msg}");
                 }
+                assert!(
+                    msg.contains(&format!(
+                        "{}=true",
+                        super::super::convert::SKIP_MEMORY_PREFLIGHT_ENV
+                    )),
+                    "{msg}"
+                );
             }
             Err(err) => panic!("wrong error: {err}"),
             Ok(_) => panic!("10 rows must not fit a 1-byte mocked limit"),

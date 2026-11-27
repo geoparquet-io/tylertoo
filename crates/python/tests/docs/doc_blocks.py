@@ -13,7 +13,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 EXAMPLES_DIR = REPO_ROOT / "examples"
-MADAGASCAR = "fieldmaps-madagascar-adm4.parquet"
+MADAGASCAR = "fieldmaps-madagascar-adm4-hilbert.parquet"
 
 # Pages written from source by the reference generators; they hold usage
 # strings, not runnable examples.
@@ -77,6 +77,41 @@ def fence_for(source: Path) -> str:
     return f"```{lang}\n{text}\n```"
 
 
+def rendered_source(example: Path) -> str:
+    """Expand the example's README includes in its tutorial or guide page."""
+    readme = example / "README.md"
+    relative = readme.relative_to(REPO_ROOT).as_posix()
+    include = re.compile(
+        rf'^[ \t]*--8<-- "{re.escape(relative)}(?::(?P<section>[^"\n]+))?"[ \t]*$',
+        re.MULTILINE,
+    )
+    pages = [
+        page.read_text(encoding="utf-8")
+        for section in ("tutorials", "guides")
+        for page in sorted((REPO_ROOT / "docs" / section).glob("*.md"))
+    ]
+    matching = [page for page in pages if include.search(page)]
+    if len(matching) != 1:
+        raise ValueError(f"Expected one tutorial or guide page including {relative}")
+    source = readme.read_text(encoding="utf-8")
+
+    def expand(match: re.Match[str]) -> str:
+        section = match.group("section")
+        if section is None:
+            return source
+        snippet = re.search(
+            rf"<!-- --8<-- \[start:{re.escape(section)}\] -->\n?"
+            rf"(?P<body>.*?)<!-- --8<-- \[end:{re.escape(section)}\] -->",
+            source,
+            re.DOTALL,
+        )
+        if snippet is None:
+            raise ValueError(f"Missing snippet section {section!r} in {relative}")
+        return snippet.group("body")
+
+    return include.sub(expand, matching[0])
+
+
 def expected_output(tutorial: str, source: Path) -> str | None:
     """The `text` block shown right after `source`'s fence, if any."""
     blocks = fenced_blocks(tutorial)
@@ -111,3 +146,7 @@ def missing_lines(expected: str, actual: str) -> list[str]:
 def stage_input(madagascar: Path, workdir: Path) -> None:
     """Put the input where a reader's `curl -LO` would have left it."""
     shutil.copyfile(madagascar, workdir / MADAGASCAR)
+    shutil.copyfile(
+        REPO_ROOT / "tests/fixtures/realdata/open-buildings.parquet",
+        workdir / "open-buildings.parquet",
+    )

@@ -2,8 +2,8 @@
 
 Reproducible test datasets + golden references for evaluating
 GeoParquet-embedded multi-resolution **overviews** (quality metrics in
-`corpus/METRICS.md`, sweep decisions in `corpus/SWEEPS.md`, access/storage
-benchmarks in `benchmarks/overview/`).
+`corpus/METRICS.md`, sweep decisions in `corpus/SWEEPS.md`, release
+benchmarks in [the end-to-end benchmark instructions](../benchmarks/e2e/README.md)).
 
 **This directory contains scripts and manifests only. No data files
 are committed.** Everything under `corpus/data/` is gitignored and

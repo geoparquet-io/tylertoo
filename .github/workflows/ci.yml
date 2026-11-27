@@ -66,8 +66,8 @@
 # and evicted main's, which PRs restore from (#756). The beta lanes run
 # only on main against a moving toolchain, so they don't cache target/.
 #
-# Benchmarks run in codspeed.yml (per PR) and bench-regression.yml (label,
-# weekly; nightly `pipeline` on the 64-core host); the tippecanoe parity
+# Benchmarks run in codspeed.yml (per PR), bench-regression.yml (label or
+# manual dispatch) and bench-nightly.yml (the nightly tier); the tippecanoe parity
 # gate (#420) runs in tippecanoe-compare.yml (PRs, push to main, weekly).
 #
 # TOOLCHAIN POLICY: floating `stable` for all gates, with a `beta` lane in the
@@ -806,7 +806,7 @@ jobs:
   #
   # - The CLI and Python reference pages are generated from the clap help
   #   strings (hidden gen-docs feature) and the docstrings in
-  #   crates/python/python/tylertoo/__init__.py, committed
+  #   crates/python/src/docs/*.txt, committed
   #   under docs/reference/, and must match a fresh regeneration.
   # - rustdoc builds with -D warnings, so docs.rs never shows a broken link.
   # - crates/python/tests/docs runs both tutorials (examples/*) and the
@@ -881,6 +881,8 @@ jobs:
         run: |
           cargo run --locked -p tylertoo --features gen-docs -- gen-reference-docs \
             > docs/reference/cli.md
+          cargo run --locked -p tylertoo --features gen-docs -- gen-reference-docs tippecanoe \
+            > crates/cli/docs/tippecanoe-tables.md
 
       - name: Build extension and regenerate Python reference
         working-directory: crates/python
@@ -891,9 +893,10 @@ jobs:
 
       - name: Fail if reference docs drifted
         run: |
-          if ! git diff --exit-code -- docs/reference/cli.md docs/reference/python.md; then
+          if ! git diff --exit-code -- docs/reference/cli.md docs/reference/python.md crates/cli/docs/tippecanoe-tables.md; then
             echo "::error::Reference docs are stale — regenerate and commit:"
             echo "  cargo run -p tylertoo --features gen-docs -- gen-reference-docs > docs/reference/cli.md"
+            echo "  cargo run -p tylertoo --features gen-docs -- gen-reference-docs tippecanoe > crates/cli/docs/tippecanoe-tables.md"
             echo "  cd crates/python && uv run --no-sync --with docstring-parser==0.18.0 python scripts/gen_reference.py > ../../docs/reference/python.md"
             exit 1
           fi
@@ -1362,6 +1365,7 @@ jobs:
           uv run --no-project --python 3.12 --with pytest==8.4.2
           pytest -q benchmarks/test_run_manifest.py benchmarks/test_valve_guard.py
           benchmarks/coalesce/test_run.py benchmarks/e2e/test_run_e2e.py
+          benchmarks/test_release.py benchmarks/test_comparison.py benchmarks/showcase/test_showcase.py
       # The visual gate (#869) is run by hand; its metrics and band rule are
       # tested here on synthetic tiles (examples and Hypothesis properties),
       # without tylertoo or tippecanoe.

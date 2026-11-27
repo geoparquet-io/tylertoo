@@ -419,6 +419,11 @@ pub tylertoo_core::ConvertError::NoGeometryColumn::input: alloc::string::String
 #[non_exhaustive] pub tylertoo_core::ConvertError::NothingAtOrBelowCeiling
 pub tylertoo_core::ConvertError::NothingAtOrBelowCeiling::ceiling: u8
 pub tylertoo_core::ConvertError::Output(tylertoo_core::OutputNotWritable)
+#[non_exhaustive] pub tylertoo_core::ConvertError::Pass1MemoryExceeded
+pub tylertoo_core::ConvertError::Pass1MemoryExceeded::coalesce_max_level_rows: core::option::Option<usize>
+pub tylertoo_core::ConvertError::Pass1MemoryExceeded::estimated_bytes: u64
+pub tylertoo_core::ConvertError::Pass1MemoryExceeded::limit_bytes: u64
+pub tylertoo_core::ConvertError::Pass1MemoryExceeded::rows: u64
 pub tylertoo_core::ConvertError::PointCountColumnPresent
 pub tylertoo_core::ConvertError::Properties(tylertoo_core::PropertySelectionError)
 pub tylertoo_core::ConvertError::RankingConflict

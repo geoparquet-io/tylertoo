@@ -99,7 +99,7 @@ pub const DEFAULT_JUNCTION_ANGLE_DEG: f64 = 0.0;
 
 /// Default per-level candidate-row ceiling above which coalescing is skipped.
 ///
-/// This is a bounded-memory guard; see `docs/OVERVIEW_TUNING.md`. Chaining
+/// This is a bounded-memory guard; see `docs/reference/tuning.md`. Chaining
 /// needs the level's line geometries in memory at once; levels larger than
 /// this are near-canonical, where segments are individually visible and
 /// coalescing matters least.
@@ -131,7 +131,7 @@ pub const DEFAULT_COALESCE_MAX_LEVEL_ROWS: usize = 2_000_000;
 /// output change of #449. To restore it, raise `--coalesce-max-level-rows`
 /// (it scales both limbs: 4,000,000 allows 4M lines / 2.048 GB modelled), at
 /// the cost of that much more resident geometry plus the chain-stage peak
-/// on top (`docs/OVERVIEW_TUNING.md`, "Line coalescing").
+/// on top (`docs/reference/tuning.md`, "Line coalescing").
 ///
 /// (The synthetic 37-vertex lines of #569's germany-segments benchmark
 /// proxy — 648 B modelled — would trip the byte limb from ~1.58M lines up

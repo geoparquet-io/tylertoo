@@ -100,7 +100,7 @@ larger source with `--dataset ID=PATH` to see that range.
 ## What it measures against the source
 
 Both tools tile the same source: tylertoo with `tiles --preset tippecanoe`,
-tippecanoe 2.79.0 with its defaults and `--drop-densest-as-needed`. Each
+the pinned tippecanoe (`benchmarks/e2e/setup_tippecanoe.sh`) with its defaults and `--drop-densest-as-needed`. Each
 archive is then measured **against the source**, on the same tiles, and the
 gate compares the two errors:
 

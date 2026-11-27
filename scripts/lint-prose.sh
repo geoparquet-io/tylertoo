@@ -26,7 +26,7 @@ cd "$(git rev-parse --show-toplevel)"
 # context/ is design notes).
 in_scope() {
     git ls-files -- \
-        CONTRIBUTING.md DEVELOPMENT.md \
+        CONTRIBUTING.md DEVELOPMENT.md crates/cli/docs/tippecanoe-tables.md \
         ':(glob)docs/**/*.md' ':(glob)examples/*/README.md' \
         ':(exclude)docs/index.md' \
         ':(exclude,glob)docs/tutorials/*.md' |

@@ -44,8 +44,12 @@ def site() -> Path:
         ("tutorials/madagascar/index.html", "02-preview.sh"),
         ("tutorials/brazil/index.html", "02-shard.sh"),
         ("changelog/index.html", "Changelog"),
+        ("guides/attribution/index.html", "01-credit.sh"),
+        ("guides/tippecanoe/index.html", "01-preset.sh"),
+        ("guides/tippecanoe/index.html", "compare-dataset"),
         ("reference/cli/index.html", "export-pmtiles"),
         ("reference/python/index.html", "export_pmtiles"),
+        ("reference/tuning/index.html", "memory"),
         ("spec/overviews/index.html", "canonical_level"),
     ],
 )
@@ -67,15 +71,23 @@ def _link_problem(site: Path, path: str, anchor: str) -> str | None:
     return None
 
 
-def test_absolute_site_links_resolve(site: Path) -> None:
-    """Absolute links to the site (README, tutorials) point at real pages.
+def site_link_sources() -> list[Path]:
+    sources = set(site_pages())
+    for pattern in (
+        "docs/reference/*.md",
+        "crates/*/src/**/*.rs",
+        "crates/python/src/docs/*.txt",
+        "crates/python/python/**/*.py",
+    ):
+        sources.update(REPO_ROOT.glob(pattern))
+    return sorted(sources)
 
-    The README renders on GitHub, crates.io, and PyPI, so it links to the
-    site by full URL, which the strict build does not check.
-    """
+
+def test_absolute_site_links_resolve(site: Path) -> None:
+    """Absolute site links in docs and API sources resolve in the built site."""
     broken = [
         f"{page.name}: {SITE_URL}{path}{'#' + anchor if anchor else ''} ({problem})"
-        for page in site_pages()
+        for page in site_link_sources()
         for path, anchor in SITE_LINK.findall(page.read_text(encoding="utf-8"))
         if (problem := _link_problem(site, path, anchor))
     ]

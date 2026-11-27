@@ -64,13 +64,13 @@ For public docstrings, CLI help, and `///` docs:
 - Leave out issue numbers, references to sweeps or decision files, restated
   defaults, internal crate names, memory formulas, and tuning history.
 - Give a performance-only knob one sentence and a link to the
-  [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/).
+  [tuning reference](https://geoparquet-io.github.io/tylertoo/reference/tuning/).
   Put tippecanoe comparisons in the
   [tippecanoe guide](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/),
   and benchmark numbers on the
   [benchmarks page](https://geoparquet-io.github.io/tylertoo/benchmarks/).
 - Keep one short runnable example per function. Move removed material
-  users still need to `docs/OVERVIEW_TUNING.md`, a guide, or
+  users still need to the [tuning reference](https://geoparquet-io.github.io/tylertoo/reference/tuning/), a guide, or
   `CHANGELOG.md`.
 
 ## Releasing (maintainers)
@@ -107,8 +107,18 @@ For public docstrings, CLI help, and `///` docs:
    cargo check
    ```
 
-4. Curate `CHANGELOG.md` (see below) and commit it.
-5. Push the branch and open the PR:
+4. Update the release benchmarks:
+
+   1. Run `benchmarks/release.sh` on the benchmark machine. It takes several
+      hours and resumes after a failure. Use `--skip africa` to leave the
+      committed Africa result in place.
+   2. Commit `benchmarks/results/`, `docs/benchmarks.md`, and the READMEs.
+   3. Paste the `--diff` table it prints into the PR.
+
+   CI only warns when the results are older than the version in `Cargo.toml`; nothing blocks.
+
+5. Curate `CHANGELOG.md` (see below) and commit it.
+6. Push the branch and open the PR:
 
    ```bash
    git push -u origin release/vX.Y.Z
@@ -116,7 +126,7 @@ For public docstrings, CLI help, and `///` docs:
      --body "Release vX.Y.Z"
    ```
 
-6. After the merge, start the release from `main`:
+7. After the merge, start the release from `main`:
 
    ```bash
    gh workflow run release.yml --ref main

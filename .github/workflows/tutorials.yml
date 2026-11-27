@@ -30,6 +30,9 @@ jobs:
     name: Brazil tutorial (live, whole country)
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -68,20 +71,22 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --package tylertoo
 
-      # The docs tests stage this fixture for every tutorial's working
-      # directory, including the ones that do not read it.
-      - name: Download the Madagascar fixture
+      # The docs tests stage these fixtures (stage_input in doc_blocks.py)
+      # for every tutorial's working directory, including the ones that do
+      # not read them.
+      - name: Download the staged fixtures
         run: |
           gh release download fixtures-v1 --dir tests/fixtures/realdata/ \
-            --pattern fieldmaps-madagascar-adm4.parquet --clobber
+            --pattern fieldmaps-madagascar-adm4-hilbert.parquet \
+            --pattern open-buildings.parquet --clobber
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
-      # The tutorial steps call the duckdb and gpio CLIs. The docs group
-      # pins both (duckdb-cli, geoparquet-io), as in ci.yml's docs job.
+      # The tutorial steps call the gpio CLI. The docs group pins
+      # geoparquet-io, as in ci.yml's docs job.
       - name: Run the nightly tutorials and check their output
         working-directory: crates/python
         env:
@@ -91,3 +96,30 @@ jobs:
           uv sync --locked --no-install-project --group docs
           uv run --no-sync pytest -m docs tests/docs/test_examples.py -k brazil -v
           df -h / /mnt
+
+      - name: Report a nightly tutorial failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_TITLE: Nightly Brazil tutorial failed
+          ISSUE_SEARCH: 'in:title "Nightly Brazil tutorial failed"'
+          ISSUE_LABELS: bug,P2
+          ISSUE_IMPACT: >-
+            Impact: P2. Brazil tutorial readers and maintainers lose the output
+            check whenever this daily job fails, so documented commands or output
+            may drift. Workaround: run the tutorial scripts locally and compare
+            their output with the README.
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          issues=$(gh issue list --state open --search "$ISSUE_SEARCH" --json number,title)
+          issue_number=$(jq -r --arg title "$ISSUE_TITLE" \
+            '[.[] | select(.title == $title)][0].number // empty' <<< "$issues")
+          body_file=$(mktemp)
+          trap 'rm -f "$body_file"' EXIT
+          printf '%s\n\nRun: %s\n' "$ISSUE_IMPACT" "$RUN_URL" > "$body_file"
+          if [ -n "$issue_number" ]; then
+            gh issue comment "$issue_number" --body-file "$body_file"
+          else
+            gh issue create --title "$ISSUE_TITLE" --label "$ISSUE_LABELS" --body-file "$body_file"
+          fi

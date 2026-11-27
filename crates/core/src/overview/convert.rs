@@ -65,7 +65,7 @@ use super::level::{
     GeneralizationLevel, MemoryProfile, Mode, RankingProvenance, RepresentationBandProvenance,
     GSD_TILE_BASE, METERS_PER_DEGREE,
 };
-use super::pipeline::{gib, MemoryLimit, MemoryLimitSource};
+use super::pipeline::{MemoryLimit, MemoryLimitSource};
 use super::properties::{PropertySelection, PropertySelectionError};
 use super::read::ReadPass;
 use super::simplify::{
@@ -541,7 +541,7 @@ pub struct ConvertOptions {
         default_value_t = ConvertOptions::default().gsd_base,
         help_heading = "Generalization"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Base of the zoom-to-GSD mapping, `gsd(z) = 40075016.69 / base / 2^z`: a larger base keeps more detail at every level. No effect with `--gsd`", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Base of the zoom-to-GSD mapping: a larger base keeps more detail at every level. Uses an equatorial circumference of {circumference} meters. No effect with `--gsd`", circumference = super::level::WEBMERC_CIRCUMFERENCE_M), long_help = None))]
     pub gsd_base: f64,
     /// Emit the optional COGP compatibility footer key (§3.1). Default `false`.
     #[serde(rename = "cogp_compat")]
@@ -589,7 +589,7 @@ pub struct ConvertOptions {
         default_value_t = ConvertOptions::default().read_batch_size,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Rows per Arrow read batch, in the range {READ_BATCH_SIZE_MIN}..={READ_BATCH_SIZE_MAX}. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>"), long_help = None))]
     pub read_batch_size: usize,
     /// Memory/throughput profile for the streaming pass-2 engine (#213/#212).
     /// Default [`MemoryProfile::Auto`], resolved per mode + estimated output
@@ -602,7 +602,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a `--no-default-features` build uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a build without mimalloc uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     pub profile: MemoryProfile,
     /// Worker threads in the global Rayon pool (#876). `None` (default):
     /// a positive `RAYON_NUM_THREADS`, else every core under `auto` and
@@ -619,7 +619,7 @@ pub struct ConvertOptions {
         feature = "cli",
         arg(long, value_name = "N", help_heading = "Memory & performance")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Worker threads for the whole run. Default: every core under `auto` and `speed`, at most 40 under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Worker threads for the whole run. Default: every core under `auto` and `speed`, at most {WORKER_THREADS_MAX} under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>"), long_help = None))]
     pub workers: Option<usize>,
     /// Bytes of memory the run may use (#876), in place of the detected
     /// figure (the smaller of the cgroup headroom and `MemAvailable`).
@@ -632,7 +632,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::parse_size_bytes,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Memory the run may use, such as `24G`, in place of the detected available memory (cgroup limit or `MemAvailable`); overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory the run may use, in place of the detected available memory (cgroup limit or `MemAvailable`); overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     pub memory_limit: Option<usize>,
     /// Number of Arrow read batches allowed in flight through the streaming
     /// pass-2 pipeline at once. Pass 2 splits it in half (#494): one half is
@@ -654,7 +654,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::parse_in_flight_batches,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Read batches in flight at once, or `auto` to size it to the cores. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Read batches in flight at once, or `auto` to size it to the cores. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     pub in_flight_batches: usize,
     /// Number of concurrent reader threads pass 2 (#494) and pass 1 (#717)
     /// each split the input across. Default [`READ_WORKERS_AUTO`], which
@@ -672,7 +672,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::parse_read_workers,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Reader threads for both passes, or `auto` for half the cores in the first pass and a quarter in the second, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Reader threads for both passes, or `auto` to size each pass to the core count, up to {READ_WORKERS_MAX}. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>"), long_help = None))]
     pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
@@ -681,7 +681,7 @@ pub struct ConvertOptions {
     /// its own geometry and attributes (see [`super::cluster`]). Lines and
     /// polygons are unaffected. Default `false`.
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Clustering"))]
-    #[cfg_attr(feature = "cli", arg(help = "Merge each thinning cell's points into its surviving point, which gains a `point_count` column. Duplicating mode only", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Merge each thinning cell's points into its surviving point, which gains a `point_count` column. Duplicating mode only. Reserves `level`, `input_row`, and `point_count`; input columns with these names are renamed by appending underscores until unique", long_help = None))]
     pub cluster: bool,
     /// Numeric per-cluster attribute aggregation (Q6): for each spec, the
     /// winner's value of the column becomes the aggregate over itself + the
@@ -701,7 +701,7 @@ pub struct ConvertOptions {
         feature = "cli",
         arg(long, value_name = "COL", help_heading = "Clustering")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Count a string column's values per cluster in `COL:value` columns (up to 100 values plus `other`, requires `--cluster`)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Count a string column's values per cluster in `COL:value` columns (up to {max_categories} values plus `other`, requires `--cluster`)", max_categories = super::cluster::MAX_CLUSTER_CATEGORIES), long_help = None))]
     pub cluster_categories: Option<String>,
     /// Enable line network coalescing (plan Q3). **Default `true`** (like
     /// `line_thinning = 1.0` and the clustering point grid, chosen by
@@ -720,7 +720,7 @@ pub struct ConvertOptions {
     /// output has no `coalesced_count` column and no coalescing provenance.
     /// (The CLI additionally rejects an *explicit* request.)
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().coalesce_lines, action = clap::ArgAction::SetFalse, long = "no-coalesce-lines", help_heading = "Line coalescing"))]
-    #[cfg_attr(feature = "cli", arg(help = "Turn off line coalescing, which joins touching same-class line segments into longer strokes at coarse levels", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Turn off line coalescing, which joins touching same-class line segments into longer strokes at coarse levels. Coalescing reserves `coalesced_count`, in addition to `level` and `input_row`; input columns with reserved names are renamed by appending underscores until unique", long_help = None))]
     pub coalesce_lines: bool,
     /// Endpoint snap tolerance for coalescing, in GSD multiples (default
     /// [`DEFAULT_SNAP_GSD_FACTOR`] = 1.0): after exact-endpoint chaining,
@@ -826,7 +826,7 @@ pub struct ConvertOptions {
             help_heading = "Filtering"
         )
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Filter property columns with a SQL `WHERE` predicate, such as `confidence > 0.8`. Skips row groups that cannot match. Grammar: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Filter property columns with a SQL `WHERE` predicate, such as `class = 'primary'`. Skips row groups that cannot match. Grammar: <https://geoparquet-io.github.io/tylertoo/reference/tuning/#expression-syntax>", long_help = None))]
     pub filter: Option<String>,
     /// Which property columns the output carries (#386): tippecanoe's
     /// `-x` / `-y` / `-X`. Resolved once against the input schema and applied
@@ -850,7 +850,7 @@ pub struct ConvertOptions {
         feature = "cli",
         arg(long, value_name = "PATH", help_heading = "Memory & performance")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Directory for spill files: staged remote input, and on `tiles` the intermediate overview. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Directory for spill files: staged remote input, and on `tiles` the intermediate overview. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     pub spill_dir: Option<PathBuf>,
     /// Write the **convert plan artifact** to this path once pass 1 and the
     /// level assignment are done, then carry on with the conversion.
@@ -1054,6 +1054,11 @@ with_setters!(ConvertOptions {
 
 /// Default rows per read batch for the streaming pipeline (H3).
 pub const DEFAULT_READ_BATCH_SIZE: usize = 8192;
+
+/// Accepted read-batch row bounds, shared by validation and CLI help.
+pub const READ_BATCH_SIZE_MIN: usize = 1;
+/// Maximum accepted rows in a read batch.
+pub const READ_BATCH_SIZE_MAX: usize = 1_048_576;
 
 /// Sentinel value for [`ConvertOptions::in_flight_batches`] requesting automatic sizing.
 ///
@@ -1897,13 +1902,13 @@ pub(super) fn record_level_outcome(
             diagnostics.warn(format!(
                 "level planned at GSD {:.2} m{} became empty after simplification \
                  (all {} candidate feature(s) collapsed); omitted from the output pyramid. \
-                 Pass --collapse to keep sub-GSD polygons as representative points at \
-                 coarse levels (see docs/OVERVIEW_TUNING.md)",
+                 {}",
                 planned.gsd,
                 planned
                     .zoom
                     .map_or_else(String::new, |z| format!(" (zoom {z})")),
                 candidates,
+                crate::diagnostics::EMPTY_LEVEL_ADVICE,
             ));
             skipped.push(planned);
         }
@@ -2440,9 +2445,21 @@ pub enum ConvertError {
         /// The safety ceiling checked against.
         ceiling: usize,
     },
+    /// The first-pass feature table exceeds a hard cgroup limit.
+    #[error("{}", pass1_memory_floor_message(*rows, *estimated_bytes, *limit_bytes, *coalesce_max_level_rows))]
+    #[non_exhaustive]
+    Pass1MemoryExceeded {
+        /// Exact footer row count.
+        rows: u64,
+        /// Feature-table estimate from the memory budget.
+        estimated_bytes: u64,
+        /// Probed hard cgroup limit.
+        limit_bytes: u64,
+        /// This run's line-coalescing ceiling, when enabled.
+        coalesce_max_level_rows: Option<usize>,
+    },
     /// A phase's required resident state exceeds the available memory.
-    /// Only the pass-1 scan's is the preflight that
-    /// `TYLERTOO_SKIP_MEMORY_PREFLIGHT` downgrades, so only it names that.
+    /// Scan failures name the same escape hatch as the footer preflight.
     #[error("{phase} needs {needed} bytes but only {available} bytes are available; use a bigger machine or reduce the input with --bbox/--filter.{}", skip_preflight_hint(phase))]
     #[non_exhaustive]
     BudgetExceeded {
@@ -2487,7 +2504,7 @@ pub enum InvalidOption {
         value: f64,
     },
     /// `read_batch_size` is outside `1..=1048576`.
-    #[error("read-batch-size must be in 1..=1048576 (a batch is fully resident)")]
+    #[error("read-batch-size must be in {READ_BATCH_SIZE_MIN}..={READ_BATCH_SIZE_MAX} (a batch is fully resident)")]
     ReadBatchSize,
     /// `read_workers` is past twice this machine's cores.
     #[error("read-workers must be auto or 1..={ceiling} (2× this machine's cores)")]
@@ -2733,7 +2750,9 @@ impl crate::error::Classify for ConvertError {
             | ConvertError::AutoZoomMinAboveCeiling { .. }
             | ConvertError::Filter(super::filter::FilterError::Parse(_)) => ErrorKind::Usage,
             // The box is too small for this input (#543).
-            ConvertError::BudgetExceeded { .. } => ErrorKind::Resource,
+            ConvertError::BudgetExceeded { .. } | ConvertError::Pass1MemoryExceeded { .. } => {
+                ErrorKind::Resource
+            }
             // The input itself is the problem, not the run (#429).
             ConvertError::AllFeaturesOutOfRange { .. }
             | ConvertError::UnsupportedCrs { .. }
@@ -2812,7 +2831,7 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
         }
         Ok(())
     };
-    if !(1..=1_048_576).contains(&options.read_batch_size) {
+    if !(READ_BATCH_SIZE_MIN..=READ_BATCH_SIZE_MAX).contains(&options.read_batch_size) {
         return Err(InvalidOption::ReadBatchSize.into());
     }
     let ceiling = read_workers_ceiling();
@@ -5483,8 +5502,9 @@ pub(super) fn warn_full_file_remote(
 /// that on top (#570). The preflight does not fold this in: the scratch
 /// size depends on the line count and vertex counts, which the footers do
 /// not carry, and a row-count-derived upper bound would warn on every small
-/// line input. `docs/guides/scaling.md` gives the sizing
-/// figure to add by hand.
+/// line input. The preflight message prints the sizing calculation;
+/// <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>
+/// explains the remedies.
 pub(super) const PASS1_BYTES_PER_ROW: u64 = FeatureTable::MAX_BYTES_PER_ROW;
 
 /// The realistic whole-job need as a multiple of the pass-1 feature-table
@@ -5526,7 +5546,7 @@ const PASS1_RECOMMENDED_FACTOR: f64 = 3.3;
 /// for this box. On for `1`, `true`, `yes` or `on` (trimmed,
 /// case-insensitive); anything else — including empty, `0` and `false` —
 /// leaves the check on.
-pub(super) const SKIP_MEMORY_PREFLIGHT_ENV: &str = "TYLERTOO_SKIP_MEMORY_PREFLIGHT";
+pub(crate) const SKIP_MEMORY_PREFLIGHT_ENV: &str = "TYLERTOO_SKIP_MEMORY_PREFLIGHT";
 
 fn env_flag_enabled(value: &str) -> bool {
     matches!(
@@ -5536,7 +5556,8 @@ fn env_flag_enabled(value: &str) -> bool {
 }
 
 /// Sizing-guidance doc named in both the warning and the hard error.
-const MEMORY_SIZING_DOC: &str = "docs/guides/scaling.md";
+pub(crate) const MEMORY_SIZING_DOC: &str =
+    "https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory";
 
 /// What the #543 preflight concluded, for the `TYLERTOO_PROFILE_JSON` record
 /// (#626 item 4).
@@ -5583,19 +5604,9 @@ pub(super) struct Pass1MemoryReport {
     pub(super) limit_source: Option<&'static str>,
 }
 
-/// Why a sharded build is not the fix — shared by the warning and the error.
-const PASS1_MEMORY_REMEDIATION: &str = "A sharded build does not avoid this: its coarse job \
-     runs this same full pass 1. Only a `--plan` replay skips pass 1, and that plan must first \
-     be cut on a big-enough machine.";
-
-/// The realistic "this input needs ≳X GiB" total: the floor ×
-/// [`PASS1_RECOMMENDED_FACTOR`].
-fn recommended_total_gib(rows: u64) -> f64 {
-    gib(super::memory::MemoryBudget::with_available(None).estimate(
-        super::memory::MemoryPhase::Scan,
-        rows,
-        None,
-    )) * PASS1_RECOMMENDED_FACTOR
+/// The realistic whole-job need: the floor × [`PASS1_RECOMMENDED_FACTOR`].
+fn recommended_total_bytes(estimated_bytes: u64) -> u64 {
+    (estimated_bytes as f64 * PASS1_RECOMMENDED_FACTOR) as u64
 }
 
 /// #543 decision (pure). `limit = None` (nothing could be probed, e.g.
@@ -5638,7 +5649,7 @@ fn pass1_memory_verdict(
             estimated_bytes,
             limit_bytes: limit.bytes,
         }
-    } else if estimated_bytes as f64 * PASS1_RECOMMENDED_FACTOR > limit.bytes as f64 {
+    } else if recommended_total_bytes(estimated_bytes) > limit.bytes {
         Pass1MemoryVerdict::Warn {
             estimated_bytes,
             limit,
@@ -5654,6 +5665,7 @@ fn pass1_memory_warn_message(
     estimated_bytes: u64,
     limit: MemoryLimit,
     per_feature_filter_active: bool,
+    coalesce_max_level_rows: Option<usize>,
 ) -> String {
     let floor_over = if estimated_bytes > limit.bytes {
         " The feature table alone is over it."
@@ -5661,49 +5673,110 @@ fn pass1_memory_warn_message(
         ""
     };
     let upper_bound = if per_feature_filter_active {
-        " The row count is an unpruned upper bound: --bbox/--filter drop rows at scan time, so \
-         the real need may be far smaller."
+        " The row count is an upper bound: --bbox or --filter can drop rows during the scan."
     } else {
-        ""
+        " The row count is exact."
     };
     format!(
-        "[convert] {rows} input row(s) need an estimated {:.1} GiB for the pass-1 feature table \
-         alone ({PASS1_BYTES_PER_ROW} bytes/row, a lower bound) and ≳{:.1} GiB for the whole \
-         job (×{PASS1_RECOMMENDED_FACTOR}) — more than the {:.1} GiB {}; the run may be \
-         OOM-killed.{floor_over}{upper_bound} Remedy: a bigger box (≳{:.1} GiB). \
-         {PASS1_MEMORY_REMEDIATION} See {MEMORY_SIZING_DOC}.",
-        gib(estimated_bytes),
-        recommended_total_gib(rows),
-        gib(limit.bytes),
-        limit.source.describe(),
-        recommended_total_gib(rows),
+        "[convert] Memory warning. The recommended total exceeds the limit. \
+         The run will continue but may run out of memory.{floor_over}{upper_bound} {}",
+        pass1_memory_calculation(rows, estimated_bytes, limit, coalesce_max_level_rows),
     )
 }
 
-/// The escape hatch [`ConvertError::BudgetExceeded`] names: the pass-1
-/// scan's floor is the one budget check [`SKIP_MEMORY_PREFLIGHT_ENV`]
-/// downgrades ([`preflight_pass1_memory`]); every other phase's has none.
-fn skip_preflight_hint(phase: &str) -> &'static str {
+/// Shared arithmetic and remedies for both preflight outcomes. Keep the
+/// values unrounded so even a small input's estimate can be checked.
+fn pass1_memory_calculation(
+    rows: u64,
+    estimated_bytes: u64,
+    limit: MemoryLimit,
+    coalesce_max_level_rows: Option<usize>,
+) -> String {
+    let coalescing = coalesce_max_level_rows.map_or_else(String::new, |ceiling| {
+        let bytes = (ceiling as u64).saturating_mul(COALESCE_NOMINAL_BYTES_PER_LINE);
+        format!(
+            " For line inputs, coalescing is excluded from this estimate and can add up to \
+             --coalesce-max-level-rows ({ceiling}) × {COALESCE_NOMINAL_BYTES_PER_LINE} \
+             bytes/line = {} of modeled line scratch. Chaining can use more. \
+             Use --no-coalesce-lines to turn it off.",
+            human_bytes(bytes)
+        )
+    });
+    format!(
+        "{rows} rows × {PASS1_BYTES_PER_ROW} bytes/row = {} for the first-pass feature \
+         table; × {PASS1_RECOMMENDED_FACTOR} = {} recommended for the whole job. \
+         Limit: {} ({}). Use a bigger machine, or replay with --plan to skip the first \
+         pass. Create the plan on a machine with enough memory: a sharded build does not \
+         help, because its coarse job runs the same first pass. If the detected limit is \
+         wrong, set --memory-limit. Set {SKIP_MEMORY_PREFLIGHT_ENV}=true to downgrade a \
+         preflight failure to a warning.{coalescing} See {MEMORY_SIZING_DOC}.",
+        human_bytes(estimated_bytes),
+        human_bytes(recommended_total_bytes(estimated_bytes)),
+        human_bytes(limit.bytes),
+        limit.source.describe(),
+    )
+}
+
+/// Name the escape hatch only for a scan budget failure. The footer
+/// preflight itself uses [`ConvertError::Pass1MemoryExceeded`].
+fn skip_preflight_hint(phase: &str) -> String {
     if phase == super::memory::MemoryPhase::Scan.name() {
-        " Set TYLERTOO_SKIP_MEMORY_PREFLIGHT=1 to attempt the scan anyway."
+        format!(" Set {SKIP_MEMORY_PREFLIGHT_ENV}=true to attempt the scan anyway.")
     } else {
-        ""
+        String::new()
     }
 }
 
-/// The message body of [`ConvertError::BudgetExceeded`].
-fn pass1_memory_floor_message(rows: &u64, estimated_bytes: &u64, limit_bytes: &u64) -> String {
+/// The message body of [`ConvertError::Pass1MemoryExceeded`].
+fn pass1_memory_floor_message(
+    rows: u64,
+    estimated_bytes: u64,
+    limit_bytes: u64,
+    coalesce_max_level_rows: Option<usize>,
+) -> String {
     format!(
-        "{rows} input row(s) need an estimated {:.1} GiB for the pass-1 feature table alone \
-         ({PASS1_BYTES_PER_ROW} bytes/row) — over the {:.1} GiB {}, so the run would be \
-         OOM-killed. This input needs ≳{:.1} GiB: use a bigger box. {PASS1_MEMORY_REMEDIATION} \
-         See {MEMORY_SIZING_DOC}. Set {SKIP_MEMORY_PREFLIGHT_ENV}=1 to downgrade this to a \
-         warning and attempt the run anyway.",
-        gib(*estimated_bytes),
-        gib(*limit_bytes),
-        MemoryLimitSource::CgroupMax.describe(),
-        recommended_total_gib(*rows),
+        "Memory preflight failed. The row count is exact. The feature table alone \
+         exceeds the hard cgroup limit, so this run cannot fit. {}",
+        pass1_memory_calculation(
+            rows,
+            estimated_bytes,
+            MemoryLimit {
+                bytes: limit_bytes,
+                source: MemoryLimitSource::CgroupMax,
+            },
+            coalesce_max_level_rows
+        ),
     )
+}
+
+/// Render the preflight advice for frontend documentation checks.
+#[doc(hidden)]
+pub fn pass1_memory_messages_for_docs() -> [String; 2] {
+    let rows = 1_000;
+    let estimated_bytes = super::memory::MemoryBudget::with_available(None).estimate(
+        super::memory::MemoryPhase::Scan,
+        rows,
+        None,
+    );
+    let limit = MemoryLimit {
+        bytes: 1,
+        source: MemoryLimitSource::CgroupMax,
+    };
+    [
+        pass1_memory_warn_message(
+            rows,
+            estimated_bytes,
+            limit,
+            true,
+            Some(DEFAULT_COALESCE_MAX_LEVEL_ROWS),
+        ),
+        pass1_memory_floor_message(
+            rows,
+            estimated_bytes,
+            limit.bytes,
+            Some(DEFAULT_COALESCE_MAX_LEVEL_ROWS),
+        ),
+    ]
 }
 
 /// #543 preflight: warn or fail fast when the pass-1 feature table (and the
@@ -5721,6 +5794,7 @@ pub(super) fn preflight_pass1_memory(
     limit: Option<MemoryLimit>,
     skip_on_exceed: bool,
     per_feature_filter_active: bool,
+    coalesce_max_level_rows: Option<usize>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Pass1MemoryReport, ConvertError> {
     let report = |outcome, estimated_bytes| Pass1MemoryReport {
@@ -5748,6 +5822,7 @@ pub(super) fn preflight_pass1_memory(
                 estimated_bytes,
                 limit,
                 per_feature_filter_active,
+                coalesce_max_level_rows,
             ));
             Ok(report(Pass1MemoryOutcome::Warned, estimated_bytes))
         }
@@ -5757,18 +5832,26 @@ pub(super) fn preflight_pass1_memory(
         } => {
             if skip_on_exceed {
                 diagnostics.warn(format!(
-                    "[convert] {SKIP_MEMORY_PREFLIGHT_ENV} set: downgrading the pass-1 \
-                     memory-floor error to a warning — {}",
-                    pass1_memory_floor_message(&rows, &estimated_bytes, &limit_bytes),
+                    "[convert] {SKIP_MEMORY_PREFLIGHT_ENV} set: downgrading the memory \
+                     preflight failure to a warning. {}",
+                    pass1_memory_floor_message(
+                        rows,
+                        estimated_bytes,
+                        limit_bytes,
+                        coalesce_max_level_rows
+                    ),
                 ));
                 Ok(report(
                     Pass1MemoryOutcome::ExceededButForced,
                     estimated_bytes,
                 ))
             } else {
-                super::memory::MemoryBudget::with_available(Some(limit_bytes))
-                    .require(super::memory::MemoryPhase::Scan, estimated_bytes)?;
-                unreachable!("the memory verdict already proved the floor exceeds the limit")
+                Err(ConvertError::Pass1MemoryExceeded {
+                    rows,
+                    estimated_bytes,
+                    limit_bytes,
+                    coalesce_max_level_rows,
+                })
             }
         }
     }
@@ -8575,7 +8658,7 @@ mod tests {
     /// grown by doubling instead of reserved or allocated exactly — fails
     /// here. If it fails, either the fill regressed or the table's columns
     /// changed and the #543 estimate (its incident cross-check, the preflight
-    /// wording and `docs/guides/scaling.md`) needs
+    /// wording and the memory remedies in `docs/reference/tuning.md`) needs
     /// recalibrating against the new figure.
     #[test]
     fn pass1_bytes_per_row_matches_the_feature_table() {
@@ -8657,6 +8740,117 @@ mod tests {
     )]
     fn mem_limit(bytes: u64, source: MemoryLimitSource) -> Option<MemoryLimit> {
         Some(MemoryLimit { bytes, source })
+    }
+
+    fn message_numbers(text: &str) -> Vec<f64> {
+        text.split(|c: char| !c.is_ascii_digit() && c != '.')
+            .filter_map(|word| word.trim_matches('.').parse().ok())
+            .collect()
+    }
+
+    #[test]
+    fn pass1_memory_messages_calculation_matches_verdict() {
+        for (rows, source, filtered, coalesce_ceiling) in [
+            (10, MemoryLimitSource::CgroupMax, false, Some(7)),
+            (
+                1_580_000_000,
+                MemoryLimitSource::MemAvailable,
+                true,
+                Some(DEFAULT_COALESCE_MAX_LEVEL_ROWS),
+            ),
+            (
+                u64::MAX / PASS1_BYTES_PER_ROW,
+                MemoryLimitSource::Override,
+                false,
+                None,
+            ),
+            (
+                1_580_000_000,
+                MemoryLimitSource::CgroupHigh,
+                false,
+                Some(123_456),
+            ),
+        ] {
+            let estimate = super::super::memory::MemoryBudget::with_available(None).estimate(
+                super::super::memory::MemoryPhase::Scan,
+                rows,
+                None,
+            );
+            let limit = MemoryLimit {
+                bytes: estimate / 2,
+                source,
+            };
+            let verdict = pass1_memory_verdict(rows, Some(limit), filtered);
+            assert!(
+                matches!(verdict, Pass1MemoryVerdict::Warn { estimated_bytes, .. }
+                | Pass1MemoryVerdict::Exceeds { estimated_bytes, .. } if estimated_bytes == estimate)
+            );
+            let warning =
+                pass1_memory_warn_message(rows, estimate, limit, filtered, coalesce_ceiling);
+            let error = pass1_memory_floor_message(rows, estimate, limit.bytes, coalesce_ceiling);
+            let sized = |bytes: u64| message_numbers(&human_bytes(bytes));
+            let mut expected = vec![rows as f64, PASS1_BYTES_PER_ROW as f64];
+            expected.extend(sized(estimate));
+            expected.push(PASS1_RECOMMENDED_FACTOR);
+            expected.extend(sized((estimate as f64 * PASS1_RECOMMENDED_FACTOR) as u64));
+            expected.extend(sized(limit.bytes));
+            if let Some(ceiling) = coalesce_ceiling {
+                expected.extend([ceiling as f64, COALESCE_NOMINAL_BYTES_PER_LINE as f64]);
+                expected.extend(sized(
+                    (ceiling as u64).saturating_mul(COALESCE_NOMINAL_BYTES_PER_LINE),
+                ));
+            }
+            for message in [&warning, &error] {
+                assert_eq!(message_numbers(message), expected, "{message}");
+                assert_eq!(
+                    message
+                        .split_whitespace()
+                        .find_map(|word| word.parse::<u64>().ok()),
+                    Some(rows),
+                    "the row count must retain integer precision: {message}"
+                );
+                assert!(message.contains(MEMORY_SIZING_DOC), "{message}");
+                assert!(
+                    message.contains(&format!("{SKIP_MEMORY_PREFLIGHT_ENV}=true")),
+                    "{message}"
+                );
+                assert!(!message.contains('—'), "{message}");
+                assert_eq!(
+                    message.contains("--no-coalesce-lines"),
+                    coalesce_ceiling.is_some()
+                );
+            }
+            assert!(warning.contains(limit.source.describe()), "{warning}");
+            assert_eq!(warning.contains("upper bound"), filtered);
+            assert!(
+                error.contains(MemoryLimitSource::CgroupMax.describe()),
+                "{error}"
+            );
+            assert!(error.contains("row count is exact"), "{error}");
+        }
+    }
+
+    #[test]
+    fn pass1_memory_hard_error_renders_calculation() {
+        use crate::error::Classify;
+        let rows = 1_000;
+        let limit = mem_limit(1, MemoryLimitSource::CgroupMax);
+        let error = preflight_pass1_memory(
+            rows,
+            limit,
+            false,
+            false,
+            None,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::error::ErrorKind::Resource);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{rows} rows × {PASS1_BYTES_PER_ROW} bytes/row =")),
+            "{error}"
+        );
     }
 
     /// #543: the verdict's boundaries — the realistic need
@@ -8742,6 +8936,7 @@ mod tests {
             limit,
             false,
             true,
+            None,
             &crate::diagnostics::Diagnostics::default()
         )
         .is_ok());
@@ -8772,6 +8967,7 @@ mod tests {
             limit,
             false,
             false,
+            None,
             &crate::diagnostics::Diagnostics::default()
         )
         .is_ok());
@@ -8785,9 +8981,7 @@ mod tests {
         );
     }
 
-    /// #543: the warning names the concrete numbers, the source of the
-    /// figure it was judged against, the ×[`PASS1_RECOMMENDED_FACTOR`] need,
-    /// the right remediation and the sizing doc.
+    /// The warning describes the source and whether filtering can lower the count.
     #[test]
     fn pass1_memory_warn_message_names_numbers_source_and_doc() {
         let rows = 1_580_000_000u64;
@@ -8795,16 +8989,15 @@ mod tests {
             bytes: 192 << 30,
             source: MemoryLimitSource::MemAvailable,
         };
-        let msg = pass1_memory_warn_message(rows, rows * PASS1_BYTES_PER_ROW, limit, false);
+        let msg = pass1_memory_warn_message(rows, rows * PASS1_BYTES_PER_ROW, limit, false, None);
         for want in [
-            "1580000000 input row(s)",
-            "61.8 GiB",
-            "≳203.9 GiB",
-            "192.0 GiB available memory (MemAvailable)",
-            "bigger box",
-            "does not avoid this",
+            "available memory (MemAvailable)",
+            "run will continue",
+            "bigger machine",
+            "sharded build does not help",
+            "--memory-limit",
             "--plan",
-            "docs/guides/scaling.md",
+            MEMORY_SIZING_DOC,
         ] {
             assert!(msg.contains(want), "missing {want:?}: {msg}");
         }
@@ -8819,36 +9012,45 @@ mod tests {
                 source: MemoryLimitSource::Override,
             },
             true,
+            None,
         );
         for want in [
             "TYLERTOO_AUTO_MEM_LIMIT_BYTES override",
-            "unpruned upper bound",
+            "upper bound",
             "alone is over it",
         ] {
             assert!(filtered.contains(want), "missing {want:?}: {filtered}");
         }
     }
 
-    /// #543: the hard-error message names the concrete numbers, the hard
-    /// limit, the ×[`PASS1_RECOMMENDED_FACTOR`] need, the right remediation,
-    /// and the escape hatch verbatim.
+    /// The hard error explains why it fails and names the available remedies.
     #[test]
     fn pass1_memory_floor_message_names_numbers_doc_and_escape_hatch() {
         let rows = 1_580_000_000u64;
-        let msg = pass1_memory_floor_message(&rows, &(rows * PASS1_BYTES_PER_ROW), &(64 << 30));
+        let msg = pass1_memory_floor_message(rows, rows * PASS1_BYTES_PER_ROW, 64 << 30, None);
         for want in [
-            "1580000000 input row(s)",
-            "61.8 GiB",
-            "64.0 GiB cgroup hard memory limit (memory.max)",
-            "≳203.9 GiB: use a bigger box",
-            "does not avoid this",
+            "cgroup hard memory limit (memory.max)",
+            "row count is exact",
+            "run cannot fit",
+            "bigger machine",
+            "sharded build does not help",
+            "--memory-limit",
             "--plan",
-            "docs/guides/scaling.md",
-            "TYLERTOO_SKIP_MEMORY_PREFLIGHT=1",
+            MEMORY_SIZING_DOC,
         ] {
             assert!(msg.contains(want), "missing {want:?}: {msg}");
         }
-        assert!(!msg.contains("a sharded build, or"), "{msg}");
+        assert!(
+            msg.contains(&format!("{SKIP_MEMORY_PREFLIGHT_ENV}=true")),
+            "{msg}"
+        );
+        let hint = skip_preflight_hint(super::super::memory::MemoryPhase::Scan.name());
+        assert!(
+            hint.contains(&format!("{SKIP_MEMORY_PREFLIGHT_ENV}=true")),
+            "{hint}"
+        );
+        assert!(message_numbers(&hint).is_empty());
+        assert!(skip_preflight_hint(super::super::memory::MemoryPhase::Assign.name()).is_empty());
     }
 
     /// #543: the action fn fits quietly under a generous limit and
@@ -8862,6 +9064,7 @@ mod tests {
             hard(1 << 30),
             false,
             false,
+            None,
             &crate::diagnostics::Diagnostics::default()
         )
         .is_ok());
@@ -8870,15 +9073,15 @@ mod tests {
             hard(1_000),
             false,
             false,
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .expect_err("a 1,580,000,000-row table cannot fit a 1,000-byte limit");
         assert!(
             matches!(
                 err,
-                ConvertError::BudgetExceeded {
-                    phase: "pass-1 scan",
-                    available: 1_000,
+                ConvertError::Pass1MemoryExceeded {
+                    limit_bytes: 1_000,
                     ..
                 }
             ),
@@ -8895,6 +9098,7 @@ mod tests {
             hard,
             false,
             false,
+            None,
             &crate::diagnostics::Diagnostics::default()
         )
         .is_err());
@@ -8903,6 +9107,7 @@ mod tests {
             hard,
             true,
             false,
+            None,
             &crate::diagnostics::Diagnostics::default()
         )
         .is_ok());
@@ -8920,6 +9125,7 @@ mod tests {
             hard(1 << 30),
             false,
             false,
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
@@ -8940,6 +9146,7 @@ mod tests {
             hard(need - 1),
             false,
             false,
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
@@ -8951,6 +9158,7 @@ mod tests {
             hard(1_000),
             true,
             false,
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
@@ -8963,6 +9171,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();

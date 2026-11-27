@@ -7,6 +7,10 @@ mod losses;
 pub use losses::SourceLosses;
 
 pub(crate) const MAX_PYTHON_LOSS_BYTES: usize = 64 << 20;
+
+/// Advice shared by empty-level diagnostics and frontend flag checks.
+#[doc(hidden)]
+pub const EMPTY_LEVEL_ADVICE: &str = "To keep more source geometry, lower --polygon-visibility or --line-visibility. Small polygon area can still produce no collapse square at a coarse scale. See https://geoparquet-io.github.io/tylertoo/reference/tuning/#geometry-detail";
 use std::fmt;
 use std::sync::Mutex;
 
@@ -516,7 +520,7 @@ impl fmt::Display for Diagnostic {
             Self::EmptyLevels {levels,gsd_min,gsd_max,input_features,first_written_gsd,first_written_zoom,..} => {
                 let ids = levels.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
                 let zoom = first_written_zoom.map_or_else(String::new, |z| format!(" (zoom {z})"));
-                write!(f, "omitting {n} empty level(s) [{ids}] spanning GSD {gsd_max:.2}–{gsd_min:.2} m: none of the {input_features} input feature(s) are visible at those scales (visibility gates / density budget); the output pyramid starts at GSD {first_written_gsd:.2} m{zoom}. To populate coarse levels, lower --polygon-visibility/--line-visibility, or pass --collapse to keep sub-GSD polygons as representative points (see docs/OVERVIEW_TUNING.md)")
+                write!(f, "omitting {n} empty level(s) [{ids}] spanning GSD {gsd_max:.2}–{gsd_min:.2} m: none of the {input_features} input feature(s) are visible at those scales (visibility gates / density budget); the output pyramid starts at GSD {first_written_gsd:.2} m{zoom}. {EMPTY_LEVEL_ADVICE}")
             }
             Self::SavedPlan {diagnostics,..} => {
                 write!(f, "saved plan (whole input): {}", diagnostics.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
@@ -960,6 +964,31 @@ mod api_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_levels_advice_accounts_for_collapse_squares() {
+        let text = super::Diagnostic::EmptyLevels {
+            count: 1,
+            levels: vec![0],
+            gsd_min: 20.0,
+            gsd_max: 20.0,
+            input_features: 100,
+            first_written_gsd: 10.0,
+            first_written_zoom: Some(4),
+        }
+        .to_string();
+        assert!(
+            !text.contains("pass --collapse"),
+            "squares already preserve small polygon area: {text}"
+        );
+        assert!(text.contains("reference/tuning/#geometry-detail"));
+        let numbers: Vec<f64> = text
+            .split(|c: char| !c.is_ascii_digit() && c != '.')
+            .map(|s| s.trim_matches('.'))
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(numbers, [1.0, 0.0, 20.0, 20.0, 100.0, 10.0, 4.0]);
+    }
     #[test]
     fn crs_assumed_hint_is_a_copy_pasteable_command() {
         let hint = |input: &str, root: &str| {

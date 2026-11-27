@@ -2,7 +2,7 @@
 
 Options and defaults match the CLI. Ground sample distance (GSD) is
 the meters covered by one pixel at a level. See the
-[tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
+[tuning reference](https://geoparquet-io.github.io/tylertoo/reference/tuning/)
 for generalization options.
 
 Diagnostics go to Python's `logging` under the `tylertoo_core` logger:

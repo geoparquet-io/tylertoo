@@ -320,12 +320,11 @@ pub struct TilesOptions {
     #[cfg_attr(feature = "cli", arg(help = "Save the intermediate overview GeoParquet to PATH after export. Does not change the PMTiles output", long_help = None))]
     pub keep_overview: Option<PathBuf>,
     /// The codec of the temporary intermediate overview. Default
-    /// [`OverviewCodec::Lz4`]: 5-7% less user CPU than ZSTD for a file
-    /// 1.4-1.6x larger. [`OverviewCodec::Zstd`] suits a host short of temp
+    /// [`OverviewCodec::Lz4`]. [`OverviewCodec::Zstd`] suits a host short of temp
     /// disk or on a slow disk. No effect with [`TilesOptions::keep_overview`],
     /// whose file is always ZSTD.
     #[cfg_attr(feature = "cli", arg(long, value_enum, value_name = "CODEC", default_value_t = OverviewCodec::Lz4))]
-    #[cfg_attr(feature = "cli", arg(help = "Compression of the temporary intermediate overview: `lz4` takes 5-7% less CPU, `zstd` writes a file about a third smaller, for a host short of temp disk or on a slow disk. No effect with --keep-overview, whose file is always ZSTD. Does not change the PMTiles output", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Compression of the temporary intermediate overview: `lz4` uses less CPU, and `zstd` writes a smaller file, for a host short of temp disk or on a slow disk. No effect with --keep-overview, whose file is always ZSTD. Does not change the PMTiles output", long_help = None))]
     pub temp_compression: OverviewCodec,
     /// The sharded-fleet job, if any (#498).
     #[serde(skip)]

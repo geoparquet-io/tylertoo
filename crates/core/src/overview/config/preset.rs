@@ -1,7 +1,8 @@
 //! `--preset` / `preset=` (#822): another tool's defaults in place of
 //! tylertoo's. A preset only replaces the core defaults that explicit flags
 //! and keywords overlay, so anything the caller sets still wins. Its values
-//! live here and nowhere else; `docs/guides/tippecanoe.md` tabulates them.
+//! live here and nowhere else; `gen-reference-docs tippecanoe` renders them
+//! into `crates/cli/docs/tippecanoe-tables.md`.
 
 use crate::overview::convert::ConvertOptions;
 use crate::overview::export::{ExportOptions, SizeValve, ValveScope};
@@ -17,23 +18,60 @@ pub enum Preset {
     Tippecanoe,
 }
 
+/// The tippecanoe release used for preset defaults and flag mappings.
+pub const TIPPECANOE_VERSION: &str = "v2.82.0";
+
+/// Sources for the preset's changed serde keys and their CLI flags.
+///
+/// References are to `felt/tippecanoe` at
+/// `4f2621186acfec33b63ddf636f665623c0fef2dd`. The generator checks that
+/// these keys equal the defaults changed by [`Preset`].
+pub const TIPPECANOE_SOURCES: &[(&str, &str, &str)] = &[
+    (
+        "drop_gamma",
+        "--drop-gamma",
+        "main.cpp:3192 (gamma disabled; uniform thinning here)",
+    ),
+    (
+        "simplify_factor",
+        "--simplify-factor",
+        "main.cpp:83,3707; geometry.cpp:220 (tile units converted to ground sample distance)",
+    ),
+    (
+        "max_compressed_tile_size",
+        "--max-compressed-tile-size",
+        "main.cpp:85 (compressed bytes)",
+    ),
+    (
+        "tile_size_limit",
+        "--max-tile-size",
+        "tile.cpp:2871-2891 (only compressed bytes are capped)",
+    ),
+    (
+        "size_valve",
+        "--size-valve",
+        "tile.cpp:2867 (drop approximates detail reduction followed by failure)",
+    ),
+    (
+        "valve_scope",
+        "--valve-scope",
+        "tile.cpp:3421-3422,3506-3509 (one gap threshold per zoom with density dropping)",
+    ),
+    (
+        "max_zoom_simplify_factor",
+        "--max-zoom-simplify-factor",
+        "main.cpp:83,3707; geometry.cpp:220; tile.cpp:607 (also simplifies at maximum zoom)",
+    ),
+];
+
 impl Preset {
     /// The convert defaults under `preset`, starting from `base`.
-    ///
-    /// Line numbers cite tippecanoe v2.82.0 (`felt/tippecanoe` at
-    /// `4f26211`); manby's `Options::default` (`src/options.rs`) agrees.
     #[must_use]
     pub fn convert(preset: Option<Self>, mut base: ConvertOptions) -> ConvertOptions {
         if preset == Some(Self::Tippecanoe) {
-            // `-r` 2.5: `double droprate = 2.5;` (main.cpp:3191).
+            // Unchanged by the preset; tippecanoe agrees (main.cpp:3191).
             base.density.drop_rate = 2.5;
-            // `-g` 0, "for no effect" (main.cpp:3192, README): every
-            // neighborhood loses the same share, which is gamma 1 here.
             base.density.gamma = 1.0;
-            // `-S` 1 (main.cpp:83) is one tile unit at detail 12
-            // (main.cpp:3707; geometry.cpp:220 `res = 1 << (32 - detail - z)`).
-            // A tile unit is GSD x gsd-base / 4096, a quarter GSD at the
-            // default `--gsd-base 1024`.
             base.simplify.factor = 0.25;
         }
         base
@@ -43,24 +81,12 @@ impl Preset {
     #[must_use]
     pub fn export(preset: Option<Self>, mut base: ExportOptions) -> ExportOptions {
         if preset == Some(Self::Tippecanoe) {
-            // `-b` 5 screen pixels, 1/256 of a tile (main.cpp:3193, README).
+            // Unchanged by the preset; screen pixels (main.cpp:3193).
             base.tile_buffer = 5;
-            // `-M` 500,000 compressed bytes (main.cpp:85 `max_tile_size`).
             base.compressed_tile_size_limit = Some(500_000);
-            // tippecanoe has no cap on the uncompressed tile.
             base.tile_size_limit = None;
-            // tippecanoe's own default lowers the tile's detail and then
-            // fails the tile, naming `--drop-densest-as-needed` (tile.cpp:2867);
-            // tylertoo has no failing valve, so drop is the nearest.
             base.size_valve = SizeValve::Drop;
-            // `--drop-densest-as-needed` raises one gap threshold for the
-            // whole zoom and rebuilds it (tile.cpp, `traverse_zooms`): one
-            // floor per zoom (#768).
             base.valve_scope = ValveScope::Zoom;
-            // `-S` 1 also simplifies lines and polygons at the max zoom
-            // (`-pS` / `--simplify-only-low-zooms` turns that off); 0.25 for
-            // the reason `convert` gives above. Polygons part at shared
-            // borders, as tippecanoe's do without `--detect-shared-borders`.
             base.max_zoom_simplify_factor = Some(0.25);
         }
         base

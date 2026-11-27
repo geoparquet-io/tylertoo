@@ -1,0 +1,80 @@
+/* Benchmark page, drawn by scripts/gen_bench_docs.py: bars share one linear
+   scale from zero, and each value is printed at its bar's tip. */
+.md-typeset figure.tt-chart {
+  display: block;
+  width: 100%;
+  max-width: none;
+  margin: 1.5em 0 .5em;
+  text-align: left;
+}
+.md-typeset .tt-chart figcaption {
+  max-width: none;
+  margin: 0;
+  font-style: normal;
+  font-weight: 700;
+  text-align: left;
+}
+.md-typeset .tt-legend {
+  display: flex;
+  gap: 1rem;
+  margin: .2em 0 .6em;
+  font-size: .7rem;
+}
+.tt-key::before {
+  content: "";
+  display: inline-block;
+  width: .7rem;
+  height: .7rem;
+  margin-right: .3rem;
+  border-radius: 2px;
+  background: var(--tt-color);
+  vertical-align: -.05rem;
+}
+.tt-row { margin: 1.1em 0; font-size: .75rem; line-height: 1.4; }
+.tt-label { display: block; margin-bottom: .15em; }
+.tt-note {
+  margin-left: .4em;
+  padding: 0 .4em;
+  border: 1px solid var(--md-default-fg-color--lighter);
+  border-radius: .2rem;
+  font-size: .65rem;
+  white-space: nowrap;
+  color: var(--md-default-fg-color--light);
+}
+.tt-line { display: flex; align-items: center; gap: .4em; margin: .1em 0; }
+.tt-bar {
+  flex: none;
+  /* Leave room for the value at the tip of the longest bar. */
+  width: calc((100% - 10em) * var(--f));
+  min-width: 2px;
+  height: .9rem;
+  border-radius: 0 3px 3px 0;
+  background: var(--tt-color);
+}
+.tt-excluded .tt-bar {
+  background: repeating-linear-gradient(135deg, var(--tt-color) 0 3px, transparent 3px 6px);
+  box-shadow: inset 0 0 0 1px var(--tt-color);
+}
+.tt-a { --tt-color: var(--md-accent-fg-color); }
+.tt-b { --tt-color: var(--md-default-fg-color--lighter); }
+.tt-val { white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+.tt-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: .6rem;
+  margin: 1em 0;
+}
+.md-typeset .tt-stat {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: .6rem .8rem;
+  border-radius: .2rem;
+  background: var(--md-code-bg-color);
+}
+.tt-stat-value { font-size: 1.15rem; font-weight: 700; line-height: 1.3; font-variant-numeric: tabular-nums; }
+.tt-stat-label { font-size: .7rem; color: var(--md-default-fg-color--light); }
+@media (max-width: 600px) {
+  .tt-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

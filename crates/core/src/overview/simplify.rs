@@ -86,8 +86,9 @@ const MIN_LINESTRING_POINTS: usize = 2;
 /// Disposition of a polygon / multipolygon that collapses below the level
 /// tolerance (visibility gate, exterior collapse, or sub-tolerance area).
 ///
-/// Three dispositions (#279):
-/// - [`Drop`](CollapseMode::Drop) (default): the feature is omitted.
+/// Collapse modes:
+/// - [`Auto`](CollapseMode::Auto) (default): acts as [`Square`](CollapseMode::Square).
+/// - [`Drop`](CollapseMode::Drop): the feature is omitted.
 /// - [`Point`](CollapseMode::Point) (`--collapse`, spec Q4 opt-in): replaced
 ///   by a representative [`Point`]. Changes the geometry type.
 /// - [`Square`](CollapseMode::Square) (`--collapse-square`): replaced by a
@@ -142,8 +143,7 @@ pub struct SimplifyOptions {
     /// [`DEFAULT_SIMPLIFY_FACTOR`].
     #[serde(rename = "simplify_factor")]
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().factor, long = "simplify-factor", id = "simplify_factor", help_heading = "Generalization"))]
-    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
-    #[cfg_attr(feature = "cli", arg(help = "Simplification tolerance in multiples of each level's GSD (default 1.0, duplicating mode only). Lower values keep more vertices", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Simplification tolerance in multiples of each level's GSD (duplicating mode only). Lower values keep more vertices", long_help = None))]
     #[cfg_attr(feature = "cli", arg(value_name = "SIMPLIFY_FACTOR"))]
     pub factor: f64,
     /// Disposition of polygons that collapse below the visibility gate

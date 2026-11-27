@@ -140,6 +140,26 @@
   font-size: 0.7rem;
   color: var(--md-default-fg-color--light);
 }
+/* tylertoo on top, tippecanoe below: the corpus extents are wider than tall. */
+.compare-maps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.compare-maps > .tutorial-map { height: 22rem; }
+.compare-badge {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  z-index: 2;
+  padding: 0.2rem 0.6rem;
+  border-radius: 0.2rem;
+  background: rgba(255, 255, 255, 0.9);
+  color: #05221d;
+  font-size: 0.75rem;
+  font-weight: 700;
+  pointer-events: none;
+}
 .maplibregl-popup-content {
   color: #05221d;
 }

@@ -8,7 +8,7 @@ Golden tiles were generated using tippecanoe v2.49.0 with the following command 
 
 > **Version gap (#420).** The automated parity gate
 > (`benchmarks/e2e/compare_tippecanoe.py`, `.github/workflows/tippecanoe-compare.yml`)
-> pins tippecanoe **2.79.0** and builds its baseline archives fresh on every
+> pins tippecanoe **2.82.0** and builds its baseline archives fresh on every
 > run; these committed 2.49.0 archives are not part of it. They are kept as
 > **structural** inputs only: `crates/cli/tests/stats_facade.rs` pins the
 > per-zoom tile counts and byte sizes *of `road-detections.pmtiles` itself*

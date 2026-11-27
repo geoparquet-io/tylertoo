@@ -10,8 +10,9 @@
 # A cell runs `tylertoo <command> <args> --min-zoom a --max-zoom b <flags>`.
 # Placeholders: {input} (the first input, a path or a served URL),
 # {files_from} (a list of every input, for --files-from), {out} (the run's
-# scratch directory under .bench-out/, deleted after the run) and {setup}
-# (the cell's setup directory). `output` is the file under {out} whose size
+# scratch directory under .bench-out/, deleted after the run), {setup}
+# (the cell's setup directory), and {inputs_dir} (a directory under the run's
+# scratch with every cell input symlinked by its manifest file name). `output` is the file under {out} whose size
 # and sha256 are recorded. `allocator` is the allocator the cell's numbers
 # are expected from; the runner records the one each binary links.
 # `heavy` cells run only when named (--cells or a set).
@@ -270,71 +271,111 @@ url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/result
 sha256 = "77860d57ee6b9d8e217d01510ced60798fe198b9b88c7066e63282bc47166293"
 bytes = 514124545
 
-# Track R's 13-part Moldova split (788-R .788/suite.sh `mp13`); local only,
-# run with --input-dir ~/bench-data/r788/moldova-parts.
+# Track R's Moldova split (788-R .788/suite.sh `mp13`), published as
+# bench-inputs-v2 assets; the file names also resolve existing local caches.
+
+[inputs.moldova-geoarrow]
+file = "moldova-hilbert-geoarrow.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-hilbert-geoarrow.parquet"
+sha256 = "5774a5c66b8600a2ef728aaf8cea5aa995b9129b24648039aef8ab361a8c4c5e"
+bytes = 78782752
+rows = 631910
+geometry = "Polygon"
+notes = "gpio 1.7.0: gpio convert geoparquet moldova-hilbert.parquet moldova-hilbert-geoarrow.parquet --geoparquet-version 1.1-geoarrow"
+
+[inputs.moldova-geo2]
+file = "moldova-hilbert-geo2.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-hilbert-geo2.parquet"
+sha256 = "81ed422107b17622a98e5134077e2f9dc06d0de36c03d45f229005302913e941"
+bytes = 98501420
+rows = 631910
+geometry = "Polygon"
+notes = "gpio 1.7.0: gpio convert geoparquet moldova-hilbert.parquet moldova-hilbert-geo2.parquet --geoparquet-version 2.0"
+
+[inputs.moldova-geo-only]
+file = "moldova-hilbert-geo-only.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-hilbert-geo-only.parquet"
+sha256 = "58636fcba98cb6a802334d15a6a10e4a36e92becb3113a15cc3b4eff39759311"
+bytes = 98500905
+rows = 631910
+geometry = "Polygon"
+notes = "gpio 1.7.0: gpio convert geoparquet moldova-hilbert.parquet moldova-hilbert-geo-only.parquet --geoparquet-version parquet-geo-only"
 
 [inputs.moldova-part-000]
 file = "part-000.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-000.parquet"
 sha256 = "0ba1b6c1c68d756573a1c99f5470ef4213eff8af47325e1211e3b9574b5af5a7"
 bytes = 7772205
 
 [inputs.moldova-part-001]
 file = "part-001.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-001.parquet"
 sha256 = "fd58803bcd1a7dea70abc6b8445422eba9f8408ae5bd9f6a76c1d68dcbbf5e8a"
 bytes = 10703145
 
 [inputs.moldova-part-002]
 file = "part-002.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-002.parquet"
 sha256 = "c26e863c14d8a781632931fbbff6f14145fbc311fa1836cdf87c158b8f1ae5f2"
 bytes = 12143376
 
 [inputs.moldova-part-003]
 file = "part-003.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-003.parquet"
 sha256 = "33adb8d03834163873229e1f09788b35b4b72329719028ee7d80afc17b0ed6d8"
 bytes = 6147322
 
 [inputs.moldova-part-004]
 file = "part-004.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-004.parquet"
 sha256 = "62d80d889a77f420906da8e345da451ae788bfcbfb6ba4ef03edd5901f05dff5"
 bytes = 7838936
 
 [inputs.moldova-part-005]
 file = "part-005.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-005.parquet"
 sha256 = "0bcaedded11308cb3ffbedb934fa9ba79425f0f8150c19fa07889739a2852011"
 bytes = 3579449
 
 [inputs.moldova-part-006]
 file = "part-006.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-006.parquet"
 sha256 = "6dd4a86ff11c39e93db0ca57bc834f73fdaffb6ad912b36b151e8fb892fce990"
 bytes = 4060315
 
 [inputs.moldova-part-007]
 file = "part-007.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-007.parquet"
 sha256 = "81cd61b66d2f4dd63c16c280c473e41324be98b575f0d67fbf1125949b078b96"
 bytes = 8218972
 
 [inputs.moldova-part-008]
 file = "part-008.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-008.parquet"
 sha256 = "47b7621c765aaab4a1cbf49d34ef636533702276265a785f899dffb5ffbcd207"
 bytes = 8004367
 
 [inputs.moldova-part-009]
 file = "part-009.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-009.parquet"
 sha256 = "a05fc0a319715587610751aa638e712bc1116e7d0a4d02aa7ea3e4c39f4e66f6"
 bytes = 11519877
 
 [inputs.moldova-part-010]
 file = "part-010.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-010.parquet"
 sha256 = "e866987a8ef9ebd60fbf0310788808b3a8b79d8ff6b6730c87b957dca8f14cba"
 bytes = 8915483
 
 [inputs.moldova-part-011]
 file = "part-011.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-011.parquet"
 sha256 = "fbaa7d5d2ccba4c49307638eb824e3a2fca5979506ae0959a1a63493bb990a32"
 bytes = 8119344
 
 [inputs.moldova-part-012]
 file = "part-012.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-inputs-v2/moldova-part-012.parquet"
 sha256 = "712e36d7f44f239a311856f4d831d705b8b30ab943a7a12e4768708aeded49b4"
 bytes = 8095056
 # ---------------------------------------------------------------------------
@@ -425,7 +466,8 @@ args = ["{input}", "{out}/out.pmtiles"]
 output = "out.pmtiles"
 zoom = [0, 14]
 wall_s = 2700
-rss_gib = 96
+# Auto memory scales with the host; retain headroom on each box.
+rss_frac = 0.8
 
 [cells.coverage-fill]
 label = "Coverage fill: FTW Moldova z0-14, --coverage-fill (track F's claim)"
@@ -727,6 +769,87 @@ watch = "tmp"
 heavy = true
 pairs = 2
 
+[cells.in-geoarrow]
+label = "FTW Moldova: geoarrow encoding"
+input = "moldova-geoarrow"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+
+[cells.in-geo2]
+label = "FTW Moldova: geo2 encoding"
+input = "moldova-geo2"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+
+[cells.in-geo-only]
+label = "FTW Moldova: geo-only encoding"
+input = "moldova-geo-only"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+
+[cells.in-parts13]
+label = "FTW Moldova: local file list"
+inputs = ["moldova-part-000", "moldova-part-001", "moldova-part-002", "moldova-part-003", "moldova-part-004", "moldova-part-005", "moldova-part-006", "moldova-part-007", "moldova-part-008", "moldova-part-009", "moldova-part-010", "moldova-part-011", "moldova-part-012"]
+command = "tiles"
+args = ["--files-from", "{files_from}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+
+[cells.in-dir13]
+label = "FTW Moldova: partitioned directory"
+inputs = ["moldova-part-000", "moldova-part-001", "moldova-part-002", "moldova-part-003", "moldova-part-004", "moldova-part-005", "moldova-part-006", "moldova-part-007", "moldova-part-008", "moldova-part-009", "moldova-part-010", "moldova-part-011", "moldova-part-012"]
+command = "tiles"
+args = ["{inputs_dir}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+
+[cells.in-http13]
+label = "FTW Moldova: HTTP file list"
+inputs = ["moldova-part-000", "moldova-part-001", "moldova-part-002", "moldova-part-003", "moldova-part-004", "moldova-part-005", "moldova-part-006", "moldova-part-007", "moldova-part-008", "moldova-part-009", "moldova-part-010", "moldova-part-011", "moldova-part-012"]
+command = "tiles"
+args = ["--files-from", "{files_from}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+serve = { ttfb_ms = 100 }
+
+[cells.tiles-madagascar-bounded]
+label = "tiles defaults: Madagascar adm4 (the smoke cell), bounded"
+tickets = [810]
+input = "madagascar-adm4"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+flags = ["--profile", "bounded"]
+
+[cells.polygons-bounded]
+label = "Polygons: FTW Moldova, bounded"
+input = "moldova"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+flags = ["--profile", "bounded"]
+
+[cells.tiles-nz-bounded]
+label = "tiles defaults: NZ parcels z0-14, bounded"
+tickets = [810]
+input = "nz-parcels"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 14]
+wall_s = 2700
+# Match the auto cell's host-scaled safety cap for comparison.
+rss_frac = 0.8
+flags = ["--profile", "bounded"]
+
 [sets]
 window1 = ["points", "points-dense", "lines", "polygons", "polygons-mt", "wide-props",
            "verbatim", "coverage-fill", "remote-multipart", "memory-capped", "resume",
@@ -740,3 +863,8 @@ final-held = ["memory-capped", "memory-capped-auto", "coverage-fill", "coverage-
 final-sweep = ["wave-nz-cg-auto", "wave-nz-cg-16", "wave-nz-cg-64"]
 results-table = ["tiles-madagascar", "polygons", "polygons-mt", "tiles-nz"]
 export-740 = ["export-nz", "polygons-mt", "export-moldova", "export-moldova-w8"]
+nightly = ["tiles-madagascar", "verbatim", "polygons", "coverage-fill", "resume",
+           "export-moldova", "in-geoarrow", "in-geo2", "in-parts13", "in-dir13", "in-http13"]
+release = ["tiles-madagascar", "polygons", "tiles-nz", "tiles-madagascar-bounded",
+           "polygons-bounded", "tiles-nz-bounded", "in-geoarrow", "in-geo2",
+           "in-geo-only", "in-parts13", "in-dir13", "in-http13"]

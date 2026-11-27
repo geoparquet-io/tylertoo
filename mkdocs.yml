@@ -33,6 +33,7 @@ theme:
     - content.code.annotate
 
 extra_css:
+  - assets/bench.css
   - stylesheets/extra.css
 
 extra:
@@ -75,15 +76,13 @@ nav:
       - Madagascar boundaries: tutorials/madagascar.md
       - Brazil fields from the cloud: tutorials/brazil.md
   - Guides:
-      - Scaling: guides/scaling.md
-      - Remote reads: guides/remote-reads.md
-      - Attribution: guides/attribution.md
       - Coming from tippecanoe: guides/tippecanoe.md
+      - Attribution: guides/attribution.md
   - Reference:
       - CLI: reference/cli.md
       - Python: reference/python.md
       - Rust (docs.rs): https://docs.rs/tylertoo-core
-      - Tuning knobs: OVERVIEW_TUNING.md
+      - Tuning knobs: reference/tuning.md
   - Specification:
       - "geo:overviews": spec/overviews.md
   - Contributing: contributing.md

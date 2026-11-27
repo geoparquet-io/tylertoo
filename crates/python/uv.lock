@@ -697,19 +697,6 @@ wheels = [
 ]
 
 [[package]]
-name = "duckdb-cli"
-version = "1.5.6"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/08/bb/fbc6f6ea745970b72c6413bc20d13367438363b8300c592ca1936d12c278/duckdb_cli-1.5.6-py3-none-macosx_12_0_arm64.whl", hash = "sha256:239b7a1af956931b6f91fe62b23912c4afdcb3538d0c00853126425067a4afe4", size = 17001296, upload-time = "2026-09-29T07:12:01.902Z" },
-    { url = "https://files.pythonhosted.org/packages/c7/0a/d0fe7f4e8f9aa7b193528fef6310497a719e845fdc63e0b2bf4d04e788ac/duckdb_cli-1.5.6-py3-none-macosx_12_0_x86_64.whl", hash = "sha256:9bcad8efb4bf3fc9ceacb226e557976446fa19930f8714f59d18d9acc1b9a35b", size = 18952617, upload-time = "2026-09-29T07:12:05.358Z" },
-    { url = "https://files.pythonhosted.org/packages/9c/53/57db6896bad6bdd8d5078bcfb1424f812c8c16fad3856e86367331d0ec11/duckdb_cli-1.5.6-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:9b03301a14310a4ef7f86386e87b36954fe099ed762c8a81f94f7bd0ba073542", size = 19292802, upload-time = "2026-09-29T07:12:09.175Z" },
-    { url = "https://files.pythonhosted.org/packages/9c/b5/4ed517e199e817c6f1900d6b25c55166f2f7933f6d05571eab8564bc528c/duckdb_cli-1.5.6-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9797555bd39095d730eb0d0b3bf29e95e148c96a4cdce1e363f01c7bf7003a44", size = 21285304, upload-time = "2026-09-29T07:12:13.403Z" },
-    { url = "https://files.pythonhosted.org/packages/ba/56/5ba1d86f393d9333a0947984e3a8ec4aafb1f06b5f8ddc848d0972189874/duckdb_cli-1.5.6-py3-none-win_amd64.whl", hash = "sha256:3fad6bf532f8101ab4d383d513ad560121946042cab17d8b63f0ad3575dc4ae1", size = 12920724, upload-time = "2026-09-29T07:12:17.101Z" },
-    { url = "https://files.pythonhosted.org/packages/ea/64/f1044c8bbc47d4f7b14b8775075208f576bc236090a194dafd84bd2f6dbf/duckdb_cli-1.5.6-py3-none-win_arm64.whl", hash = "sha256:1359947569e53aa6c7c01de6661d809bfd6306fec8d1cb234d952a4e0a620613", size = 13865534, upload-time = "2026-09-29T07:12:20.537Z" },
-]
-
-[[package]]
 name = "filelock"
 version = "4.2.4"
 source = { registry = "https://pypi.org/simple" }
@@ -3532,8 +3519,6 @@ dev = [
     { name = "xenon" },
 ]
 docs = [
-    { name = "duckdb" },
-    { name = "duckdb-cli" },
     { name = "geoparquet-io" },
     { name = "zensical" },
 ]
@@ -3564,8 +3549,6 @@ dev = [
     { name = "xenon", specifier = ">=0.9" },
 ]
 docs = [
-    { name = "duckdb", marker = "python_full_version >= '3.11'", specifier = "==1.5.6" },
-    { name = "duckdb-cli", marker = "python_full_version >= '3.11'", specifier = "==1.5.6" },
     { name = "geoparquet-io", marker = "python_full_version >= '3.11'", specifier = "==1.7.0" },
     { name = "zensical", marker = "python_full_version >= '3.11'", specifier = "==0.0.68" },
 ]

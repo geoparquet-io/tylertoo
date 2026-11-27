@@ -3,7 +3,7 @@
 Use this benchmark to measure wall time and peak memory for each stage of a
 generalization setting. It also measures how much source area a web map
 covers at each zoom. The benchmark comes from the #745 investigation,
-recorded in `RESULTS.md`. The command added for #755 lets you rerun those
+recorded in [archived results](../../context/archive/bench/coalesce-RESULTS.md). The command added for #755 lets you rerun those
 measurements and compare generalization changes (#750 first) with fixed
 numbers.
 
@@ -24,7 +24,7 @@ it skips completed work if the inputs haven't changed:
 | `fetch` | The profile's inputs from the [`bench-coalesce-v1`](https://github.com/geoparquet-io/tylertoo/releases/tag/bench-coalesce-v1) release, plus MapLibre GL JS 4.7.1 and pmtiles.js 3.2.1, each checked against its sha256 in `bench.toml` | file and sha256 |
 | `build` | `cargo build --release --bin tylertoo`; skipped with `--bin PATH` | cargo |
 | `tile` | `tylertoo overview` then `export-pmtiles` for each dataset and setting, `repeats` times each, under GNU time with a wall and RSS cap (`run_matrix.run_cell`) | binary sha256, `run_matrix.py`, input, flags, repeats |
-| `tippecanoe` | The pinned tippecanoe (`benchmarks/e2e/setup_tippecanoe.sh`, 2.79.0) on FlatGeobuf input, with #745's arguments | tippecanoe commit, input, arguments, gpio version |
+| `tippecanoe` | The pinned tippecanoe (`benchmarks/e2e/setup_tippecanoe.sh`) on FlatGeobuf input, with #745's arguments | tippecanoe commit, input, arguments, gpio version |
 | `score` | `render_maplibre.py` for each window, `render_coverage.py` and `tile_metrics.py` for each check | archive sha256s, input, scorer script, and the entry's config |
 | `report` | `report-<profile>.json` and `.md` in `<work>/runs/<binary>/`; the latest run's also as `<work>/report.json` and `report.md` | — |
 
@@ -195,14 +195,14 @@ the same PR. Copy `<work>/runs/<binary>/report-<profile>.json` and `.md` to
   ([#750](https://github.com/geoparquet-io/tylertoo/issues/750)).
 - **Before #745, coverage depended on the maximum zoom.** Madagascar's
   before-#745 archive misses 65.3% of the z4 window at z6 when built to z12,
-  but 43.6% when built to z10 (the `RESULTS.md` figure). With the defaults,
+  but 43.6% when built to z10 (the [archived results](../../context/archive/bench/coalesce-RESULTS.md) figure). With the defaults,
   the maximum zoom makes no difference to coverage at these zooms.
 - **Determinism.** Every cell's repeats wrote identical bytes. Re-scoring the
   same archives reproduced every MapLibre and tile-check value exactly.
 
-## Compare with `RESULTS.md`
+## Compare with the archived results
 
-`RESULTS.md` records the #745 investigation. Its numbers come from builds
+The [archived results](../../context/archive/bench/coalesce-RESULTS.md) record the #745 investigation. The numbers come from builds
 made during that work. Some builds predate the merge threshold (`f323c9f`)
 and the one-GSD placeholder square changes on the branch. `run.py` measures
 the current binary on the same inputs, windows, and settings. The
@@ -227,12 +227,12 @@ The `full` profile reproduces the NZ rows:
   - before #745: 67.2/76.4/68.7%;
   - defaults: 97.3/97.9/97.6%, the "thinning off" row;
   - tippecanoe: 99.5/99.6/99.6%.
-- Timings: before #745 takes 52 s (57 s in `RESULTS.md`) and the defaults
-  take 108 s (106 s). `--simplify-factor 0.25` is faster than in `RESULTS.md`
+- Timings: before #745 takes 52 s (57 s in [archived results](../../context/archive/bench/coalesce-RESULTS.md)) and the defaults
+  take 108 s (106 s). `--simplify-factor 0.25` is faster than in [archived results](../../context/archive/bench/coalesce-RESULTS.md)
   (116 s against 156 s), and factor 0 is slower (139 s against 120 s).
 
 The one exception is Madagascar's before-#745 MapLibre column. The
-`RESULTS.md` measurements use an archive built to `--max-zoom 10`; this
+[archived results](../../context/archive/bench/coalesce-RESULTS.md) measurements use an archive built to `--max-zoom 10`; this
 benchmark builds every Madagascar archive to z12 (see
 [Findings](#findings-baseline)). Other differences from the #745 runs:
 

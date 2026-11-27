@@ -21,6 +21,7 @@ from doc_blocks import (
     expected_output,
     fence_for,
     missing_lines,
+    rendered_source,
     stage_input,
 )
 
@@ -54,9 +55,9 @@ def test_examples_exist() -> None:
 def test_tutorial_shows_step_verbatim(param: tuple[Path, Path]) -> None:
     """The prose cannot drift from the code CI runs."""
     example, step = param
-    tutorial = (example / "README.md").read_text(encoding="utf-8")
+    tutorial = rendered_source(example)
     assert fence_for(step) in tutorial, (
-        f"{example.name}/README.md does not show {step.name} verbatim"
+        f"The rendered {example.name} tutorial does not show {step.name} verbatim"
     )
 
 

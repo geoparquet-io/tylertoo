@@ -2,7 +2,7 @@
 
 How to measure where time and memory go. The recorded performance
 history of the pipeline (what was measured, what was fixed) lives in
-[`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/PROFILE.md).
+[archived pipeline performance history](archive/bench/overview-PROFILE.md).
 
 ## Memory envelope
 
@@ -855,7 +855,7 @@ injected, and `record --inject-threads` is refused. A phase the cell measures
 cell) missing from any round fails the check and makes `record` refuse to
 write. A matched baseline missing a field the gate compares (recorded before
 these fields), a cell, or `floors` fails on the pinned class (`PINNED_CLASS`,
-aarch64/0xd40/64, the `tylertoo-bench` runner) with the missing fields and the
+aarch64/0xd40/64) with the missing fields and the
 `record` command; on another recorded class it reports
 `baseline: NOT APPLICABLE (... run record)`. `record --cells X` merges into the host class entry (other
 cells and `floors` stay). A CPU core-seconds check that cannot run (baseline
@@ -1389,6 +1389,7 @@ open target/criterion/report/index.html
 
 ## Reproducing the published numbers
 
-The corpus-based storage/access/conversion benchmarks are scripted in
-`benchmarks/overview/` (see its README for the run order); the corpus
-itself is rebuilt from `corpus/fetch.sh` + `corpus/optimize.sh`.
+Run `benchmarks/release.sh` to reproduce the published benchmarks. For the
+method and settings parity, see the [end-to-end benchmark instructions](../benchmarks/e2e/README.md).
+The [archived performance history](archive/bench/overview-PROFILE.md) records
+the earlier storage, access, and conversion investigations.
