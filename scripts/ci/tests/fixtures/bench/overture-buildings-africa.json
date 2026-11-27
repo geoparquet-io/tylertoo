@@ -1,0 +1,85 @@
+{
+  "provenance": {
+    "commit": "abc1234",
+    "tylertoo_version": "tylertoo 0.9.0",
+    "host": "Test host",
+    "nproc": 4,
+    "kernel": "test",
+    "allocator": "mimalloc",
+    "tool_versions": {
+      "tippecanoe": "test-tip",
+      "gpio": "test-gpio"
+    },
+    "inputs": [],
+    "date": "2026-11-01T12:00:00Z"
+  },
+  "features": 200,
+  "release": "current",
+  "in_scope_bytes": 3000000000.0,
+  "rows": [
+    {
+      "label": "tylertoo, s3:// in place",
+      "runs_wall_s": [
+        1620
+      ],
+      "peak_rss_bytes": 1000000000.0,
+      "fetched_bytes": 2000000000.0,
+      "archive_sha256": [
+        "same"
+      ],
+      "argv": [
+        "/old/binary",
+        "tiles",
+        "s3://bucket/prefix",
+        "{out}/out.pmtiles",
+        "--max-zoom",
+        "14"
+      ],
+      "env": {
+        "AWS_SKIP_SIGNATURE": "true"
+      }
+    },
+    {
+      "label": "bounded",
+      "runs_wall_s": [
+        1800
+      ],
+      "peak_rss_bytes": 1000000000.0,
+      "fetched_bytes": 2000000000.0,
+      "archive_sha256": [
+        "same"
+      ],
+      "argv": [
+        "/old/binary",
+        "tiles",
+        "s3://bucket/prefix",
+        "{out}/out.pmtiles",
+        "--max-zoom",
+        "14"
+      ],
+      "env": {
+        "AWS_SKIP_SIGNATURE": "true"
+      }
+    }
+  ],
+  "history": [
+    {
+      "provenance": {
+        "commit": "old1234",
+        "tylertoo_version": "tylertoo 0.9.0",
+        "host": "Test host",
+        "nproc": 4,
+        "kernel": "test",
+        "allocator": "mimalloc",
+        "tool_versions": {
+          "tippecanoe": "test-tip",
+          "gpio": "test-gpio"
+        },
+        "inputs": [],
+        "date": "2026-11-01T12:00:00Z"
+      },
+      "release": "old",
+      "wall_s": 3240
+    }
+  ]
+}
