@@ -7,9 +7,15 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## v0.9.2 (2026-11-27)
 
-### Fix
+The v0.9.1 manylinux aarch64 wheel failed to build, so v0.9.1 is on
+crates.io and GitHub but not on PyPI. v0.9.2 is the first release of the 0.9
+line on PyPI. The changes since v0.8.0 are under v0.9.0.
 
-- **release**: build the manylinux aarch64 wheel on an arm64 runner
+### Fixed
+
+- The manylinux aarch64 wheel builds on an arm64 runner. The cross image used
+  before ships gcc 4.8.5, which libdeflate and libmimalloc-sys refuse. The
+  wheel keeps the glibc 2.17 floor and mimalloc (#937).
 
 ## v0.9.1 (2026-11-27)
 
