@@ -363,21 +363,27 @@ jobs:
       matrix:
         include:
           # Linux wheels are built inside maturin-action's manylinux /
-          # musllinux containers; aarch64 is cross-compiled there (the
-          # container host is always x86_64), so no QEMU is involved.
+          # musllinux containers, so no QEMU is involved. musllinux aarch64
+          # is cross-compiled from an x86_64 host.
+          #
+          # manylinux aarch64 builds natively on an arm64 runner, in
+          # quay.io/pypa/manylinux2014_aarch64. The cross image maturin-action
+          # picks on an x86_64 host ships gcc 4.8.5, which libdeflate (#889)
+          # and libmimalloc-sys refuse; the native image has the same newer
+          # devtoolset gcc as the x86_64 one.
           #
           # `native: true` marks the entries whose wheel can be installed and
           # imported on the runner itself (manylinux x86_64 on the glibc
           # runner, macOS arm64 on the arm64 runner, Windows x86_64). The
-          # cross-compiled ones (linux aarch64, musllinux on a glibc runner,
-          # macOS x86_64 on the arm64 runner) cannot be smoke-tested here.
+          # cross-compiled ones (musllinux on a glibc runner, macOS x86_64 on
+          # the arm64 runner) cannot be smoke-tested here.
           - name: manylinux-x86_64
             os: ubuntu-latest
             target: x86_64
             manylinux: auto
             native: true
           - name: manylinux-aarch64
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             target: aarch64
             manylinux: auto
           - name: musllinux-x86_64
@@ -436,10 +442,11 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           args: --release --locked --out dist -m crates/python/Cargo.toml
           before-script-linux: |
-            # protoc for prost-build. It is a host tool, so the x86_64 build
-            # is right for every one of these containers, including the
-            # aarch64 cross ones. The musllinux images are Debian-based and
-            # the manylinux ones RPM-based, hence the unzip fallback chain.
+            # protoc for prost-build. It is a host tool, so it matches the
+            # container's own architecture: x86_64 in the cross images, and
+            # aarch64 in the native manylinux aarch64 image. The musllinux
+            # images are Debian-based and the manylinux ones RPM-based, hence
+            # the unzip fallback chain.
             if ! command -v unzip >/dev/null 2>&1; then
               if command -v apt-get >/dev/null 2>&1; then
                 apt-get update && apt-get install -y unzip
@@ -451,9 +458,13 @@ jobs:
                 apk add --no-cache unzip
               fi
             fi
-            curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip
-            unzip -o protoc-25.1-linux-x86_64.zip -d /usr/local
-            rm protoc-25.1-linux-x86_64.zip
+            case "$(uname -m)" in
+              aarch64) PROTOC_ZIP=protoc-25.1-linux-aarch_64.zip ;;
+              *) PROTOC_ZIP=protoc-25.1-linux-x86_64.zip ;;
+            esac
+            curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v25.1/$PROTOC_ZIP"
+            unzip -o "$PROTOC_ZIP" -d /usr/local
+            rm "$PROTOC_ZIP"
 
       - name: Build wheel (macOS/Windows)
         if: runner.os != 'Linux'
