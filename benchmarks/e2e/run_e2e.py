@@ -241,7 +241,7 @@ MAX_TILE_BYTES = 500_000
 # every run, whether or not the gitignored, machine-local tippecanoe.lock.json
 # exists: a missing lockfile must never mean "any binary will do". Keep in
 # step with TIPPECANOE_TAG in setup_tippecanoe.sh.
-EXPECTED_TIPPECANOE_VERSION = "tippecanoe v2.79.0"
+EXPECTED_TIPPECANOE_VERSION = "tippecanoe v2.82.0"
 
 
 # --------------------------------------------------------------------------

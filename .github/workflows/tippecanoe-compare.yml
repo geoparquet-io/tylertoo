@@ -8,7 +8,7 @@
 #
 #   1. builds the release binary and, from source at a pinned tag + commit
 #      SHA (benchmarks/e2e/setup_tippecanoe.sh, cached in .tools/ on the
-#      script's hash, so a re-pin invalidates the cache), tippecanoe 2.79.0;
+#      script's hash, so a re-pin invalidates the cache), tippecanoe 2.82.0;
 #   2. runs benchmarks/e2e/compare_tippecanoe.py: both tools tile every
 #      fixture with matched flags (the README.md "Settings parity" set;
 #      tylertoo in its quality-matched configuration, which is the run
