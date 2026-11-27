@@ -488,13 +488,20 @@ fn check_pass1_memory_preflight(value: &serde_json::Value) {
         "the preflight's footer row count ({rows}) must cover what pass 1 then \
          scanned ({scanned}) — it is an upper bound, exact without --bbox/--filter: {value}"
     );
-    // `PASS1_BYTES_PER_ROW` is crate-private, so this restates it. #543 item 2
-    // cut it from 64 to 42 (the column-major `FeatureTable`, worst case: both
-    // optional columns materialized).
+    // The price is the level assignment path's (#928): the table path's
+    // `PASS1_BYTES_PER_ROW` (42, #543 item 2), or the streamed path's row
+    // tables and working maps, which are always cheaper.
+    let per_row = pre["bytes_per_row"].as_u64().unwrap_or_else(|| {
+        panic!("pass1_memory_preflight.bytes_per_row must be an integer: {value}")
+    });
+    assert!(
+        per_row > 0 && per_row <= 42,
+        "bytes_per_row must be at most PASS1_BYTES_PER_ROW: {value}"
+    );
     assert_eq!(
         pre["estimated_bytes"].as_u64(),
-        Some(rows * 42),
-        "estimated_bytes must be rows x PASS1_BYTES_PER_ROW: {value}"
+        Some(rows * per_row),
+        "estimated_bytes must be rows x bytes_per_row: {value}"
     );
 }
 
