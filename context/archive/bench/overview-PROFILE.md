@@ -1,10 +1,12 @@
+Frozen history, moved from `benchmarks/overview/PROFILE.md` on 2026-11-27; not maintained.
+
 # Performance profile — methodology + history
 
 Companion to [`RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (storage/access numbers; in git history since #810).
 This page records **how** the pipeline's performance was measured and
 the sequence of changes that produced the current numbers. The full
 point-in-time engineering notes are archived in
-[`context/archive/bench/`](../../context/archive/bench/) —
+[`context/archive/bench/`](./) —
 `H3_NOTES.md` (streaming convert + export restructure),
 `H3C_PROFILE.md` (wall-time profile + optimization levers),
 `EXPORT_NOTES.md` (E0 export design/validation).

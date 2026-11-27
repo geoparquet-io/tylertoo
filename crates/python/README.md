@@ -7,7 +7,7 @@
 [![Crates.io](https://img.shields.io/crates/v/tylertoo?color=blue)](https://crates.io/crates/tylertoo)
 [![PyPI](https://img.shields.io/pypi/v/tylertoo?color=blue)](https://pypi.org/project/tylertoo/)
 
-GeoParquet to PMTiles with a Rust engine, CLI, and Python API. [<!-- bench:e2e-corpus/readme-claim -->17.0–23.0× faster than tippecanoe end-to-end on 631k–1203k-feature line and polygon datasets at each tool's production settings — 13.7–17.9× with tylertoo's feature thinning switched off, and at up to 3.7× peak memory (Neoverse-V1, tylertoo 0.8.0 @ `ae0363f`, tippecanoe v2.79.0, 2026-11-06)<!-- /bench -->](https://geoparquet-io.github.io/tylertoo/benchmarks/). It [<!-- bench:overture-buildings-africa/stream-claim -->streams 527 million Overture buildings (58.7 GB of partitioned GeoParquet) from S3 into PMTiles in 54 min on one machine<!-- /bench -->](https://geoparquet-io.github.io/tylertoo/benchmarks/#streaming-at-scale-africa-straight-from-s3), which tippecanoe cannot do. Supports streaming, bounded-memory processing, remote reads, and sharded builds across multiple machines. Named after [“Tippecanoe and Tyler Too.”](https://en.wikipedia.org/wiki/Tippecanoe_and_Tyler_Too)
+GeoParquet to PMTiles with a Rust engine, CLI, and Python API. [<!-- bench:e2e-corpus/readme-claim -->20× faster than tippecanoe end to end, the geometric mean over 3 datasets (commit ae0363f, 2026-11-06)<!-- /bench -->](https://geoparquet-io.github.io/tylertoo/benchmarks/). It [<!-- bench:overture-buildings-africa/stream-claim -->streams 527 million Overture buildings (58.7 GB of partitioned GeoParquet) from S3 into PMTiles in 54 min on one machine (commit afb6b15)<!-- /bench -->](https://geoparquet-io.github.io/tylertoo/benchmarks/#streaming-overture-from-s3), which tippecanoe cannot do. Supports streaming, bounded-memory processing, remote reads, and sharded builds across multiple machines. Named after [“Tippecanoe and Tyler Too.”](https://en.wikipedia.org/wiki/Tippecanoe_and_Tyler_Too)
 
 ## Install
 
@@ -18,12 +18,12 @@ pip install tylertoo      # Python API, and the CLI as `tylertoo` or `python -m 
 
 ## Quickstart
 
-Tile 17,465 Madagascar boundary polygons (17 MB) into a PMTiles archive:
+Tile 17,465 Madagascar boundary polygons (28 MB) into a PMTiles archive:
 
 ```bash
 cargo install tylertoo
 repo=https://github.com/geoparquet-io/tylertoo
-file=fieldmaps-madagascar-adm4-hilbert.parquet
+file=fieldmaps-madagascar-adm4.parquet
 curl -LO "$repo/releases/download/fixtures-v1/$file"
 tylertoo "$file" madagascar.pmtiles --max-zoom 10
 ```
@@ -33,7 +33,7 @@ Or in Python:
 ```python
 import tylertoo
 
-tylertoo.overview("fieldmaps-madagascar-adm4-hilbert.parquet", "madagascar-ov.parquet", max_zoom=10)
+tylertoo.overview("fieldmaps-madagascar-adm4.parquet", "madagascar-ov.parquet", max_zoom=10)
 tylertoo.export_pmtiles("madagascar-ov.parquet", "madagascar.pmtiles")
 ```
 

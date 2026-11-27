@@ -78,6 +78,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import run_manifest as rm  # noqa: E402
+from run_manifest import host_class_key  # noqa: E402
 BASELINE = HERE / "baseline" / "valve_guard.json"
 
 RATIO_WALL_MAX = 1.8
@@ -101,7 +102,8 @@ SCALING_CELLS = ("moldova-tiles", "792-def")
 CPU_MIN_BASELINE_S = 0.05  # a shorter phase's core-seconds are noise: skipped, said so
 CORE_PHASES = ("convert/pass2 (output sink)", "export/levels")
 EXEMPTIONS = HERE.parent / "ci" / "exemptions.toml"
-# The self-hosted `tylertoo-bench` runner's class (valve-guard.yml). Here a
+# The 64-core development box's class, where the baseline is recorded by hand
+# (context/PROFILING.md). Here a
 # baseline lacking a field the gate checks fails instead of reading NOT
 # APPLICABLE, so a stale baseline cannot switch the #817 gate off.
 PINNED_CLASS = "aarch64/0xd40/64"
@@ -125,11 +127,6 @@ CELLS = {
     "moldova-tiles": ("mim", "moldova", []),
 }
 RATIO_PAIRS = [("792-def", "792-drop"), ("792-def-glibc", "792-drop-glibc")]
-
-
-def host_class_key(host: dict) -> str:
-    """The baseline file's key for a host class (run_manifest.host_class)."""
-    return f"{host['machine']}/{host['cpu_model']}/{host['cpus']}"
 
 
 def command(cell: str, bins: dict, work: Path, prepared: dict) -> list[str]:

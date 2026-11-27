@@ -123,3 +123,61 @@ def test_tippecanoe_reads_the_converter_whose_time_is_reported(tmp_path):
     assert chosen["tool"] == "fast"
     assert set(order.read_text().split()) == {"fast"}
     assert "convert:fast" in summ
+
+
+@pytest.fixture(autouse=True)
+def mock_load_gate(monkeypatch):
+    """Round tests exercise timings on tiny commands without host-load waits."""
+    class Gate:
+        def __init__(self, *args, **kwargs): self.last_own_end = 0
+        def wait(self): return {'gate': 'quiet'}
+    monkeypatch.setattr(run_e2e.rm, 'Gate', Gate)
+    monkeypatch.setattr(run_e2e, '_gate', None, raising=False)
+
+
+def test_load_gate_precedes_every_timed_run(tmp_path, monkeypatch):
+    calls = []
+    class Gate:
+        last_own_end = 0
+        def wait(self): calls.append('gate'); return {'gate': 'quiet'}
+    gate = Gate()
+    monkeypatch.setattr(run_e2e.rm, 'Gate', lambda *a, **k: gate)
+    original = run_e2e.rm.timed
+    def timed(*a, **k):
+        calls.append('timed')
+        return original(*a, **k)
+    monkeypatch.setattr(run_e2e.rm, 'timed', timed)
+    for i in range(2):
+        run_e2e.measure(['true'], tmp_path / f'{i}.log')
+    assert calls == ['gate', 'timed', 'gate', 'timed']
+    assert gate.last_own_end > 0
+
+
+def test_pin_parser_reads_owner(tmp_path):
+    setup = tmp_path / 'setup.sh'
+    setup.write_text('DEFAULT_TAG="9.8.7"\n')
+    assert run_e2e.tippecanoe_pin(setup) == '9.8.7'
+    assert run_e2e.EXPECTED_TIPPECANOE_VERSION == f'tippecanoe v{run_e2e.tippecanoe_pin()}'
+
+
+def test_kept_archive_paths(tmp_path):
+    assert run_e2e.archive_paths(tmp_path, 'tiny') == {
+        'tylertoo': tmp_path / 'tiny/tylertoo.pmtiles',
+        'tippecanoe': tmp_path / 'tiny/tippecanoe.pmtiles'}
+
+
+def test_provenance_uses_shared_host_and_memory_facts(monkeypatch):
+    shared = {'host': 'shared host', 'host_class': 'shared class', 'mem_gib': 247,
+              'tylertoo_version': 'tylertoo test', 'tool_versions': {'head': 'tylertoo test'}}
+    binary = {'label': 'head', 'path': '/bin/tylertoo'}
+    monkeypatch.setattr(run_e2e.rm, 'parse_bin', lambda spec: binary)
+    def provenance(bins, inputs):
+        assert bins == [binary] and inputs == {}
+        return shared
+    monkeypatch.setattr(run_e2e.rm, 'provenance', provenance)
+    monkeypatch.setattr(run_e2e.shutil, 'which', lambda tool: None)
+    p = run_e2e.run_provenance('/bin/tylertoo', 'tippecanoe vtest', 'tip-sha')
+    assert p is shared
+    assert p['mem_gib'] == 247 and p['host_class'] == 'shared class'
+    assert p['tool_versions']['tippecanoe'] == 'vtest'
+    assert p['tool_versions']['tippecanoe_commit'] == 'tip-sha'

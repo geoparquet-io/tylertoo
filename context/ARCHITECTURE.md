@@ -14,7 +14,7 @@ Related canonical documents:
   generalization knob, its default, and its direction.
 - **Benchmarks**: [`benchmarks/overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/139aa99/benchmarks/overview/RESULTS.md) (2026-07-03, before H3; removed in #810, kept in history)
   (storage/access numbers) and
-  [`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/PROFILE.md)
+  [archived pipeline performance history](archive/bench/overview-PROFILE.md)
   (performance methodology + history).
 
 ## Decision Record: Legacy Tiles Pipeline Removed (#177, 2026-07-03)

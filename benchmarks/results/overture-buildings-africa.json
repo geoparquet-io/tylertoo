@@ -614,7 +614,10 @@
         ]
       }
     ],
-    "date": "2026-11-07T12:07:44Z"
+    "date": "2026-11-07T12:07:44Z",
+    "notes": [
+      "argv and env were backfilled from manifest-africa.toml at e73ca1e0."
+    ]
   },
   "dataset": "Overture buildings 2026-10-21.0, africa (bbox -18,-35,52,37.5)",
   "features": 526532679,
@@ -6797,7 +6800,36 @@
         "max_tile_bytes": 794296,
         "tiles_over_cap_in_1000_largest": 40
       },
-      "note": "reads the parts in place; no extract"
+      "note": "reads the parts in place; no extract",
+      "argv": [
+        "tylertoo",
+        "tiles",
+        "s3://overturemaps-us-west-2/release/2026-10-21.0/theme=buildings/type=building/",
+        "{out}/out.pmtiles",
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "14",
+        "--layer-name",
+        "buildings",
+        "--tile-buffer",
+        "8",
+        "--max-compressed-tile-size",
+        "500000",
+        "--max-tile-size",
+        "0",
+        "--include-property",
+        "class",
+        "--include-property",
+        "subtype",
+        "--include-property",
+        "height",
+        "--bbox=-18,-35,52,37.5"
+      ],
+      "env": {
+        "AWS_REGION": "us-west-2",
+        "AWS_SKIP_SIGNATURE": "true"
+      }
     },
     {
       "label": "tylertoo, s3:// in place, `--profile bounded`",
@@ -12962,7 +12994,38 @@
         "max_tile_bytes": 794296,
         "tiles_over_cap_in_1000_largest": 40
       },
-      "note": "reads the parts in place; no extract"
+      "note": "reads the parts in place; no extract",
+      "argv": [
+        "tylertoo",
+        "tiles",
+        "s3://overturemaps-us-west-2/release/2026-10-21.0/theme=buildings/type=building/",
+        "{out}/out.pmtiles",
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "14",
+        "--layer-name",
+        "buildings",
+        "--tile-buffer",
+        "8",
+        "--max-compressed-tile-size",
+        "500000",
+        "--max-tile-size",
+        "0",
+        "--include-property",
+        "class",
+        "--include-property",
+        "subtype",
+        "--include-property",
+        "height",
+        "--bbox=-18,-35,52,37.5",
+        "--profile",
+        "bounded"
+      ],
+      "env": {
+        "AWS_REGION": "us-west-2",
+        "AWS_SKIP_SIGNATURE": "true"
+      }
     }
   ]
 }

@@ -1,0 +1,34 @@
+.tt-chart { margin: 1.5rem 0; }
+.tt-chart figcaption { font-weight: bold; }
+.tt-legend { display: flex; gap: 1rem; }
+.tt-key::before {
+  content: "";
+  display: inline-block;
+  width: .8rem;
+  height: .8rem;
+  margin-right: .3rem;
+  background: var(--tt-color);
+}
+.tt-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 12rem;
+  gap: .25rem .5rem;
+  margin: 1rem 0;
+}
+.tt-label { grid-column: 1 / -1; }
+.tt-bar {
+  display: block;
+  /* The grid reserves the value column; percentages scale the remaining track. */
+  width: var(--w);
+  min-height: .8rem;
+  align-self: center;
+  background: var(--tt-color);
+}
+.tt-a { --tt-color: var(--md-accent-fg-color); }
+.tt-b { --tt-color: var(--md-default-fg-color--lighter); }
+.tt-val { font-variant-numeric: tabular-nums; }
+.tt-hero { padding: 1rem; font-size: 1.3rem; background: var(--md-code-bg-color); }
+@media (max-width: 600px) {
+  .tt-row { grid-template-columns: minmax(0, 1fr); }
+  .tt-label { grid-column: 1; }
+}

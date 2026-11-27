@@ -384,7 +384,7 @@ The measurements showed the following:
   the loss includes placeholder-square gaps (#750). Archive 26.9 MB default,
   29.3 MB at factor 0.25, 33.5 MB at factor 0. Table:
   `docs/OVERVIEW_TUNING.md` § Coverage and simplification; commands in
-  `benchmarks/coalesce/RESULTS.md`.
+  [the archived coalesce investigation](../context/archive/bench/coalesce-RESULTS.md).
 - `--polygon-visibility 0` once kept placeholder squares alive at every
   coarse cascade level (#749), drawing small features as very large
   squares. The cascade now dithers on canonical polygon parts, retaining

@@ -68,9 +68,8 @@ USAGE
     ./setup_tippecanoe.sh
     cargo build --release -p tylertoo
     python3 run_e2e.py --repeat 3 --geojson --quality-matched   # the full run
-        # -> results-<UTC timestamp>.json (gitignored); pass
-        #    --out ../results/e2e-fixtures.json only when deliberately
-        #    replacing the committed record, then run scripts/gen_bench_docs.py
+        # -> results-<UTC timestamp>.json (gitignored); the committed
+        #    corpus record is written only by benchmarks/release.sh
     python3 run_e2e.py --only madagascar-adm4 --repeat 5
     python3 run_e2e.py --dataset big=/data/planet-buildings.parquet \
                        --only big --max-zoom 12         # cluster-scale run
@@ -186,6 +185,7 @@ def corpus_datasets() -> dict:
         out[did] = {
             "path": CORPUS_GPIO / f"{did}.parquet",
             "layer": did,
+            "label": ds["region"], "geometry": ds["class"], "features": feats,
             "note": f"corpus {ds.get('class')}/{ds.get('tier')}: "
                     f"{ds.get('region')} ({feats_s})",
             "min_zoom": tc.get("minzoom"),
@@ -241,7 +241,21 @@ MAX_TILE_BYTES = 500_000
 # every run, whether or not the gitignored, machine-local tippecanoe.lock.json
 # exists: a missing lockfile must never mean "any binary will do". Keep in
 # step with TIPPECANOE_TAG in setup_tippecanoe.sh.
-EXPECTED_TIPPECANOE_VERSION = "tippecanoe v2.79.0"
+def tippecanoe_pin(setup: Path = HERE / "setup_tippecanoe.sh") -> str:
+    """The setup script owns the expected baseline tag."""
+    match = re.search(r'^DEFAULT_TAG="([^"]+)"$', setup.read_text(), re.MULTILINE)
+    if not match:
+        raise ValueError(f"DEFAULT_TAG not found in {setup}")
+    return match[1]
+
+
+EXPECTED_TIPPECANOE_VERSION = f"tippecanoe v{tippecanoe_pin()}"
+_gate = None
+
+
+def archive_paths(work: Path, dataset: str) -> dict[str, Path]:
+    """Stable paths consumed by comparison.py when the caller keeps outputs."""
+    return {tool: work / dataset / f"{tool}.pmtiles" for tool in ("tylertoo", "tippecanoe")}
 
 
 # --------------------------------------------------------------------------
@@ -272,7 +286,17 @@ def measure(argv: list[str], log: Path, *, unlink_first: Path | None = None) -> 
     # repeat measure the same work rather than an overwrite fast path.
     if unlink_first is not None:
         unlink_first.unlink(missing_ok=True)
-    res = rm.timed(argv, log, caps=CAPS)
+    global _gate
+    if _gate is None:
+        defaults = rm.load_manifest()["defaults"]
+        _gate = rm.Gate(defaults["load_max"], defaults["load_wait_s"], log.parent / "gate.jsonl")
+    gate = _gate.wait()
+    if gate["gate"] == "TIMED_OUT":
+        raise RuntimeError(f"load gate timed out; see {_gate.log}")
+    try:
+        res = rm.timed(argv, log, caps=CAPS)
+    finally:
+        _gate.last_own_end = time.monotonic()
     if res["status"] != "ok":
         raise CommandFailed(argv, res["returncode"], res["stderr_tail"] or "")
     cores = res["effective_cores"]
@@ -735,11 +759,24 @@ def run_invariants(args, datasets: dict) -> int:
     return 0
 
 
+def run_provenance(tylertoo: str, tip_version: str, tip_sha: str | None) -> dict:
+    """Use the harness's host, memory, and release identity for corpus runs."""
+    prov = rm.provenance([rm.parse_bin(f'head={tylertoo}')], {})
+    prov['tool_versions'].update({
+        'tippecanoe': tip_version.removeprefix('tippecanoe ').strip(),
+        'tippecanoe_commit': tip_sha,
+        **{tool: rm._out([tool, '--version']) for tool in ('ogr2ogr', 'gpio') if shutil.which(tool)},
+    })
+    return prov
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--print-tippecanoe-pin", action="store_true",
+                    help="print the baseline tag from setup_tippecanoe.sh and exit")
     ap.add_argument("--repeat", type=int, default=3,
-                    help="timed runs per measurement (median reported); default 3")
+                    help="timed runs per measurement (median reported); default %(default)s")
     ap.add_argument("--only", action="append", default=None,
                     help="restrict to these dataset ids (repeatable)")
     ap.add_argument("--dataset", action="append", default=[],
@@ -782,9 +819,8 @@ def main() -> int:
     ap.add_argument("--out", default=None,
                     help="results file (default: results-<UTC timestamp>.json "
                          "next to this script, gitignored). The committed "
-                         "records benchmarks/results/e2e-fixtures.json and "
-                         "e2e-corpus.json are only ever written when named "
-                         "here explicitly")
+                         "benchmarks/results/e2e-corpus.json is written "
+                         "only by benchmarks/release.sh")
     ap.add_argument("--markdown", default=None,
                     help="also write a markdown table here")
     inv = ap.add_argument_group(
@@ -803,6 +839,9 @@ def main() -> int:
     inv.add_argument("--invariants-out", default=None,
                      help="write every invariant outcome here as JSON")
     args = ap.parse_args()
+    if args.print_tippecanoe_pin:
+        print(tippecanoe_pin())
+        return 0
     if args.invariants:
         datasets = {**DATASETS, **INVARIANT_ONLY_DATASETS}
         for spec in args.dataset:
@@ -865,23 +904,7 @@ def main() -> int:
         machine = machine_info()
         results = {
             # The results-file contract of scripts/gen_bench_docs.py (#810).
-            "provenance": {
-                "commit": git_sha(),
-                "tylertoo_version": tyler_version,
-                "host": f"{machine.get('cpu')}, {machine.get('ram_gb')} GB RAM, "
-                        f"{machine.get('platform')}",
-                "nproc": os.cpu_count(),
-                "kernel": platform.release(),
-                "allocator": rm.detect_allocator(Path(tylertoo)),
-                "tool_versions": {
-                    "tippecanoe": tip_version.removeprefix("tippecanoe ").strip(),
-                    "tippecanoe_commit": tip_sha,
-                    **{t: rm._out([t, "--version"]) for t in ("ogr2ogr", "gpio")
-                       if shutil.which(t)},
-                },
-                "inputs": [],  # filled per dataset as it runs
-                "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            },
+            "provenance": run_provenance(tylertoo, tip_version, tip_sha),
             "schema_version": 1,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "machine": machine,
@@ -925,6 +948,7 @@ def main() -> int:
                 "input_bytes": src.stat().st_size,
                 "note": ds.get("note"),
                 "layer": ds["layer"],
+                **{key: ds[key] for key in ("label", "geometry", "features") if key in ds},
                 "min_zoom": zmin,
                 "max_zoom": zmax,
                 "tippecanoe_dataset_flags": ds_tip_flags,
@@ -938,7 +962,9 @@ def main() -> int:
             #   convert: parquet -> fgb, every available converter
             #   C.  tippecanoe: fgb -> pmtiles
             #   ldGeoJSON + -P (optional, --geojson)
-            tt_out = workdir / f"{did}.tylertoo.pmtiles"
+            archives = archive_paths(workdir, did)
+            archives["tylertoo"].parent.mkdir(parents=True, exist_ok=True)
+            tt_out = archives["tylertoo"]
             tt_report = workdir / f"{did}.tylertoo.report.json"
             legs = {"tylertoo": {"argv": tylertoo_argv(tylertoo, src, tt_out, ds["layer"],
                                                        zmin, zmax, tt_report)}}
@@ -958,7 +984,7 @@ def main() -> int:
             tip_fgb = workdir / f"{did}.tippecanoe-input.fgb"
             conv_legs, chosen = converter_legs(converters, tip_fgb)
             legs.update(conv_legs)
-            tp_out = workdir / f"{did}.tippecanoe-fgb.pmtiles"
+            tp_out = archives["tippecanoe"]
             legs["tippecanoe_fgb"] = {"needs": tip_fgb, "argv": tippecanoe_argv(
                 tippecanoe, tip_fgb, tp_out, ds["layer"], zmin, zmax, False, tip_all)}
             gj = workdir / f"{did}.geojsonseq"

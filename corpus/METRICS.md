@@ -154,10 +154,8 @@ gpio input, using the recorded flags.
 
 ## 6. Reporting
 
-- Emit one machine-readable results file per run
-  (`benchmarks/overview/results-<date>.json`) keyed by
-  `dataset_id → {structural, storage, access, write}` so numbers are
-  regression-tracked over time.
+- Run `benchmarks/release.sh` to write the committed release results
+  in `benchmarks/results/`.
 - V2 additionally emits the side-by-side PNG grid for the human gate.
 - Always record: overview file version, Overture release, tool
   versions (tippecanoe, cogp, duckdb, gpio), and host (localhost vs

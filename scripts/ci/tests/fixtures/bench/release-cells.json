@@ -1,0 +1,72 @@
+{
+  "provenance": {
+    "commit": "abc1234",
+    "tylertoo_version": "tylertoo 0.9.0",
+    "host": "Test host",
+    "nproc": 4,
+    "kernel": "test",
+    "allocator": "mimalloc",
+    "tool_versions": {
+      "tippecanoe": "test-tip",
+      "gpio": "test-gpio"
+    },
+    "inputs": [],
+    "date": "2026-11-01T12:00:00Z"
+  },
+  "cells": {
+    "tiles-madagascar": {
+      "auto": {
+        "wall_s": {
+          "median": 10
+        },
+        "true_peak_mib": {
+          "median": 1024
+        }
+      },
+      "bounded": {
+        "wall_s": {
+          "median": 20
+        },
+        "true_peak_mib": {
+          "median": 512
+        }
+      }
+    },
+    "polygons": {
+      "auto": {
+        "wall_s": {
+          "median": 10
+        },
+        "true_peak_mib": {
+          "median": 1024
+        }
+      },
+      "bounded": {
+        "wall_s": {
+          "median": 20
+        },
+        "true_peak_mib": {
+          "median": 512
+        }
+      }
+    },
+    "tiles-nz": {
+      "auto": {
+        "wall_s": {
+          "median": 10
+        },
+        "true_peak_mib": {
+          "median": 1024
+        }
+      },
+      "bounded": {
+        "wall_s": {
+          "median": 20
+        },
+        "true_peak_mib": {
+          "median": 512
+        }
+      }
+    }
+  }
+}

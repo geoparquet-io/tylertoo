@@ -19,6 +19,11 @@ GH = {"machine": "x86_64", "cpu_model": "AMD EPYC 7763 64-Core Processor", "cpus
 VM = {"machine": "aarch64", "cpu_model": "0xd40", "cpus": 64}
 
 
+def test_host_class_key_is_shared_with_manifest_runner():
+    import run_manifest as rm
+    assert vg.host_class_key is rm.host_class_key
+
+
 def _cell(wall: float, rss: int = 1000) -> dict:
     return {"wall_s": wall, "peak_rss_kib": rss, "peak_rss_min_kib": rss, "rounds": 3}
 
