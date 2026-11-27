@@ -78,7 +78,7 @@ def fence_for(source: Path) -> str:
 
 
 def rendered_source(example: Path) -> str:
-    """Expand the example's README includes in its tutorial page."""
+    """Expand the example's README includes in its tutorial or guide page."""
     readme = example / "README.md"
     relative = readme.relative_to(REPO_ROOT).as_posix()
     include = re.compile(
@@ -87,11 +87,12 @@ def rendered_source(example: Path) -> str:
     )
     pages = [
         page.read_text(encoding="utf-8")
-        for page in sorted((REPO_ROOT / "docs" / "tutorials").glob("*.md"))
+        for section in ("tutorials", "guides")
+        for page in sorted((REPO_ROOT / "docs" / section).glob("*.md"))
     ]
     matching = [page for page in pages if include.search(page)]
     if len(matching) != 1:
-        raise ValueError(f"Expected one tutorial page including {relative}")
+        raise ValueError(f"Expected one tutorial or guide page including {relative}")
     source = readme.read_text(encoding="utf-8")
 
     def expand(match: re.Match[str]) -> str:
