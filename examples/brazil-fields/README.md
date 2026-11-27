@@ -7,9 +7,9 @@ independent jobs that can run at the same time on a cluster.
 
 The input is the 45 GeoParquet files under Brazil's prefix on
 [Source Cooperative](https://source.coop/ftw/global-data): 11.6 GB with
-55,500,503 rows. The data holds predictions for 2024 and 2025, with about
-27.5 million rows per year. The `determination:datetime` column tells the
-years apart. Without the year in the filter, the map draws most fields
+55,500,520 rows. The data holds about 27.5 million rows for 2024 and
+28.0 million for 2025. The `determination:datetime` column identifies
+each prediction's year. Without the year in the filter, the map draws most fields
 twice, once per year. Keeping only 2025 fields of one hectare or more
 leaves 4,173,713 fields, or 7.5% of the rows, covering 103.3 million hectares.
 The map shows A5 density cells at z0-z7 and field polygons at z8-z14.
@@ -21,27 +21,33 @@ Each step is a script in
 
 Install `tylertoo` with `cargo install tylertoo`. You don't need credentials:
 requests are anonymous, and `tylertoo` logs a warning. Run the steps in
-order in an empty working directory. Each step downloads the 11.6 GB.
+order in an empty working directory. Step 1 downloads about 11.6 GB after
+staging the columns its first pass needs. In step 2, the coarse job and
+each shard download their own input. In the worst case, each of the five
+jobs downloads the full dataset.
 
-On a 4-core machine with 16 GB of memory, step 1 took about 20 minutes,
-peaked at 12 GB of memory, and needed about 21 GB of free disk for its
-temporary files and the 3.3 GB archive. The archive was byte-identical to
-the 64-core run. If the default disk is short on space, set `TMPDIR` to a
-roomier disk. Step 2 runs five jobs in sequence, so it takes longer on one
-machine.
+If the default disk is short on space, set `TMPDIR` to a roomier disk.
+Alternatively, pass `--spill-dir PATH` to `tylertoo tiles` to choose a
+directory for staged remote input and the intermediate overview. Step 2
+runs five jobs in sequence, so it takes longer than step 1 on one machine.
 
-## 1. Tile all of Brazil straight from the bucket
+The output and timings in both steps are from a run on November 27, 2026.
+The run used a 64-core aarch64 development machine with a 40 GB memory cap.
+The whole tutorial, both steps, took 35 minutes on that machine.
 
-Point `AWS_ENDPOINT_URL` at Source Cooperative. The `--filter` keeps 2025
+## 1. Tile all Brazil straight from the bucket
+
+Point `AWS_ENDPOINT_URL` at Source Cooperative. tylertoo reads an `s3://`
+prefix ending in `/` as one dataset. The `--filter` keeps 2025
 fields of one hectare or more using `determination:datetime` and
-`metrics:area`, which stores square meters. The column names need double
-quotes in the filter, so the whole filter is in double quotes and the
-inner ones are escaped.
+`metrics:area`, which stores square meters. Enclose the whole filter in
+double quotes, and escape the inner quotes around column names.
 
-This run reads 875 of the 879 row groups and downloads all 11.6 GB once.
-Both years share row groups, so the year filter cannot skip downloads.
-The command counts the A5 cells first and then tiles the fields from the
-same downloaded bytes.
+This run reads 875 of the 879 row groups. It stages 1.24 GB of the columns
+the first pass needs. Then it fetches 11,062.65 MiB (about 11.6 GB, or 100%
+of the object) in 5,340 range requests. Both years share row groups, so the
+year filter cannot skip most downloads. The command counts the A5 cells
+first and then tiles the fields.
 
 Use `--band 0-7:a5` to draw A5 cells at z0-z7. Each cell holds its ID in
 `cell` and the number of fields whose centroid falls in it in `point_count`.
@@ -89,39 +95,46 @@ tylertoo stats brazil.pmtiles
 ```
 ```text
 ✓ Converted admin:country_code=BR → brazil.pmtiles
-  857,315 tiles across z0..z14 in 174.16s
+850,534 tiles across z0..z14 in 708.37s
 ...
-  3 tile(s) still over the size limit, written as is
+attribute filter: reading 875/879 input row groups
 ...
- z    tiles          total     mean      p50      p99      max
- 0        1          1,663    1,663    1,663    1,663    1,663
- 1        2          6,305    3,152    1,895    4,410    4,410
- 2        2         13,775    6,887    2,539   11,236   11,236
- 3        4         38,872    9,718    3,685   25,405   25,405
- 4        8        119,085   14,885    3,849   59,644   59,644
- 5       15        370,907   24,727    7,067   85,940   85,940
- 6       40      1,176,585   29,414   13,815   80,543   80,543
- 7      120      3,605,503   30,045   20,952   73,098   73,800
- 8      408     88,559,434  217,057  151,525  510,604  560,436
- 9    1,391    176,905,218  127,178   76,355  499,280  511,638
-10    4,725    248,244,053   52,538   32,908  296,306  509,116
-11   16,499    359,181,678   21,769   13,682  123,829  277,193
-12   57,165    558,874,935    9,776    6,240   53,571  118,290
-13  188,497    838,446,327    4,448    3,106   21,519   43,053
-14  588,438  1,043,813,089    1,773    1,344    7,163   13,556
+(12.33 GiB, removed after export
+...
+2 tile(s) at z8 written at reduced extent; smallest extent 2048
+...
+z    tiles        total     mean      p50      p99      max
+0        1        1,601    1,601    1,601    1,601    1,601
+1        2        5,783    2,891    1,500    4,283    4,283
+2        2       12,697    6,348    2,017   10,680   10,680
+3        4       35,349    8,837    3,134   23,493   23,493
+4        7      108,730   15,532    5,112   55,036   55,036
+5       15      339,090   22,606    6,332   79,747   79,747
+6       40    1,069,360   26,734   12,233   73,115   73,115
+7      120    3,283,232   27,360   18,626   66,841   67,450
+8      405   78,247,404  193,203  125,836  509,417  511,154
+9    1,379  164,173,708  119,052   71,514  497,698  510,414
+10    4,704  234,519,836   49,855   31,016  277,364  510,527
+11   16,427  341,436,579   20,785   13,100  118,362  263,943
+12   56,869  539,310,112    9,483    6,061   51,409  113,377
+13  187,112  791,225,893    4,228    2,960   20,368   40,476
+14  583,447  986,072,532    1,690    1,282    6,818   12,790
 ```
 
-The archive `brazil.pmtiles` holds 857,315 tiles across z0-z14 and is
-3.3 GB. On a 64-core machine, the run took 4 minutes 19 seconds. The
-intermediate overview file was 7.3 GiB and was removed after the export.
+The archive `brazil.pmtiles` holds 850,534 tiles across z0-z14 and is
+3.1 GB. On the 64-core development machine with a 40 GB memory cap, step 1
+took about 11 minutes 48 seconds. The command writes a 12.33 GiB
+intermediate overview file and removes it after the export.
 
-Across z0-z7, the map has 185,261 A5 cells, including 129,558 at z7.
-At every cell zoom, `point_count` sums to 4,173,713.
+Across z0-z7, the map has 185,261 A5 cells, including 129,558 at z7,
+counting each cell once. At every cell zoom z0-z7, `point_count` sums to
+4,173,713 and `metrics:area` sums to 103.3 million hectares, also counting
+each cell once. A decoded tile file lists a cell once per tile it touches.
 
-Tiles are heaviest at z8-z9, where whole fields are drawn over the dense
-soy belt. The size valve merges features to keep tiles under the 500 KB
-compressed cap. Three tiles remain over the cap and are written anyway;
-[issue #873](https://github.com/geoparquet-io/tylertoo/issues/873) tracks this.
+Tiles are heaviest at z8-z9, where the map shows whole fields across
+areas with dense soy fields. The size valve merges features to keep tiles near the size cap.
+Two z8 tiles use a reduced extent of 2048 to fit the cap. No tile remains
+over it.
 Drop `brazil.pmtiles` onto [pmtiles.io](https://pmtiles.io/) to inspect it.
 
 ## 2. Split the same build into shard jobs
@@ -129,8 +142,9 @@ Drop `brazil.pmtiles` onto [pmtiles.io](https://pmtiles.io/) to inspect it.
 To distribute the build across a cluster, use `shard-plan` to cut the z10
 tile space, the pivot, into four shards of about 13.9 million rows each.
 The plan counts rows before the filter. The coarse job reads the whole
-prefix and draws z0-z9: the cells and the z8-z9 fields. It saves the convert plan with `--save-plan`. Each shard
-loads that plan with `--plan` and draws z10-z14 for its slice.
+prefix and draws z0-z9: the cells and the z8-z9 fields. It saves the
+convert plan with `--save-plan`. Each shard loads that plan with `--plan`
+and draws z10-z14 for its slice.
 
 Give every job the same options through the `OPTIONS` array. The plan's
 fingerprint covers them, including `--band`, and `tylertoo` refuses a
@@ -139,6 +153,10 @@ mismatched job. A cell band must end below the pivot.
 The script runs the four shard jobs in sequence. On a cluster, they run on
 separate machines at the same time. Once the jobs finish, `merge`
 concatenates the five archives.
+
+A shard with no rows writes an empty archive and exits 0; `merge` skips empty archives and refuses archives whose tiles overlap.
+
+In this run, shards 0-3 downloaded 11.6, 10.4, 5.2, and 6.8 GB, respectively.
 
 File: `02-shard.sh`
 
@@ -183,37 +201,30 @@ Cut 4 shard(s) at pivot z10 for s3://ftw/global-data/predictions/vectors/alpha/r
   shard 3   tiles 858065..=1398100  (540036 pivot tile(s), ~13838304 row(s), 24.9%)
 ...
 ✓ Converted admin:country_code=BR → coarse.pmtiles
-  1,991 tiles across z0..z9 in 137.83s
+  1,975 tiles across z0..z9 in 131.28s
 ...
 ✓ Converted admin:country_code=BR → shard-0.pmtiles
-  337,242 tiles across z10..z14 in 145.08s
+  334,182 tiles across z10..z14 in 453.97s
 ...
 ✓ Converted admin:country_code=BR → shard-1.pmtiles
-  273,749 tiles across z10..z14 in 119.98s
+  271,771 tiles across z10..z14 in 345.37s
 ...
 ✓ Converted admin:country_code=BR → shard-2.pmtiles
-  110,400 tiles across z10..z14 in 64.83s
+  109,790 tiles across z10..z14 in 81.15s
 ...
 ✓ Converted admin:country_code=BR → shard-3.pmtiles
-  133,933 tiles across z10..z14 in 79.99s
+  132,816 tiles across z10..z14 in 111.67s
 ...
-✓ 857,315 tiles (856,916 unique) from 5 archive(s), z0..z14 in 4.32s
+✓ 850,534 tiles (850,109 unique) from 5 archive(s), z0..z14 in 3.99s
 ...
-10    4,725    248,244,039   52,538   32,908  296,306  509,140
+10    4,704  234,519,671   49,855   31,016  277,364  510,527
 ...
 ```
 
-On the same 64-core machine, the coarse job drew 1,991 tiles in 2 minutes
-18 seconds. The four shard jobs drew 337,242, 273,749, 110,400, and 133,933
-tiles, respectively, and took 1 to 2.5 minutes each. Merging took 4 seconds.
-The whole script took 10.5 minutes on that machine.
-
-The merged `sharded.pmtiles` has the same 857,315 tiles as step 1. All but
-4 are byte-identical. Those 4 are z10 tiles at the 500 KB cap, where the
-size valve cut slightly differently within a shard. That is why the z10
-total differs slightly from step 1.
-[Issue #854](https://github.com/geoparquet-io/tylertoo/issues/854) tracks this
-difference.
+The merged `sharded.pmtiles` has the same 850,534 tiles as step 1.
+A few z10 tiles at the size cap differ between the two builds
+([#854](https://github.com/geoparquet-io/tylertoo/issues/854)). The z10 total
+differs slightly: 234,519,836 bytes in step 1 and 234,519,671 bytes in step 2.
 
 <!-- --8<-- [end:build] -->
 <!-- --8<-- [start:run] -->
@@ -228,12 +239,9 @@ for step in ../tylertoo/examples/brazil-fields/0*.sh; do bash "$step"; done
 
 ## Next steps
 
-- To tile a smaller area, add `--bbox`. The
-  [remote reads guide](https://geoparquet-io.github.io/tylertoo/guides/remote-reads/)
-  covers it, along with `--filter` syntax, `--files-from` manifests, and
-  row-group pruning.
-- To run shard jobs on a scheduler, see the
-  [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/#sharded-builds).
+- The [CLI reference](https://geoparquet-io.github.io/tylertoo/reference/cli/)
+  describes every flag, including `--bbox`, `--filter`, and `--shard`, and
+  the `shard-plan` and `merge` commands.
 - The [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
   explains every generalization setting, including `--band`.
 - Use `tylertoo pyramid` to combine bands from separate inputs or archives,

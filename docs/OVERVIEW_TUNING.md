@@ -2297,8 +2297,7 @@ strings, tippecanoe's convention for nested attributes. So
 as one string property. A column with no MVT encoding, such as a binary
 column, drops with one warning per column and appears in the export report's
 `skipped_property_columns`. tylertoo rejects it by name if `--include-property`
-asks for it, and an `--exclude-property` naming it silences the warning. The
-full type table is in [preparing input](tutorials/madagascar.md#1-prepare-the-input).
+asks for it, and an `--exclude-property` naming it silences the warning.
 
 ---
 

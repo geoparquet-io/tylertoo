@@ -13,7 +13,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 EXAMPLES_DIR = REPO_ROOT / "examples"
-MADAGASCAR = "fieldmaps-madagascar-adm4.parquet"
+MADAGASCAR = "fieldmaps-madagascar-adm4-hilbert.parquet"
 
 # Pages written from source by the reference generators; they hold usage
 # strings, not runnable examples.
@@ -75,6 +75,40 @@ def fence_for(source: Path) -> str:
     lang = {".sh": "bash", ".py": "python"}[source.suffix]
     text = source.read_text(encoding="utf-8").rstrip("\n")
     return f"```{lang}\n{text}\n```"
+
+
+def rendered_source(example: Path) -> str:
+    """Expand the example's README includes in its tutorial page."""
+    readme = example / "README.md"
+    relative = readme.relative_to(REPO_ROOT).as_posix()
+    include = re.compile(
+        rf'^[ \t]*--8<-- "{re.escape(relative)}(?::(?P<section>[^"\n]+))?"[ \t]*$',
+        re.MULTILINE,
+    )
+    pages = [
+        page.read_text(encoding="utf-8")
+        for page in sorted((REPO_ROOT / "docs" / "tutorials").glob("*.md"))
+    ]
+    matching = [page for page in pages if include.search(page)]
+    if len(matching) != 1:
+        raise ValueError(f"Expected one tutorial page including {relative}")
+    source = readme.read_text(encoding="utf-8")
+
+    def expand(match: re.Match[str]) -> str:
+        section = match.group("section")
+        if section is None:
+            return source
+        snippet = re.search(
+            rf"<!-- --8<-- \[start:{re.escape(section)}\] -->\n?"
+            rf"(?P<body>.*?)<!-- --8<-- \[end:{re.escape(section)}\] -->",
+            source,
+            re.DOTALL,
+        )
+        if snippet is None:
+            raise ValueError(f"Missing snippet section {section!r} in {relative}")
+        return snippet.group("body")
+
+    return include.sub(expand, matching[0])
 
 
 def expected_output(tutorial: str, source: Path) -> str | None:
