@@ -855,7 +855,7 @@ injected, and `record --inject-threads` is refused. A phase the cell measures
 cell) missing from any round fails the check and makes `record` refuse to
 write. A matched baseline missing a field the gate compares (recorded before
 these fields), a cell, or `floors` fails on the pinned class (`PINNED_CLASS`,
-aarch64/0xd40/64, the `tylertoo-bench` runner) with the missing fields and the
+aarch64/0xd40/64) with the missing fields and the
 `record` command; on another recorded class it reports
 `baseline: NOT APPLICABLE (... run record)`. `record --cells X` merges into the host class entry (other
 cells and `floors` stay). A CPU core-seconds check that cannot run (baseline

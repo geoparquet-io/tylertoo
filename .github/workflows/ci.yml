@@ -66,8 +66,8 @@
 # and evicted main's, which PRs restore from (#756). The beta lanes run
 # only on main against a moving toolchain, so they don't cache target/.
 #
-# Benchmarks run in codspeed.yml (per PR) and bench-regression.yml (label,
-# weekly; nightly `pipeline` on the 64-core host); the tippecanoe parity
+# Benchmarks run in codspeed.yml (per PR), bench-regression.yml (label or
+# manual dispatch) and bench-nightly.yml (the nightly tier); the tippecanoe parity
 # gate (#420) runs in tippecanoe-compare.yml (PRs, push to main, weekly).
 #
 # TOOLCHAIN POLICY: floating `stable` for all gates, with a `beta` lane in the
@@ -1362,6 +1362,7 @@ jobs:
           uv run --no-project --python 3.12 --with pytest==8.4.2
           pytest -q benchmarks/test_run_manifest.py benchmarks/test_valve_guard.py
           benchmarks/coalesce/test_run.py benchmarks/e2e/test_run_e2e.py
+          benchmarks/test_release.py benchmarks/test_comparison.py benchmarks/showcase/test_showcase.py
       # The visual gate (#869) is run by hand; its metrics and band rule are
       # tested here on synthetic tiles (examples and Hypothesis properties),
       # without tylertoo or tippecanoe.
