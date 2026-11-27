@@ -587,6 +587,10 @@ pub struct OverviewArgs {
     /// Input GeoParquet. Pass a file, directory, glob, URL, or `s3://` or
     /// `gs://` prefix, or omit it with `--files-from`.
     ///
+    /// Quote a presigned or SAS URL; logs and saved plans redact its query.
+    /// Directory and prefix walks skip names starting with `.` or `_`;
+    /// `key=value` partition keys do not become columns.
+    ///
     /// EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are
     /// reprojected to EPSG:4326 as they are read when they name an EPSG code
     /// (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4
@@ -643,6 +647,10 @@ pub struct OverviewArgs {
 pub struct TilesArgs {
     /// Input GeoParquet. Pass a file, directory, glob, URL, or `s3://` or
     /// `gs://` prefix, or omit it with `--files-from`.
+    ///
+    /// Quote a presigned or SAS URL; logs and saved plans redact its query.
+    /// Directory and prefix walks skip names starting with `.` or `_`;
+    /// `key=value` partition keys do not become columns.
     ///
     /// EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are
     /// reprojected to EPSG:4326 as they are read when they name an EPSG code
@@ -717,7 +725,7 @@ pub struct TilesArgs {
     /// Build one shard: `I/N` for data shard I of N, or
     /// `coarse` for the zooms below the pivot. Requires `--shard-plan`, and
     /// data shards also need `--plan`. See
-    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#sharded-builds>.
+    /// <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-same-build-into-shard-jobs>.
     #[arg(
         long,
         value_name = "I/N|coarse",

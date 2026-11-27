@@ -11,7 +11,7 @@ tippecanoe does not read GeoParquet, let alone filter a remote collection
 while tiling it.
 
 - **Numbers + methodology + findings:** [RESULTS.md](./RESULTS.md). The
-  [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/)
+  [benchmarks page](https://geoparquet-io.github.io/tylertoo/benchmarks/)
   summarizes them.
 - The docs site no longer hosts an interactive viewer for this archive. Drop
   the public URL below onto [pmtiles.io](https://pmtiles.io/) to view it.

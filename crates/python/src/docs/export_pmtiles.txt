@@ -16,7 +16,7 @@ Args:
         `"auto"` is {const:DEFAULT_TILE_SIZE_LIMIT}, and `0` or `None` is no limit.
     simple_clip_fastpath: Use faster clipping for simple polygons.
         `False` gives byte-stable output.
-    partition_wave: [Partitions in memory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves)
+    partition_wave: [Partitions in memory](https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory)
         at once, or `0` to size from CPUs and RAM.
     feature_order: Paint order within a tile: `"input"`, or a
         property name with an optional `:asc` or `:desc`.
@@ -31,9 +31,9 @@ Args:
         geometry-only tiles. `include_properties` overrides it.
     feature_id: Integer column to use as the MVT feature ID. By default,
         features have no ID.
-    spill_dir: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files)
+    spill_dir: [Spill directory](https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory)
         used when memory runs short.
-    profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles):
+    profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory):
         `"speed"` holds everything in RAM, `"bounded"` uses disk and
         holds the least, and `"auto"` sizes to the machine's memory.
         Wheels use mimalloc. Under `"bounded"`, it purges freed pages
@@ -43,14 +43,14 @@ Args:
         `"bounded"` call runs. A non-musl source build uses the system allocator with
         `maturin build --no-default-features` (musl always uses mimalloc).
         Output is identical across profiles.
-    workers: [Worker threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads)
+    workers: [Worker threads](https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory)
         for the whole run. `None` (default) uses `RAYON_NUM_THREADS`
         when set, else every core under `"auto"` and `"speed"` and at
         most {const:WORKER_THREADS_MAX} under `"bounded"`. `0` is an error. The pool is
         process-wide, so the first call in a process sets it and later
         calls keep it.
-    memory_limit: [Memory limit](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit)
-        in bytes, such as `24 * 2**30`, used in place of the detected
+    memory_limit: [Memory limit](https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory)
+        in bytes, used in place of the detected
         available memory (cgroup limit or `MemAvailable`). It overrides
         `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. `0` is an error. The limit is
         process-wide: it stays in force for later calls in the process

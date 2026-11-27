@@ -44,6 +44,8 @@ def site() -> Path:
         ("tutorials/madagascar/index.html", "02-preview.sh"),
         ("tutorials/brazil/index.html", "02-shard.sh"),
         ("changelog/index.html", "Changelog"),
+        ("guides/attribution/index.html", "01-credit.sh"),
+        ("guides/tippecanoe/index.html", "01-preset.sh"),
         ("reference/cli/index.html", "export-pmtiles"),
         ("reference/python/index.html", "export_pmtiles"),
         ("spec/overviews/index.html", "canonical_level"),

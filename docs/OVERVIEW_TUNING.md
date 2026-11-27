@@ -1652,7 +1652,7 @@ buffers would reach nonadjacent tiles and risk O(features × tiles) export,
 so tylertoo rejects them before conversion or export. Sharded builds read
 two pivot tiles beyond their range, covering this margin, and nine when
 the export fades its size valve (`--valve-scope smooth` with a size cap). See
-[Scaling](guides/scaling.md#sharded-builds).
+[Shared plans for sharded builds](#shared-plans-for-sharded-builds).
 
 ### Max-zoom simplification
 
@@ -1967,7 +1967,7 @@ an exact interval test at each zoom. Tiles coarser than the pivot are not
 emitted. `--zoom-ceiling Z` emits only the zooms at or below `Z`, the coarse
 half. It is a ceiling, not a `--max-zoom`, because it chooses which zooms to
 emit, while `--min-zoom` only widens what the metadata declares. The overview
-file still holds every level. [Scaling](guides/scaling.md#sharded-builds)
+file still holds every level. [Shared plans for sharded builds](#shared-plans-for-sharded-builds)
 covers both in context.
 
 ### `tylertoo merge`
@@ -2085,7 +2085,7 @@ a bigger footer for that pushdown.
 ## Memory / streaming knobs: `--read-batch-size`
 
 These settings control conversion memory without changing output content.
-[How streaming bounds memory](guides/scaling.md#how-streaming-bounds-memory)
+[Memory and speed](reference/tuning.md#memory)
 explains the two-pass pipeline and its pass-1 floor of up to 42 bytes per row.
 See also the [file layout knobs](#file-layout-knobs-row-group-size-full-column-stats).
 
@@ -2112,7 +2112,7 @@ assignment. It costs 33 bytes per input row, 41 with a sort key (explicit or
 detected from the schema), and 42 with a sort key and an entry-zoom
 ladder. The transient scan vectors raise the scan-time peak to about 42–80
 bytes per row. The table is the coarse job's memory floor on a
-[sharded build](guides/scaling.md#sizing-the-coarse-jobs-memory) and reaches
+sharded build (see [Memory and speed](reference/tuning.md#memory)) and reaches
 tens of GiB at a billion rows. Before pass 1, tylertoo checks it against the
 footer row counts (#543). It warns when rows × 42 B × 3.3 exceeds the memory
 figure. It fails only when the floor alone exceeds a hard cgroup limit and no
@@ -2125,7 +2125,7 @@ error into a warning.
 
 `--bbox xmin,ymin,xmax,ymax` converts only features whose bounding box
 intersects the region, in longitude and latitude degrees (EPSG:4326).
-[Remote reads](guides/remote-reads.md#what-gets-skipped) explains how covering
+[The Madagascar tutorial](tutorials/madagascar.md) explains how covering
 statistics let it skip row groups, and what makes a source prunable.
 
 ```bash
@@ -2212,8 +2212,7 @@ upstream, for example with `gpio`, or filter on another column.
 
 Like `--bbox`, the filter checks row-group statistics before it reads data.
 It then evaluates each row exactly in pass 1, so the output is identical
-whether pruning fired or not. See
-[Remote reads](guides/remote-reads.md#filters). `AND` intersects the prunable
+whether pruning fired or not. `AND` intersects the prunable
 sets and `OR` unions them. `NOT (...)` subtrees and columns without usable
 statistics keep the row group.
 
@@ -2308,11 +2307,6 @@ These settings control speed and memory. Output is byte-identical across
 profiles, batch concurrency, read-worker counts, and thread counts, as with
 the [memory and streaming knobs](#memory-streaming-knobs-read-batch-size).
 
-The Scaling guide covers [memory profiles](guides/scaling.md#memory-profiles),
-[read concurrency](guides/scaling.md#read-concurrency), and
-[spill files](guides/scaling.md#spill-files) in depth, including container
-memory limits and `--spill-dir`.
-
 Pass 2 reads Parquet once and pipelines reads, decoding, and simplification
 across all cores. The profile decides how much memory every phase may hold:
 where output rows wait before writing, how many batches are read ahead and
@@ -2364,16 +2358,14 @@ the memory the convert has just freed counts as available (#876). Pages a
 worker thread's heap still holds can stay counted, and in Python only the
 first call in a process releases them. Under every profile, export
 still refuses a tile that alone needs more than the machine's memory
-([Export waves](guides/scaling.md#export-waves)).
+([Memory and speed](reference/tuning.md#memory)).
 
 Two options sit beside the profile. `--memory-limit SIZE` (Python
 `memory_limit`, in bytes) replaces the detected memory that every budget
 above is a share of, and takes precedence over
-`TYLERTOO_AUTO_MEM_LIMIT_BYTES` ([Memory limit](guides/scaling.md#memory-limit)).
+`TYLERTOO_AUTO_MEM_LIMIT_BYTES` ([Memory and speed](reference/tuning.md#memory)).
 `--workers N` (Python `workers`) sets the worker pool; without it `auto`
-and `speed` use every core and `bounded` at most 40
-([Worker threads](guides/scaling.md#worker-threads), with measured wall
-times and peak memory per core count).
+and `speed` use every core and `bounded` at most 40.
 
 `auto` is a third shape, not a switch between the other two: on a large
 machine it holds more than `bounded` and less than `speed`. On a machine
@@ -2696,8 +2688,7 @@ Shards need one shared plan because assignment depends on the whole input:
 Recomputing assignment on each shard would produce inconsistent levels, so
 `tiles --shard` requires `--plan`. A shard reads only planned row groups
 whose bbox reaches its tile range. Validation allows this subset, and the
-plan's row tables are remapped to the shorter stream before pass 2. See
-[Scaling](guides/scaling.md#sharded-builds).
+plan's row tables are remapped to the shorter stream before pass 2.
 
 ### Paths and output replacement
 
@@ -2764,7 +2755,7 @@ it by hand.
 ### Speed and memory
 
 - Conversion exhausts RAM or swaps: lower `--read-batch-size`, keep
-  streaming enabled, and see [Scaling](guides/scaling.md).
+  streaming enabled, and see [Memory and speed](reference/tuning.md#memory).
 - Cores remain idle: raise `--in-flight-batches` to process more batches at
   once. If `pass2.windows.max_window` in `TYLERTOO_PROFILE_JSON` stays at 1,
   reads are the bottleneck: raise `--read-workers` instead.

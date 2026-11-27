@@ -612,7 +612,7 @@ pub struct ExportOptions {
     /// Output is byte-identical for every value — the wave is a scheduling
     /// concern only.
     #[cfg_attr(feature = "cli", arg(long, value_name = "N|auto", default_value = "auto", value_parser = super::config::cli::parse_partition_wave))]
-    #[cfg_attr(feature = "cli", arg(help = "Partitions to export at once, or `auto` to size the wave to the cores and free memory. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Partitions to export at once, or `auto` to size the wave to the cores and free memory. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     pub partition_wave: usize,
     /// Within-tile feature order (#361). Defaults to [`FeatureOrder::Input`],
     /// the order tylertoo has always emitted.
@@ -741,7 +741,7 @@ pub struct ExportOptions {
         feature = "cli",
         arg(long, value_name = "PATH", help_heading = "Memory & performance")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Directory for the export's spill file, used when buffered tiles exceed the memory budget. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Directory for the export's spill file, used when buffered tiles exceed the memory budget. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub spill_dir: Option<PathBuf>,
     /// Memory profile for the export (#788), the same values and rule as
@@ -764,7 +764,7 @@ pub struct ExportOptions {
         value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a build without mimalloc uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a build without mimalloc uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub profile: MemoryProfile,
     /// Worker threads in the global Rayon pool (#876). `None` (default):
@@ -782,7 +782,7 @@ pub struct ExportOptions {
         feature = "cli",
         arg(long, value_name = "N", help_heading = "Memory & performance")
     )]
-    #[cfg_attr(feature = "cli", arg(help = format!("Worker threads for the whole run. Default: every core under `auto` and `speed`, at most {workers_max} under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>", workers_max = super::convert::WORKER_THREADS_MAX), long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Worker threads for the whole run. Default: every core under `auto` and `speed`, at most {workers_max} under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", workers_max = super::convert::WORKER_THREADS_MAX), long_help = None))]
     #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub workers: Option<usize>,
     /// Bytes of memory the run may use (#876), in place of the detected
@@ -796,7 +796,7 @@ pub struct ExportOptions {
         value_parser = super::config::cli::parse_size_bytes,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Memory the run may use, such as `24G`, in place of the detected available memory (cgroup limit or `MemAvailable`); overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory the run may use, in place of the detected available memory (cgroup limit or `MemAvailable`); overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub memory_limit: Option<usize>,
     /// Top-level `name`, `description` and `attribution` written to the

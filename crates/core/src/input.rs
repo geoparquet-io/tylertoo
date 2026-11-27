@@ -38,7 +38,7 @@
 //! - **L3**, one network range request, taken only on the first touch of a
 //!   chunk.
 //!
-//! See `docs/remote-reads.md` for the fetch-count implications.
+//! See `docs/reference/tuning.md` (Memory and speed) for the fetch-count implications.
 //!
 //! Remote support is compiled behind the `remote` cargo feature; the CLI and
 //! Python bindings enable it by default. Without the feature, URL inputs

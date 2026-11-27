@@ -140,6 +140,18 @@
   font-size: 0.7rem;
   color: var(--md-default-fg-color--light);
 }
+.compare-maps {
+  display: flex;
+  gap: 1rem;
+}
+.compare-maps > .tutorial-map {
+  flex: 1;
+  min-width: 0;
+}
+@media (max-width: 700px) {
+  .compare-maps { flex-direction: column; }
+  .compare-maps > .tutorial-map { flex: auto; }
+}
 .maplibregl-popup-content {
   color: #05221d;
 }

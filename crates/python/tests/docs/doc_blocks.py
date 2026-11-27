@@ -111,3 +111,7 @@ def missing_lines(expected: str, actual: str) -> list[str]:
 def stage_input(madagascar: Path, workdir: Path) -> None:
     """Put the input where a reader's `curl -LO` would have left it."""
     shutil.copyfile(madagascar, workdir / MADAGASCAR)
+    shutil.copyfile(
+        REPO_ROOT / "tests/fixtures/realdata/open-buildings.parquet",
+        workdir / "open-buildings.parquet",
+    )

@@ -168,5 +168,3 @@ Running this surfaced four things worth recording:
   a *pipeline and its output*, not byte-identical tiling.
 
 The archive is hosted on Source Cooperative (see [README.md](./README.md)).
-The headline numbers are summarized in the
-[scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/).

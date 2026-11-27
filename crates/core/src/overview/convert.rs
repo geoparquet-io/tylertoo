@@ -589,7 +589,7 @@ pub struct ConvertOptions {
         default_value_t = ConvertOptions::default().read_batch_size,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     pub read_batch_size: usize,
     /// Memory/throughput profile for the streaming pass-2 engine (#213/#212).
     /// Default [`MemoryProfile::Auto`], resolved per mode + estimated output
@@ -602,7 +602,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a build without mimalloc uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a build without mimalloc uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     pub profile: MemoryProfile,
     /// Worker threads in the global Rayon pool (#876). `None` (default):
     /// a positive `RAYON_NUM_THREADS`, else every core under `auto` and
@@ -619,7 +619,7 @@ pub struct ConvertOptions {
         feature = "cli",
         arg(long, value_name = "N", help_heading = "Memory & performance")
     )]
-    #[cfg_attr(feature = "cli", arg(help = format!("Worker threads for the whole run. Default: every core under `auto` and `speed`, at most {WORKER_THREADS_MAX} under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>"), long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Worker threads for the whole run. Default: every core under `auto` and `speed`, at most {WORKER_THREADS_MAX} under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>"), long_help = None))]
     pub workers: Option<usize>,
     /// Bytes of memory the run may use (#876), in place of the detected
     /// figure (the smaller of the cgroup headroom and `MemAvailable`).
@@ -632,7 +632,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::parse_size_bytes,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Memory the run may use, such as `24G`, in place of the detected available memory (cgroup limit or `MemAvailable`); overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory the run may use, in place of the detected available memory (cgroup limit or `MemAvailable`); overrides `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     pub memory_limit: Option<usize>,
     /// Number of Arrow read batches allowed in flight through the streaming
     /// pass-2 pipeline at once. Pass 2 splits it in half (#494): one half is
@@ -654,7 +654,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::parse_in_flight_batches,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Read batches in flight at once, or `auto` to size it to the cores. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Read batches in flight at once, or `auto` to size it to the cores. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     pub in_flight_batches: usize,
     /// Number of concurrent reader threads pass 2 (#494) and pass 1 (#717)
     /// each split the input across. Default [`READ_WORKERS_AUTO`], which
@@ -672,7 +672,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::parse_read_workers,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = format!("Reader threads for both passes, or `auto` for half the cores in the first pass and a quarter in the second, up to {READ_WORKERS_MAX}. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>"), long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Reader threads for both passes, or `auto` for half the cores in the first pass and a quarter in the second, up to {READ_WORKERS_MAX}. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>"), long_help = None))]
     pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
@@ -850,7 +850,7 @@ pub struct ConvertOptions {
         feature = "cli",
         arg(long, value_name = "PATH", help_heading = "Memory & performance")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Directory for spill files: staged remote input, and on `tiles` the intermediate overview. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Directory for spill files: staged remote input, and on `tiles` the intermediate overview. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
     pub spill_dir: Option<PathBuf>,
     /// Write the **convert plan artifact** to this path once pass 1 and the
     /// level assignment are done, then carry on with the conversion.

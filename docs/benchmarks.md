@@ -205,8 +205,6 @@ that tippecanoe can't do at all:
 - skipping row groups with `--bbox` and `--filter`;
 - sharding one build across machines and merging without re-encoding.
 
-See [what only tylertoo does](guides/tippecanoe.md#what-only-tylertoo-does).
-
 ## Methods and caveats
 
 - **Warm cache.** Each tool gets one discarded warm-up run, then 3 timed
@@ -232,7 +230,7 @@ tools' phase split, run-to-run variance, and the asymmetry list, is
 [`benchmarks/e2e/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md).
 The method and the settings-parity mapping are in
 [`benchmarks/e2e/README.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/README.md).
-For a sharded build across machines, see [scaling](guides/scaling.md).
+For a sharded build across machines, see [the Brazil tutorial](tutorials/brazil.md#2-split-the-same-build-into-shard-jobs).
 
 ## Reproduce
 

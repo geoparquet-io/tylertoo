@@ -228,12 +228,9 @@ for step in ../tylertoo/examples/brazil-fields/0*.sh; do bash "$step"; done
 
 ## Next steps
 
-- To tile a smaller area, add `--bbox`. The
-  [remote reads guide](https://geoparquet-io.github.io/tylertoo/guides/remote-reads/)
-  covers it, along with `--filter` syntax, `--files-from` manifests, and
-  row-group pruning.
-- To run shard jobs on a scheduler, see the
-  [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/#sharded-builds).
+- To tile a smaller area, add `--bbox`, as the
+  [Madagascar tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/madagascar/)
+  shows.
 - The [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
   explains every generalization setting, including `--band`.
 - Use `tylertoo pyramid` to combine bands from separate inputs or archives,
