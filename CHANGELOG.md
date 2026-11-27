@@ -5,6 +5,12 @@ Notable changes to this project are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.9.1 (2026-11-27)
+
+### Fix
+
+- **core**: read the thread id through the raw gettid syscall
+
 ## v0.9.0 (2026-11-27)
 
 MapLibre Tile output, cell bands, a local viewer, reprojection of projected
