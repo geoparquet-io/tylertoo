@@ -5,6 +5,12 @@ Notable changes to this project are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.9.2 (2026-11-27)
+
+### Fix
+
+- **release**: build the manylinux aarch64 wheel on an arm64 runner
+
 ## v0.9.1 (2026-11-27)
 
 The v0.9.0 Linux wheels failed to build, so v0.9.0 is on crates.io but not
