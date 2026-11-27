@@ -734,3 +734,54 @@ def test_gate_baseline_thresholds_come_from_constants(tmp_path, monkeypatch, met
     entry[metric] = head[metric] / getattr(rm, limit) / factor
     (tmp_path / "baseline.json").write_text(json.dumps({"hosts": {"matching": {"slow": entry}}}))
     assert rm.main(argv) == status
+
+
+def test_failed_round_is_retried_without_repeating_successes(tmp_path, monkeypatch):
+    """Release resumes must not treat an OOM or expired gate as completed."""
+    cdir = tmp_path / 'results/c'
+    cdir.mkdir(parents=True)
+    status = {'status': 'KILLED', 'returncode': -9, 'wall_s': 1, 'cpu_s': 1,
+              'peak_rss_kib': 1, 'scratch_peak_mib': 0, 'foreign_cores': 0}
+    gate = SimpleNamespace(wait=lambda: {'gate': 'quiet'}, last_own_end=0)
+    runner = SimpleNamespace(results=tmp_path / 'results', bench_out=tmp_path / 'scratch',
+        args=SimpleNamespace(name='release', dry_run=False), bins=[{'label': 'head', 'path': 'fake',
+        'allocator': 'any', 'env': {'EXPLICIT': 'yes'}, 'sha256': 'abc'}],
+        min_free_gb=0, gate=gate, disk=None, cpus=None)
+    cell = {'env': {'AWS_SKIP_SIGNATURE': 'true', 'COUNT': 4}, 'output': 'out.pmtiles', 'allocator': 'any',
+            'command': 'tiles', 'args': ['{out}/out.pmtiles'], 'flags': []}
+    monkeypatch.setattr(rm, 'require_disk', lambda *a: None)
+    monkeypatch.setattr(rm, 'sectors_written', lambda *a: 0)
+    monkeypatch.setattr(rm, 'read_profile', lambda *a: {})
+    monkeypatch.setattr(rm, 'output_digest', lambda *a: {'bytes': 1, 'sha256': 'x'})
+    monkeypatch.setattr(rm.subprocess, 'run', lambda *a, **k: None)  # sync only
+    calls = []
+    def measured(*args):
+        calls.append(args)
+        return dict(status)
+    monkeypatch.setattr(rm, 'run_capped', measured)
+    with pytest.raises(rm.ManifestError, match='failed'):
+        rm.Runner.run_one(runner, 'c', cell, 0, 'head', {}, [], None)
+    saved = json.loads((cdir / 'head-r0.json').read_text())
+    assert saved['env'] == {'AWS_SKIP_SIGNATURE': 'true', 'COUNT': '4', 'EXPLICIT': 'yes'}
+    status.update(status='ok', returncode=0)
+    rm.Runner.run_one(runner, 'c', cell, 0, 'head', {}, [], None)
+    rm.Runner.run_one(runner, 'c', cell, 0, 'head', {}, [], None)
+    assert len(calls) == 2
+    assert rm.successful_run(cdir / 'head-r0.json')
+    assert not rm.successful_run(cdir / 'missing.json')
+
+
+def test_failed_summary_does_not_skip_cell(tmp_path, monkeypatch):
+    cdir = tmp_path / 'c'
+    cdir.mkdir()
+    (cdir / 'summary.json').write_text('{}')
+    (cdir / 'head-r0.json').write_text(json.dumps({'status': 'KILLED'}))
+    # Input resolution is reached only when the failed summary was not skipped.
+    def resolve(*args):
+        raise RuntimeError('resuming failed cell')
+    monkeypatch.setattr(rm, 'resolve_input', resolve)
+    runner = SimpleNamespace(results=tmp_path, args=SimpleNamespace(force=False),
+        m={'cells': {'c': {'input': 'a'}}, 'inputs': {'a': {}}}, bins=[{'label': 'head'}],
+        pairs=lambda cell: 1, data=tmp_path, input_dirs=[])
+    with pytest.raises(RuntimeError, match='resuming failed cell'):
+        rm.Runner.run_cell(runner, 'c')

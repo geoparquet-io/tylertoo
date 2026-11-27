@@ -20,9 +20,7 @@ cargo build --release -p tylertoo
 python3 benchmarks/e2e/run_e2e.py --repeat 3 --geojson --quality-matched
 python3 benchmarks/e2e/format_results.py benchmarks/e2e/results-<stamp>.json
 
-./benchmarks/e2e/run_corpus.sh                # the corpus tier (#447), one command:
-                                              # fetch + optimize corpus data, build both
-                                              # binaries, measure, print the tables
+./benchmarks/release.sh build tippecanoe corpus
 
 uv run benchmarks/e2e/compare_tippecanoe.py   # the parity gate (#420); exit 1 on a breach
 ```
@@ -255,7 +253,7 @@ the ratio says nothing about tiling throughput. They are kept as the
 geometry-class smoke test. RESULTS.md says so in the table itself.
 
 For datasets that actually exercise the engines, there is the **corpus tier**
-(`--corpus`, or the whole thing as one command with `run_corpus.sh`): every
+(`--corpus`, or `benchmarks/release.sh build tippecanoe corpus`): every
 dataset `corpus/manifest.json` defines, read from the gpio-optimized copies at
 `corpus/data/gpio/<id>.parquet` (build them with `corpus/fetch.sh &&
 corpus/optimize.sh`, ~2–3 GB download; datasets not on disk are skipped with
@@ -307,7 +305,7 @@ dataset. That is the path for cluster-scale runs.
 |---|---|
 | `setup_tippecanoe.sh` | clones + verifies + builds the pinned tippecanoe; writes `tippecanoe.lock.json` |
 | `run_e2e.py` | the harness (stdlib only, timed by `../run_manifest.py`); writes `results-<UTC timestamp>.json` (or `--out`) and a markdown table |
-| `run_corpus.sh` | one command for the corpus tier: fetch + optimize the corpus, build both binaries, run `run_e2e.py --corpus --quality-matched`, print the tables |
+| [../release.sh](../release.sh) | Run the release tier, including cached corpus preparation and kept comparison archives. |
 | `format_results.py` | prints RESULTS.md's tables from a results file, so no number is retyped |
 | `render_parity.py` | side-by-side PNG renders of two archives at chosen zooms, with distinct-feature counts |
 | `compare_tippecanoe.py` | the parity gate (#420): tiles both tools, decodes both archives, per-zoom ratios vs `tippecanoe_tolerances.toml`; exit 1 on a breach |

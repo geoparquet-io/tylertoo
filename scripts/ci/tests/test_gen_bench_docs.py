@@ -411,3 +411,10 @@ def test_archive_sizes_keep_useful_precision(results):
     r = results['e2e-corpus']
     r['datasets']['a']['tylertoo']['output_bytes'] = 61654743
     assert '61.7 MB' in g.speedup_bars(r)
+
+
+def test_recipe_replaces_actual_run_output_path(results):
+    r = results['overture-buildings-africa']
+    r['rows'][0]['argv'][3] = '/bench/scratch/africa-s3/ovt-s3/head-r0/out.pmtiles'
+    assert 'africa.pmtiles' in g.recipe(r)
+    assert '/bench/scratch/' not in g.recipe(r)

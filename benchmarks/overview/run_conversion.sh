@@ -6,7 +6,7 @@
 # artifacts (overview GeoParquet vs a tileset) against whatever tippecanoe is
 # on PATH, and the GNU-only `/usr/bin/time -v` / `grep -oP` make it
 # Linux-only. The end-to-end, pinned, portable comparison is
-# benchmarks/e2e/run_corpus.sh. This script remains for the overview-regen
+# benchmarks/release.sh. This script remains for the overview-regen
 # timing it reuses.
 #
 #   overview  : `tylertoo overview` (duplicating, default knobs, z0..14)

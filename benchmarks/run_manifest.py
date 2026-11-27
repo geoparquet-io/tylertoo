@@ -470,6 +470,13 @@ def release_version(root: Path) -> str | None:
     return version if tag is not None and tag.strip() == head.strip() else None
 
 
+def git_describe(rev: str | None = None) -> str | None:
+    """`git describe` against the release tags only (other tags, such as
+    bench-coalesce-v1, are input releases, not versions)."""
+    return _out(["git", "-C", str(ROOT), "describe", "--tags", "--match", "v*", "--always",
+                 *(["--dirty"] if rev is None else [rev])])
+
+
 def _out(argv: list[str]) -> str | None:
     """First line of a command's output, or None when it cannot run."""
     try:
@@ -508,7 +515,7 @@ def provenance(bins: list[dict], inputs: dict) -> dict:
         "tool_versions": versions,
         "inputs": ins,
         "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "git_describe": _out(["git", "-C", str(ROOT), "describe", "--tags", "--always", "--dirty"]),
+        "git_describe": git_describe(),
         "host_class": host_class_key(h),
         "release_version": release_version(ROOT),
     }
@@ -886,6 +893,11 @@ def output_digest(out_dir: Path, output: str) -> dict:
 # --- cells ------------------------------------------------------------------
 
 
+def successful_run(path: Path) -> bool:
+    """Only successful rounds count as completed during a resume."""
+    return path.is_file() and run_status(json.loads(path.read_text())) == "ok"
+
+
 class Runner:
     """One `run` invocation: a manifest, binaries, a results directory."""
 
@@ -977,7 +989,9 @@ class Runner:
         cdir = self.results / name
         if self.args.force and cdir.exists():
             shutil.rmtree(cdir)
-        if (cdir / "summary.json").exists():
+        if (cdir / "summary.json").exists() and all(
+                successful_run(cdir / f"{b['label']}-r{r}.json")
+                for r in range(self.pairs(cell)) for b in self.bins):
             print(f"skip  {name} (summary.json exists; --force reruns it)")
             return
         cdir.mkdir(parents=True, exist_ok=True)
@@ -995,7 +1009,7 @@ class Runner:
             prefix = scope_prefix(cell["memory_max"]) if "memory_max" in cell else []
             labels = [b["label"] for b in self.bins]
             todo = [(r, lb) for r in range(self.pairs(cell)) for lb in round_order(labels, r)
-                    if not (cdir / f"{lb}-r{r}.json").exists()]
+                    if not successful_run(cdir / f"{lb}-r{r}.json")]
             warmups = self.args.warmup if self.args.warmup is not None else (cell["warmup"] or 0)
             if todo:
                 # Untimed runs of the first binary bring the inputs into the page
@@ -1063,7 +1077,7 @@ class Runner:
         cdir.mkdir(exist_ok=True)
         tag = f"{label}-w{r}" if warmup else f"{label}-r{r}"
         rec_path = cdir / f"{tag}.json"
-        if rec_path.exists():
+        if successful_run(rec_path):
             return
         b = next(x for x in self.bins if x["label"] == label)
         out = self.bench_out / self.args.name / name / tag
@@ -1075,7 +1089,8 @@ class Runner:
         prof = cdir / f"{tag}.profile.jsonl"
         prof.unlink(missing_ok=True)
         argv = [b["path"], *build_argv(cell, {**subs, "out": str(out)})]
-        env = {**os.environ, **{k: str(v) for k, v in cell["env"].items()}, **b["env"],
+        overrides = {**{k: str(v) for k, v in cell["env"].items()}, **b["env"]}
+        env = {**os.environ, **overrides,
                "TYLERTOO_PROFILE_JSON": str(prof), "TMPDIR": str(out / "tmp")}
         require_disk(self.bench_out, self.min_free_gb)
         gate = self.gate.wait()
@@ -1102,7 +1117,8 @@ class Runner:
         rec = {
             "run": self.args.name, "cell": name, "binary": label, "round": r, "warmup": warmup,
             "allocator": b["allocator"], "allocator_expected": cell["allocator"],
-            "binary_sha256": b["sha256"], "binary_env": b["env"], "argv": argv, "dry_run": self.args.dry_run,
+            "binary_sha256": b["sha256"], "binary_env": b["env"], "env": overrides,
+            "argv": argv, "dry_run": self.args.dry_run,
             "started": time.strftime("%FT%T"), "gate": gate, **res,
             "load1_after": loadavg1(),
             "output": output,
@@ -1112,6 +1128,8 @@ class Runner:
         }
         subprocess.run(["sync"], check=False)
         rec_path.write_text(json.dumps(rec, indent=2))
+        if run_status(rec) != "ok":
+            raise ManifestError(f"run failed ({run_status(rec)}): {rec_path}; rerun to retry this round")
         if not warmup:
             with (self.results / "results.jsonl").open("a") as f:
                 f.write(json.dumps(rec) + "\n")

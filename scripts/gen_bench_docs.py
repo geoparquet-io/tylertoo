@@ -348,7 +348,9 @@ def recipe(r):
     if not row or not row.get('argv'):
         return NOT_MEASURED
     argv = ['tylertoo', *row['argv'][1:]]
-    argv = ['africa.pmtiles' if '{out}' in arg else arg for arg in argv]
+    # The output is `{out}/out.pmtiles` as written in the manifest, or the
+    # scratch path it expanded to in a recorded run.
+    argv = ['africa.pmtiles' if arg.endswith('/out.pmtiles') else arg for arg in argv]
     env = [f"{key}={shlex.quote(str(value))}" for key, value in row.get('env', {}).items()]
     return '```bash\n' + ' '.join([*env, shlex.join(argv)]) + '\n```'
 
