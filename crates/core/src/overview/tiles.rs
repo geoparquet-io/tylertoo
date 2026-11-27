@@ -325,7 +325,7 @@ pub struct TilesOptions {
     /// disk or on a slow disk. No effect with [`TilesOptions::keep_overview`],
     /// whose file is always ZSTD.
     #[cfg_attr(feature = "cli", arg(long, value_enum, value_name = "CODEC", default_value_t = OverviewCodec::Lz4))]
-    #[cfg_attr(feature = "cli", arg(help = "Compression of the temporary intermediate overview: `lz4` takes 5-7% less CPU, `zstd` writes a file about a third smaller, for a host short of temp disk or on a slow disk. No effect with --keep-overview, whose file is always ZSTD. Does not change the PMTiles output", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Compression of the temporary intermediate overview: `lz4` uses less CPU, and `zstd` writes a smaller file, for a host short of temp disk or on a slow disk. No effect with --keep-overview, whose file is always ZSTD. Does not change the PMTiles output", long_help = None))]
     pub temp_compression: OverviewCodec,
     /// The sharded-fleet job, if any (#498).
     #[serde(skip)]

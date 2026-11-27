@@ -6,15 +6,10 @@ use std::fmt::Write;
 use super::Cli;
 type ConvertTuningArgs = tylertoo_core::internal::overview::config::cli::ConvertArgs<false>;
 
-/// Honor clap's hidden defaults and inverted switches in clap-markdown 0.1.5.
+/// Honor clap's inverted switches in clap-markdown 0.1.5.
 pub(super) fn command_for_markdown(command: clap::Command) -> clap::Command {
     command
         .mut_args(|arg| {
-            let arg = if arg.is_hide_default_value_set() {
-                arg.default_value(None::<&str>)
-            } else {
-                arg
-            };
             if matches!(arg.get_action(), clap::ArgAction::SetFalse) {
                 arg.action(clap::ArgAction::SetTrue)
                     .default_value(None::<&str>)
@@ -124,6 +119,10 @@ pub(super) fn format(markdown: String) -> String {
     output.push_str("## Shared conversion options\n\nThese options apply to both `tylertoo tiles` and `tylertoo overview`.\n\n");
     for (heading, entries) in shared {
         write_table(&mut output, &heading, &entries);
+    }
+    output.push_str("## Environment variables\n\n| Variable | Meaning |\n| --- | --- |\n");
+    for (name, meaning) in tylertoo_core::internal::environment::ENVIRONMENT {
+        writeln!(output, "| `{name}` | {meaning} |").unwrap();
     }
     output.truncate(output.trim_end().len());
     output.push('\n');

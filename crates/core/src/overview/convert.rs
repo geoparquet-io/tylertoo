@@ -541,7 +541,7 @@ pub struct ConvertOptions {
         default_value_t = ConvertOptions::default().gsd_base,
         help_heading = "Generalization"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Base of the zoom-to-GSD mapping, `gsd(z) = 40075016.69 / base / 2^z`: a larger base keeps more detail at every level. No effect with `--gsd`", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Base of the zoom-to-GSD mapping: a larger base keeps more detail at every level. Uses an equatorial circumference of {circumference} meters. No effect with `--gsd`", circumference = super::level::WEBMERC_CIRCUMFERENCE_M), long_help = None))]
     pub gsd_base: f64,
     /// Emit the optional COGP compatibility footer key (§3.1). Default `false`.
     #[serde(rename = "cogp_compat")]
@@ -602,7 +602,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a `--no-default-features` build uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a build without mimalloc uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
     pub profile: MemoryProfile,
     /// Worker threads in the global Rayon pool (#876). `None` (default):
     /// a positive `RAYON_NUM_THREADS`, else every core under `auto` and
@@ -619,7 +619,7 @@ pub struct ConvertOptions {
         feature = "cli",
         arg(long, value_name = "N", help_heading = "Memory & performance")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Worker threads for the whole run. Default: every core under `auto` and `speed`, at most 40 under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Worker threads for the whole run. Default: every core under `auto` and `speed`, at most {WORKER_THREADS_MAX} under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>"), long_help = None))]
     pub workers: Option<usize>,
     /// Bytes of memory the run may use (#876), in place of the detected
     /// figure (the smaller of the cgroup headroom and `MemAvailable`).
@@ -672,7 +672,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::parse_read_workers,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Reader threads for both passes, or `auto` for half the cores in the first pass and a quarter in the second, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Reader threads for both passes, or `auto` for half the cores in the first pass and a quarter in the second, up to {READ_WORKERS_MAX}. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>"), long_help = None))]
     pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
@@ -701,7 +701,7 @@ pub struct ConvertOptions {
         feature = "cli",
         arg(long, value_name = "COL", help_heading = "Clustering")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Count a string column's values per cluster in `COL:value` columns (up to 100 values plus `other`, requires `--cluster`)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Count a string column's values per cluster in `COL:value` columns (up to {max_categories} values plus `other`, requires `--cluster`)", max_categories = super::cluster::MAX_CLUSTER_CATEGORIES), long_help = None))]
     pub cluster_categories: Option<String>,
     /// Enable line network coalescing (plan Q3). **Default `true`** (like
     /// `line_thinning = 1.0` and the clustering point grid, chosen by
@@ -5526,7 +5526,7 @@ const PASS1_RECOMMENDED_FACTOR: f64 = 3.3;
 /// for this box. On for `1`, `true`, `yes` or `on` (trimmed,
 /// case-insensitive); anything else — including empty, `0` and `false` —
 /// leaves the check on.
-pub(super) const SKIP_MEMORY_PREFLIGHT_ENV: &str = "TYLERTOO_SKIP_MEMORY_PREFLIGHT";
+pub(crate) const SKIP_MEMORY_PREFLIGHT_ENV: &str = "TYLERTOO_SKIP_MEMORY_PREFLIGHT";
 
 fn env_flag_enabled(value: &str) -> bool {
     matches!(

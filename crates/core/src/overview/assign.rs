@@ -799,33 +799,28 @@ pub struct AssignConfig {
     /// Grid-cell multiplier for points (coarser grid ⇒ more aggressive thin).
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().point_thinning))]
-    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
-    #[cfg_attr(feature = "cli", arg(help = "Point thinning grid cell, as a multiple of the level's GSD (default 4.0, or 16.0 with `--cluster`). Larger cells keep fewer points", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Point thinning grid cell, as a multiple of the level's GSD. With `--cluster`, the default is {CLUSTER_POINT_THINNING_DEFAULT}. Larger cells keep fewer points"), long_help = None))]
     pub point_thinning: f64,
     /// Grid-cell multiplier for lines.
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().line_thinning))]
-    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
-    #[cfg_attr(feature = "cli", arg(help = "Line thinning grid cell, as a multiple of the level's GSD (default 1.0). Larger cells keep fewer lines", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Line thinning grid cell, as a multiple of the level's GSD. Larger cells keep fewer lines", long_help = None))]
     pub line_thinning: f64,
     /// Grid-cell multiplier for polygons.
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().polygon_thinning))]
-    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
-    #[cfg_attr(feature = "cli", arg(help = "Polygon thinning grid cell, as a multiple of the level's GSD (default 0, off). Larger cells keep fewer polygons and can remove a polygon whose center falls in a larger neighbor's cell", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Polygon thinning grid cell, as a multiple of the level's GSD. Larger cells keep fewer polygons and can remove a polygon whose center falls in a larger neighbor's cell", long_help = None))]
     pub polygon_thinning: f64,
     /// A line is eligible at level `z` only if `diag >= line_visibility·gsd(z)`.
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().line_visibility))]
-    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
-    #[cfg_attr(feature = "cli", arg(help = "Drop lines whose bbox diagonal is shorter than this many GSDs at a level (default 2.0)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Drop lines whose bbox diagonal is shorter than this many GSDs at a level", long_help = None))]
     pub line_visibility: f64,
     /// A polygon is eligible at level `z` only if
     /// `diag >= polygon_visibility·gsd(z)`.
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().polygon_visibility))]
-    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
-    #[cfg_attr(feature = "cli", arg(help = "Drop polygons whose bbox diagonal is shorter than this many GSDs at a level (default 2.0)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Drop polygons whose bbox diagonal is shorter than this many GSDs at a level", long_help = None))]
     pub polygon_visibility: f64,
     /// Whether larger or smaller `sort_key` wins.
     #[serde(

@@ -432,7 +432,7 @@ pub struct ExportOptions {
     /// At most [`MAX_TILE_BUFFER_PX`] (one tile width); wider is
     /// [`ConfigError::TileBufferTooWide`] (#433).
     #[cfg_attr(feature = "cli", arg(long, default_value_t = ExportOptions::default().tile_buffer))]
-    #[cfg_attr(feature = "cli", arg(help = "Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most {MAX_TILE_BUFFER_PX} (one tile width)"), long_help = None))]
     pub tile_buffer: u32,
     /// MVT tile extent (integer tile-local resolution). Default 4096. Must be
     /// positive ([`ConfigError::InvalidExtent`] otherwise); a value that is
@@ -455,7 +455,7 @@ pub struct ExportOptions {
         default_value = "auto",
         value_parser = super::config::cli::parse_size_auto
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap: a backstop behind `--max-compressed-tile-size`. `auto` is 2M, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile over a cap goes through `--size-valve`. With several layers the caps apply to the joined tile", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Per-tile cap on the raw MVT size, or zero for no cap: a backstop behind `--max-compressed-tile-size`. `auto` is {}, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile over a cap goes through `--size-valve`. With several layers the caps apply to the joined tile", super::convert::human_bytes(DEFAULT_TILE_SIZE_LIMIT as u64)), long_help = None))]
     pub tile_size_limit: Option<usize>,
     /// Per-tile limit on the **gzip-compressed** tile size, in bytes:
     /// tippecanoe's `-M` / `--maximum-tile-bytes` (#745). Checked alongside
@@ -468,7 +468,7 @@ pub struct ExportOptions {
         default_value = "auto",
         value_parser = super::config::cli::parse_size_auto
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Per-tile cap on the gzip-compressed tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap. `auto` is 500K, or no cap with `tiles --verbatim` and for `pyramid` bands. Both caps apply, to the joined tile when there are several layers", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Per-tile cap on the gzip-compressed tile size, like tippecanoe's `-M`, or zero for no cap. `auto` is {}, or no cap with `tiles --verbatim` and for `pyramid` bands. Both caps apply, to the joined tile when there are several layers", super::convert::human_bytes(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT as u64)), long_help = None))]
     pub compressed_tile_size_limit: Option<usize>,
     /// How a tile over a size limit is brought back under it (#745). Default
     /// [`SizeValve::Merge`].
@@ -478,7 +478,7 @@ pub struct ExportOptions {
         value_name = "merge|drop",
         default_value_t = ExportOptions::default().size_valve
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "How to reduce a tile over its cap: `merge` merges dense lines and polygons, drops singles, halves the extent down to 512, then drops whole features if needed. Merges keep the target's attributes and are never split into their sources. In a tile of lines or polygons, only a lone feature still over the cap at the extent floor is written over it, with a warning. `drop` removes features and keeps each survivor's attributes. Point tiles use dropping in both modes", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("How to reduce a tile over its cap: `merge` merges dense lines and polygons, drops singles, halves the extent down to {floor}, then drops whole features if needed. Merges keep the target's attributes and are never split into their sources. In a tile of lines or polygons, only a lone feature still over the cap at the extent floor is written over it, with a warning. `drop` removes features and keeps each survivor's attributes. Point tiles use dropping in both modes", floor = valve::MIN_VALVE_EXTENT), long_help = None))]
     pub size_valve: SizeValve,
     /// How far the size valve's threshold reaches past the tile it fits
     /// (#768). Default [`ValveScope::Smooth`].
@@ -488,7 +488,7 @@ pub struct ExportOptions {
         value_name = "smooth|tile|zoom",
         default_value_t = ExportOptions::default().valve_scope
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "How far the size valve's thinning reaches past the tile that needs it: `smooth` predicts each tile's threshold from the export scan and fades it over the tiles around, so neighbouring tiles differ by at most `--valve-max-step` (in point tiles, in the share of points they keep) and the density steps down over several tiles instead of jumping at a tile edge; tiles near a dense one are thinned too. `tile` thins each tile only as much as it needs on its own: the most detail, with visible steps at tile edges. `zoom` starts every tile from the largest threshold predicted at its zoom, like tippecanoe's one threshold per zoom: no edges, the least detail; `--preset tippecanoe` sets it; not with --tile-range", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "How far the size valve's thinning reaches past the tile that needs it: `smooth` predicts each tile's threshold from the export scan and fades it over the tiles around, so neighboring tiles differ by at most `--valve-max-step` (in point tiles, in the share of points they keep) and the density steps down over several tiles instead of jumping at a tile edge; tiles near a dense one are thinned too. `tile` thins each tile only as much as it needs on its own: the most detail, with visible steps at tile edges. `zoom` starts every tile from the largest threshold predicted at its zoom, like tippecanoe's one threshold per zoom: no edges, the least detail. On `tiles` and `export-pmtiles`, `--preset tippecanoe` sets it; not with `--tile-range`", long_help = None))]
     pub valve_scope: ValveScope,
     /// The largest density step `--valve-scope smooth` allows between
     /// neighbouring tiles (#768): a tile keeps at most this many times the
@@ -503,7 +503,7 @@ pub struct ExportOptions {
         value_name = "RATIO",
         default_value_t = ExportOptions::default().valve_max_step
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "With `--valve-scope smooth`, the largest density step allowed between neighbouring tiles: a tile keeps at most RATIO times the points its neighbour keeps, or merges at most RATIO times less hard, so the thinning around a dense tile fades over the tiles beside it. The fade reaches at most 8 tiles out: a tile thinned more than RATIO^9 fades by the larger even step that ends there. 1.25 makes edges barely visible but spreads the thinning further; larger values come closer to `--valve-scope tile`. Must be above 1", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("With `--valve-scope smooth`, the largest density step allowed between neighboring tiles: a tile keeps at most RATIO times the points its neighbor keeps, or merges at most RATIO times less hard, so the thinning around a dense tile fades over the tiles beside it. The fade reaches at most {rings} tiles out: a tile thinned more than RATIO^{exponent} fades by the larger even step that ends there. Smaller values spread the thinning further; larger values come closer to `--valve-scope tile`. Must be above one", rings = valve_predict::MAX_RINGS, exponent = valve_predict::MAX_RINGS + 1), long_help = None))]
     pub valve_max_step: f64,
     /// Tile encoding, MVT by default. Each finished MVT tile is converted
     /// to MLT with mlt-core before gzip and both size caps, so the caps
@@ -527,7 +527,7 @@ pub struct ExportOptions {
             &["web", "native", "min-size", "diffable", "fast-encoding"]
         )
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "MLT profile, non-default profiles need `--tile-format mlt`: `web` (default) targets GL JS before 6.0 with @maplibre/mlt 1.1, omits FastPFOR, FSST and shared dictionaries, and stores integer columns wider than 32 bits as doubles when every value is exact (absolute value at most 2^53), since GL JS reads 64-bit integers as BigInt and style expressions do not compare BigInt with numbers; mlt-core profiles: `native` for MapLibre Native with every codec and stored polygon triangles, `min-size` for smallest tiles, `diffable` for small binary diffs between releases, `fast-encoding` for quickest encoding", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("MLT profile, non-default profiles need `--tile-format mlt`: `web` (default) supports web renderers, omits FastPFOR, FSST, and shared dictionaries, and stores integer columns wider than {small_bits} bits as doubles when every value is exact (absolute value at most {exact}), since GL JS reads {large_bits}-bit integers as BigInt and style expressions do not compare BigInt with numbers; mlt-core profiles: `native` for MapLibre Native with every codec and stored polygon triangles, `min-size` for smallest tiles, `diffable` for small binary diffs between releases, `fast-encoding` for quickest encoding", small_bits = u32::BITS, large_bits = u64::BITS, exact = crate::tile_format::MAX_EXACT_DOUBLE_INTEGER), long_help = None))]
     pub mlt_profile: MltProfile,
     /// Experimental (#750): draw, under each tile's own features below the
     /// finest zoom, the area its child tiles cover, built from the finest
@@ -536,7 +536,7 @@ pub struct ExportOptions {
     /// file's finest level (#771); a data shard ([`Self::tile_range`]) does
     /// not build it.
     #[cfg_attr(feature = "cli", arg(long))]
-    #[cfg_attr(feature = "cli", arg(help = "Fill the holes that dense small polygons (parcels, fields, small admin units) leave at coarse zooms: under each tile's features, also draw the area its child tiles cover, with the attributes of one feature it sits under, in the room the tile's own features leave. Adds 10–17% to build time on dense coverages, about 1.5x on scattered sub-pixel fields (which it may also over-draw), and holds the finest level's geometry in memory. A sharded build's coarse job draws it; data shards (`--tile-range`) do not", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Fill the holes that dense small polygons (parcels, fields, small admin units) leave at coarse zooms: under each tile's features, also draw the area its child tiles cover, with the attributes of one feature it sits under, in the room the tile's own features leave. Can overdraw scattered fields and holds the finest level's geometry in memory. A sharded `tiles` build's coarse job draws it; data shards (`--tile-range`) do not", long_help = None))]
     pub coverage_fill: bool,
     /// #803: end each branch of the pyramid at the coarsest zoom whose tile
     /// can carry every canonical feature under it within both size caps,
@@ -581,7 +581,7 @@ pub struct ExportOptions {
         feature = "cli",
         arg(long, value_name = "FACTOR", help_heading = "Generalization")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Simplify each finest-level (canonical) line and polygon once before clipping, with tolerance factor × GSD at that level's zoom, like --simplify-factor for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Only vertices are removed: features, parts and rings smaller than the tolerance keep their own geometry. Leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Unset, lines get 0.25 and polygons are not simplified, since each polygon is simplified on its own and shared borders would part; `0` simplifies nothing, as `tiles --verbatim` and `pyramid` bands do. Comparable to tippecanoe's -S, which uses tile units at every zoom: -S 1 is about factor 0.25", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Simplify each finest-level (canonical) line and polygon once before clipping, with tolerance factor × GSD at that level's zoom, like `overview --simplify-factor` for coarser levels. Only vertices are removed: features, parts and rings smaller than the tolerance keep their own geometry. Leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Unset, lines get {DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR} and polygons are not simplified, since each polygon is simplified on its own and shared borders would part. Zero simplifies nothing, as `tiles --verbatim` and `pyramid` bands do."), long_help = None))]
     pub max_zoom_simplify_factor: Option<f64>,
     /// Shared-border pins at the finest level (#802, default **off**): when
     /// [`Self::max_zoom_simplify_factor`] simplifies polygons, rebuild the
@@ -764,7 +764,7 @@ pub struct ExportOptions {
         value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a `--no-default-features` build uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build also purges freed pages immediately under `bounded` (at a speed cost); a build without mimalloc uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
     #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub profile: MemoryProfile,
     /// Worker threads in the global Rayon pool (#876). `None` (default):
@@ -782,7 +782,7 @@ pub struct ExportOptions {
         feature = "cli",
         arg(long, value_name = "N", help_heading = "Memory & performance")
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Worker threads for the whole run. Default: every core under `auto` and `speed`, at most 40 under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Worker threads for the whole run. Default: every core under `auto` and `speed`, at most {workers_max} under `bounded`; `RAYON_NUM_THREADS` is used when this is unset. The pool is process-wide, so in Python the first call sets it. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads>", workers_max = super::convert::WORKER_THREADS_MAX), long_help = None))]
     #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub workers: Option<usize>,
     /// Bytes of memory the run may use (#876), in place of the detected
@@ -2770,3 +2770,7 @@ mod tests;
 #[cfg(test)]
 #[path = "export/valve_cost_tests.rs"]
 mod valve_cost_tests;
+
+#[cfg(all(test, feature = "cli"))]
+#[path = "help_tests.rs"]
+mod help_tests;

@@ -8,7 +8,7 @@ members and deduplicated tiles each count individually.
 Args:
     archive: PMTiles archive to summarize.
     largest: Number of largest tiles to return, or 0 for none.
-        Defaults to 10.
+        Defaults to {default:largest}.
     layers: Decode each distinct stored tile body once and include
         per-layer statistics. Defaults to `False`.
 

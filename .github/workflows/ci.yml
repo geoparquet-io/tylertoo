@@ -806,7 +806,7 @@ jobs:
   #
   # - The CLI and Python reference pages are generated from the clap help
   #   strings (hidden gen-docs feature) and the docstrings in
-  #   crates/python/python/tylertoo/__init__.py, committed
+  #   crates/python/src/docs/*.txt, committed
   #   under docs/reference/, and must match a fresh regeneration.
   # - rustdoc builds with -D warnings, so docs.rs never shows a broken link.
   # - crates/python/tests/docs runs both tutorials (examples/*) and the

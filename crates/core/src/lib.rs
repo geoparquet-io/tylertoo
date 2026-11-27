@@ -116,6 +116,7 @@ mod covering;
 mod decode;
 mod dedup;
 mod diagnostics;
+mod environment;
 mod error;
 mod fs_probe;
 #[cfg(feature = "fuzzing")]
@@ -228,6 +229,9 @@ pub use tile_format::{MltProfile, TileFormat};
 /// Any release may change or remove any item without a semver bump. The
 /// supported API is the crate root.
 pub mod internal {
+    pub mod environment {
+        pub use crate::environment::*;
+    }
     /// The MLT codec, for tests that decode MLT archives independently.
     #[cfg(feature = "mlt")]
     pub use mlt_core;

@@ -44,6 +44,11 @@
 //! Python bindings enable it by default. Without the feature, URL inputs
 //! fail with a clear `InputError::RemoteDisabled` error.
 
+// Environment variable names are shared with the generated reference.
+pub(crate) const CONCURRENCY_VAR: &str = "TYLERTOO_STAGING_CONCURRENCY";
+pub(crate) const MEM_BUDGET_VAR: &str = "TYLERTOO_STAGING_MEM_BUDGET_BYTES";
+pub(crate) const COALESCE_VAR: &str = "TYLERTOO_STAGING_COALESCE_BYTES";
+
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -2465,14 +2470,14 @@ pub(crate) mod remote {
     mod staging_tunables {
         use super::{STAGE_COALESCE_WINDOW, STAGE_MAX_CONCURRENCY, STAGE_MEM_BUDGET};
 
+        /// Override for [`STAGE_COALESCE_WINDOW`], in bytes.
+        pub(super) use crate::input::COALESCE_VAR;
         /// Override for [`STAGE_MAX_CONCURRENCY`]: ceiling on in-flight
         /// row-group spans.
-        pub(super) const CONCURRENCY_VAR: &str = "TYLERTOO_STAGING_CONCURRENCY";
+        pub(super) use crate::input::CONCURRENCY_VAR;
         /// Override for [`STAGE_MEM_BUDGET`]: transient-memory budget, in
         /// bytes (same unit as `TYLERTOO_AUTO_MEM_LIMIT_BYTES`).
-        pub(super) const MEM_BUDGET_VAR: &str = "TYLERTOO_STAGING_MEM_BUDGET_BYTES";
-        /// Override for [`STAGE_COALESCE_WINDOW`], in bytes.
-        pub(super) const COALESCE_VAR: &str = "TYLERTOO_STAGING_COALESCE_BYTES";
+        pub(super) use crate::input::MEM_BUDGET_VAR;
 
         /// Hard ceiling on the concurrency override: each in-flight span is a
         /// task holding a whole row group's bytes, so an absurd value is a

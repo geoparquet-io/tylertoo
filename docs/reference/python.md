@@ -115,21 +115,21 @@ Build a GeoParquet overview file: one generalized level per zoom.
 #### Geometry and thinning
 
 * `verbatim`: Turn off thinning, visibility gates, simplification, the density budget, and line coalescing, for pre-aggregated or pre-levelled input. Sets the defaults of the options below to off; an option you pass still applies.
-* `simplify_factor`: Simplification tolerance, in GSDs, or `None` for 1 (0 with `verbatim`).
+* `simplify_factor`: Simplification tolerance, in GSDs, or `None` for 1.0 (zero with `verbatim`).
 * `collapse`: Represent small polygons as points instead of the default placeholder squares.
 * `collapse_square`: Represent small polygons as placeholder squares. Squares are the default except with an entry-zoom ladder, which uses points unless you set this option.
 * `no_collapse`: Drop small polygons instead of using placeholders. This was the default before #745. Output is smaller, but polygon coverages have holes at coarse zooms.
 * `no_simplification_of_shared_nodes`: Set `True` to keep junction pins and simplify shared polygon borders identically in duplicating mode with `simplify_factor` above 0. Defaults to `False`.
 * `representation`: Geometry kind per zoom band, such as `"0-7:point,8-14:geom"`.
 * `cascade`: Speed up simplification by deriving each level from the next finer one.
-* `point_thinning`: Point grid cell size in GSDs, or `None` for 4 (16 with `cluster`, 0 with `verbatim`).
-* `line_thinning`: Line grid cell size in GSDs, or `None` for 1 (0 with `verbatim`).
-* `polygon_thinning`: Polygon grid cell size in GSDs, or `None` for 0 (off).
-* `line_visibility`: Smallest line bounding-box diagonal kept, in GSDs, or `None` for 2 (0 with `verbatim`).
-* `polygon_visibility`: Smallest polygon bounding-box diagonal kept, in GSDs, or `None` for 2 (0 with `verbatim`).
+* `point_thinning`: Point grid cell size in GSDs, or `None` for 4.0 (16 with `cluster`, zero with `verbatim`).
+* `line_thinning`: Line grid cell size in GSDs, or `None` for 1.0 (zero with `verbatim`).
+* `polygon_thinning`: Polygon grid cell size in GSDs, or `None` for 0.0 (off).
+* `line_visibility`: Smallest line bounding-box diagonal kept, in GSDs, or `None` for 2.0 (zero with `verbatim`).
+* `polygon_visibility`: Smallest polygon bounding-box diagonal kept, in GSDs, or `None` for 2.0 (zero with `verbatim`).
 * `drop_rate`: Ratio between feature budgets of adjacent levels.
 * `drop_gamma`: How strongly the budget spares sparse areas.
-* `density_drop`: Apply the per-level feature budget, or `None` for on (off with `verbatim`). It thins points only unless `drop_lines` or `drop_polygons` is set.
+* `density_drop`: Apply the per-level feature budget, or `None` for `True` (off with `verbatim`). It thins points only unless `drop_lines` or `drop_polygons` is set.
 * `drop_lines`: Apply the feature budget to lines too.
 * `drop_polygons`: Apply the feature budget to polygons too, which leaves holes in a polygon coverage. Polygons too small to see (outside `square` representation bands), or removed by `polygon_thinning`, still become placeholder squares; `no_collapse=True` removes them outside `square` bands.
 
@@ -141,7 +141,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 #### Line coalescing
 
-* `coalesce_lines`: Join touching same-class lines at coarse levels, or `None` for on (off with `verbatim`). `True` is refused in partitioning mode.
+* `coalesce_lines`: Join touching same-class lines at coarse levels, or `None` for `True` (off with `verbatim`). `True` is refused in partitioning mode.
 * `coalesce_snap`: Largest gap between joined line ends, in GSDs.
 * `coalesce_junction_angle`: Largest turn through a junction, in degrees. Set `0` to stop at every junction.
 * `coalesce_max_level_rows`: Skip joining above this line count per level to bound memory.
@@ -241,10 +241,10 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `input`: Overview file from `overview()`.
 * `output`: PMTiles archive to write.
 * `layer_name`: MVT layer name.
-* `tile_buffer`: Tile edge buffer in pixels, default 5, from 0 to 256.
+* `tile_buffer`: Tile edge buffer in pixels, default 5, from zero to 256.
 * `preset`: `"tippecanoe"` starts from tippecanoe's tile buffer, max-zoom simplification, size limits, size valve and one valve threshold per zoom (`valve_scope="zoom"`) instead of tylertoo's; an option you pass still applies. See [the tippecanoe preset](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/#the-tippecanoe-preset).
 * `extent`: Tile resolution in MVT units.
-* `tile_size_limit`: Maximum raw (uncompressed) tile size in bytes, a backstop behind `max_compressed_tile_size`; `"auto"` is 2 MiB, and `0` or `None` is no limit.
+* `tile_size_limit`: Maximum raw (uncompressed) tile size in bytes, a backstop behind `max_compressed_tile_size`; `"auto"` is 2.00 MiB, and `0` or `None` is no limit.
 * `simple_clip_fastpath`: Use faster clipping for simple polygons. `False` gives byte-stable output.
 * `partition_wave`: [Partitions in memory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves) at once, or `0` to size from CPUs and RAM.
 * `feature_order`: Paint order within a tile: `"input"`, or a property name with an optional `:asc` or `:desc`.
@@ -260,18 +260,18 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `name`: Human-readable tileset name, stored in the metadata.
 * `description`: Description of the tileset, stored in the metadata.
 * `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.
-* `size_valve`: How to reduce a tile that exceeds its limit: `"merge"` merges the densest lines and polygons into a neighbor, which keeps its own attributes. If still over, drop unmerged features, halve the tile extent to 512, then drop whole features if needed. Merged features are never split into their sources. In a tile of lines or polygons, only a lone feature still over the cap at the extent floor is written over it, with a warning. `"drop"` removes features, leaving holes. Point tiles use feature dropping in both modes.
+* `size_valve`: How to reduce a tile that exceeds its limit: `"merge"` merges the densest lines and polygons into a neighbor, which keeps its own attributes. If still over, drop unmerged features, halve the tile extent to its floor, then drop whole features if needed. Merged features are never split into their sources. In a tile of lines or polygons, only a lone feature still over the cap at the extent floor is written over it, with a warning. `"drop"` removes features, leaving holes. Point tiles use feature dropping in both modes.
 * `valve_scope`: How far the size valve's thinning reaches past the tile that needs it. `"smooth"` predicts each tile's threshold from the export scan and fades it over the tiles around, so neighbouring tiles differ by at most `valve_max_step` (in point tiles, in the share of points they keep) and the density steps down over several tiles instead of jumping at a tile edge; tiles near a dense one are thinned too. `"tile"` thins each tile only as much as it needs on its own: the most detail, with visible steps at tile edges. `"zoom"` starts every tile from the largest threshold predicted at its zoom, like tippecanoe's one threshold per zoom: no edges, the least detail; `preset="tippecanoe"` sets it; not with `tile_range`.
-* `valve_max_step`: Under `valve_scope="smooth"`, the largest density step allowed between neighbouring tiles: a tile keeps at most this many times more points (or merges at most this many times less hard) than its neighbour. The fade reaches at most 8 tiles out: a tile thinned more than `valve_max_step ** 9` fades by the larger even step that ends there. Must be above 1, and only applies under `valve_scope="smooth"`. `1.25` makes the edges barely visible but spreads the thinning further; `2` is the default; larger values come closer to `valve_scope="tile"`.
+* `valve_max_step`: Under `valve_scope="smooth"`, the largest density step allowed between neighbouring tiles: a tile keeps at most this many times more points (or merges at most this many times less hard) than its neighbour. The fade reaches a bounded number of tiles out. Must be above 1, and only applies under `valve_scope="smooth"`. Smaller values spread the thinning further; the default is 2.0; larger values come closer to `valve_scope="tile"`.
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M`; `"auto"` is 500 KiB, and `0` or `None` is no limit.
-* `max_zoom_simplify_factor`: Simplify each feature of the finest (canonical) level once, before clipping, with tolerance factor × GSD at that level's zoom, like `simplify_factor` for coarser levels. With the default GSD base, 1 GSD is 4 tile units at extent 4096. Only vertices are removed: features, individual MultiLineString or MultiPolygon parts, and polygon rings (including holes) that would collapse or be dropped under the tolerance keep their original geometry. Defaults to `None`: lines use factor 0.25 and polygons are not simplified. An explicit factor applies to both; `0` disables it. Explicit `None` selects the command's default, like `"auto"` for size caps: no max-zoom simplification under verbatim or for pyramid bands, and 0.25 for both kinds under the tippecanoe preset. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Comparable to tippecanoe's `-S`, which uses tile units at every zoom: `-S 10` is about factor 2.5.
+* `max_zoom_simplify_factor`: Simplify each feature of the finest (canonical) level once, before clipping, with tolerance factor × GSD at that level's zoom, like `simplify_factor` for coarser levels. Only vertices are removed: features, individual MultiLineString or MultiPolygon parts, and polygon rings (including holes) that would collapse or be dropped under the tolerance keep their original geometry. Defaults to `None`: lines use factor 0.25 and polygons are not simplified. An explicit factor applies to both; `0` disables it. Explicit `None` selects the command's default, like `"auto"` for size caps: no max-zoom simplification under verbatim or for pyramid bands, and 0.25 for both kinds under the tippecanoe preset. Changes the output; leaves coarser levels unchanged, except that variable-depth stop tiles carry the simplified finest-level features. Leaves the overview file unchanged. Comparable to tippecanoe's `-S`, which uses tile units at every zoom: `-S 10` is about factor 2.5.
 * `no_simplification_of_shared_nodes`: Set `True` to rebuild and keep shared-border pins at the finest zoom. Acts only when you set `max_zoom_simplify_factor` above 0 or use `preset="tippecanoe"`, which sets it to 0.25. Defaults to `False`.
 * `coverage_fill`: Experimental: under each tile's features, draw the area its child tiles cover, so a polygon coverage shows no holes at coarse zooms. Holds the finest level's geometry in memory. See `docs/OVERVIEW_TUNING.md`.
 * `variable_depth`: End each branch of the tile pyramid at the coarsest zoom whose tile holds all of that area's finest-level features within both size caps, like tippecanoe's `--generate-variable-depth-tile-pyramid`. The server must serve the nearest ancestor for a missing tile. See `docs/OVERVIEW_TUNING.md`.
 * `tile_range`: Export only the tiles in this tile-id range, `"LO..HI"`: one shard of a sharded build.
 * `zoom_ceiling`: Export only the tiles at or below this zoom: the coarse job of a sharded build.
 * `tile_format`: Tile encoding, `"mvt"` (default) or `"mlt"`. MLT needs MapLibre GL JS 5.12 or later, or MapLibre Native. Each finished MVT tile is converted with mlt-core before gzip and both size caps, so the caps measure MLT bytes. MLT stores each attribute of a layer as one typed column, following mlt-core's MVT conversion: integers mixed with floats become f64 (doubles), and other mixes become strings. Attribute order within a feature becomes column order. MLT archives use PMTiles tile type 6 and metadata format `"mlt"`. Merge refuses to combine MVT and MLT archives.
-* `mlt_profile`: MLT profile. Non-default profiles need `tile_format="mlt"`. `"web"` (default) targets GL JS before 6.0, which decodes with @maplibre/mlt 1.1. It omits FastPFOR, FSST and shared dictionaries, and stores integer columns wider than 32 bits as doubles when every value is exact (absolute value at most 2^53): GL JS reads 64-bit integers as BigInt, and style expressions do not compare BigInt with numbers. The others are mlt-core's profiles: `"native"` for MapLibre Native with every codec and stored polygon triangles; `"min-size"` for smallest tiles; `"diffable"` for small binary diffs between releases; `"fast-encoding"` for quickest encoding.
+* `mlt_profile`: MLT profile. Non-default profiles need `tile_format="mlt"`. `"web"` (default) supports web renderers. It omits FastPFOR, FSST, and shared dictionaries, and stores integer columns wider than 32 bits as doubles when every value is exact (absolute value at most 9007199254740992): GL JS reads 64-bit integers as BigInt, and style expressions do not compare BigInt with numbers. The others are mlt-core's profiles: `"native"` for MapLibre Native with every codec and stored polygon triangles; `"min-size"` for smallest tiles; `"diffable"` for small binary diffs between releases; `"fast-encoding"` for quickest encoding.
 
 ### Returns
 
@@ -692,7 +692,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `partition_wave`: See `export_pmtiles()`.
 * `feature_id`: See `export_pmtiles()`.
 * `keep_overview`: Keep the intermediate overview file at this path instead of removing it. Its directory must exist.
-* `temp_compression`: Compression of the temporary intermediate overview, `"lz4"` (default) or `"zstd"`. `"zstd"` writes a file about a third smaller for 5-7% more CPU. No effect with `keep_overview`, whose file is always ZSTD.
+* `temp_compression`: Compression of the temporary intermediate overview, `"lz4"` (default) or `"zstd"`. Choose the codec for your temporary storage. No effect with `keep_overview`, whose file is always ZSTD.
 * `tile_range`: See `export_pmtiles()`.
 * `gsd_base`: See `overview()`.
 * `sort_key`: See `overview()`.

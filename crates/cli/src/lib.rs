@@ -101,31 +101,32 @@ enum Command {
     /// Cut a dataset's tile space into N disjoint shards for a sharded build.
     ShardPlan(ShardPlanArgs),
     /// Serve PMTiles archives over HTTP with a map viewer.
-    ///
-    /// Run until Ctrl-C. The viewer at `/` handles MVT and MLT archives.
-    /// It loads MapLibre GL JS from unpkg.com and needs internet access.
-    ///
-    /// `/index.json` lists archive names. Each `{name}` is the archive's file
-    /// stem. `/{name}.json` returns TileJSON; `/{name}/{z}/{x}/{y}` returns
-    /// tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns
-    /// archive metadata; `/{name}/stats.json` returns tile-size statistics.
-    /// `/{name}.pmtiles` serves the archive with HTTP Range support.
-    /// It honours `If-Match` and `If-Range` against its `ETag`.
-    /// If a Range read detects the file being rewritten in place during the
-    /// read, it returns HTTP 412 for requests with `If-Match` or `If-Range`,
-    /// or HTTP 503 otherwise. A whole-file download caught by a rewrite is
-    /// cut off before its `Content-Length`. Renaming another file over the
-    /// path does not affect a download in progress.
-    ///
-    /// At most 64 responses can be in flight at once. Further requests get
-    /// HTTP 503 with `Retry-After: 1`.
-    ///
-    /// `serve` returns HTTP 204 for missing tiles without scaling up a stored
-    /// ancestor, so variable-depth archives (`--generate-variable-depth-tile-pyramid`)
-    /// show holes below stopped tiles; `serve` warns when it opens one.
-    ///
-    /// An archive rewritten on disk is reopened on the next request for it;
-    /// if it does not reopen, requests for it return HTTP 503 until it does.
+    #[command(long_about = format!(r#"Serve PMTiles archives over HTTP with a map viewer.
+
+Run until Ctrl-C. The viewer at `/` handles MVT and MLT archives.
+It loads MapLibre GL JS from unpkg.com and needs internet access.
+
+`/index.json` lists archive names. Each `{{name}}` is the archive's file
+stem. `/{{name}}.json` returns TileJSON; `/{{name}}/{{z}}/{{x}}/{{y}}` returns
+tiles, with HTTP 204 for absent tiles. `/{{name}}/metadata.json` returns
+archive metadata; `/{{name}}/stats.json` returns tile-size statistics.
+`/{{name}}.pmtiles` serves the archive with HTTP Range support.
+It honors `If-Match` and `If-Range` against its `ETag`.
+If a Range read detects the file being rewritten in place during the
+read, it returns HTTP 412 for requests with `If-Match` or `If-Range`,
+or HTTP 503 otherwise. A whole-file download caught by a rewrite is
+cut off before its `Content-Length`. Renaming another file over the
+path does not affect a download in progress.
+
+At most {responses} responses can be in flight at once. Further requests get
+HTTP 503 with a `Retry-After` header.
+
+`serve` returns HTTP 204 for missing tiles without scaling up a stored
+ancestor, so variable-depth archives (`tiles --generate-variable-depth-tile-pyramid`)
+show holes below stopped tiles; `serve` warns when it opens one.
+
+An archive rewritten on disk is reopened on the next request for it;
+if it does not reopen, requests for it return HTTP 503 until it does."#, responses = tylertoo_core::internal::serve::MAX_RESPONSES))]
     Serve(ServeArgs),
     /// Emit the full CLI reference as Markdown (docs generator, hidden).
     ///
@@ -306,9 +307,9 @@ pub struct ShardPlanArgs {
     #[arg(long, value_name = "N")]
     pub shards: usize,
 
-    /// Pivot zoom: data shards cover this zoom through `--max-zoom`; the
+    /// Pivot zoom: data shards cover this zoom through `tiles --max-zoom`; the
     /// coarse job covers lower zooms. Choose a zoom with a few populated
-    /// tiles per shard, usually z4 to z8.
+    /// tiles per shard.
     #[arg(long, value_name = "ZOOM", default_value = "6")]
     pub pivot: u8,
 
@@ -2061,6 +2062,136 @@ fn format_number(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn help_texts(command: &clap::Command) -> Vec<String> {
+        command
+            .get_arguments()
+            .flat_map(|arg| [arg.get_help(), arg.get_long_help()])
+            .chain([command.get_about(), command.get_long_about()])
+            .flatten()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn has_measurement(text: &str) -> bool {
+        text.char_indices().any(|(index, c)| {
+            if !c.is_ascii_digit() {
+                return false;
+            }
+            let rest = text[index..]
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.')
+                .trim_start();
+            ["%", "×", "x ", "ms", "min", "s"].iter().any(|unit| {
+                rest.strip_prefix(unit).is_some_and(|after| {
+                    matches!(*unit, "%" | "×" | "x ")
+                        || after.chars().next().is_none_or(|c| !c.is_alphanumeric())
+                })
+            })
+        })
+    }
+
+    #[test]
+    fn help_states_no_measurements() {
+        assert!(has_measurement("costs 5-7% more"));
+        assert!(has_measurement("takes 1.5x longer"));
+        assert!(has_measurement("takes 10 ms"));
+        assert!(!has_measurement("limit 1024 bytes"));
+        let mut failures = Vec::new();
+        walk_commands(&Cli::command(), &mut |command| {
+            for text in help_texts(command) {
+                if has_measurement(&text) {
+                    failures.push(format!("{}: {text}", command.get_name()));
+                }
+            }
+        });
+        assert!(failures.is_empty(), "measured claims: {failures:#?}");
+    }
+
+    fn named_flags(text: &str) -> impl Iterator<Item = &str> {
+        text.split("--")
+            .skip(1)
+            .map(|rest| {
+                rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                    .next()
+                    .unwrap()
+            })
+            .filter(|flag| !flag.is_empty())
+    }
+
+    #[test]
+    fn every_flag_named_in_help_exists() {
+        let mut root = Cli::command();
+        root.build();
+        let mut failures = Vec::new();
+        walk_commands(&root, &mut |command| {
+            for text in help_texts(command) {
+                let allowed: Vec<_> = std::iter::once(command)
+                    .chain(root.get_subcommands().filter(|sibling| {
+                        text.contains(&format!("`{}", sibling.get_name()))
+                            || text.contains(&format!("tylertoo {}", sibling.get_name()))
+                    }))
+                    .flat_map(|cmd| cmd.get_arguments())
+                    .flat_map(|arg| {
+                        arg.get_long()
+                            .into_iter()
+                            .chain(arg.get_all_aliases().unwrap_or_default())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                // External tippecanoe spellings, only when named explicitly.
+                const TIPPECANOE: &[&str] = &["generate-variable-depth-tile-pyramid"];
+                for flag in named_flags(&text) {
+                    if !allowed.contains(&flag)
+                        && !(text.contains("tippecanoe") && TIPPECANOE.contains(&flag))
+                    {
+                        failures.push(format!("{}: --{flag} in {text}", command.get_name()));
+                    }
+                }
+            }
+        });
+        assert!(failures.is_empty(), "unknown help flags: {failures:#?}");
+    }
+
+    #[test]
+    fn server_help_response_limit_matches_owner() {
+        let command = Cli::command();
+        let text = command
+            .find_subcommand("serve")
+            .unwrap()
+            .get_long_about()
+            .unwrap()
+            .to_string();
+        let rendered: usize = text
+            .split("At most ")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(rendered, tylertoo_core::internal::serve::MAX_RESPONSES);
+    }
+
+    fn walk_commands(command: &clap::Command, visit: &mut impl FnMut(&clap::Command)) {
+        visit(command);
+        for child in command.get_subcommands() {
+            walk_commands(child, visit);
+        }
+    }
+
+    #[test]
+    fn no_option_hides_its_default() {
+        let mut hidden = std::collections::BTreeSet::new();
+        walk_commands(&Cli::command(), &mut |command| {
+            for arg in command.get_arguments() {
+                if arg.is_hide_default_value_set() {
+                    hidden.insert(arg.get_id().to_string());
+                }
+            }
+        });
+        assert!(hidden.is_empty(), "hidden defaults: {hidden:?}");
+    }
     use tylertoo_core::internal::overview::config::cli::resolve_level_plan;
     use tylertoo_core::internal::overview::config::cli::{
         parse_in_flight_batches, parse_partition_wave, parse_read_workers, parse_size_bytes,

@@ -29,9 +29,9 @@ if it does not reopen, requests for it return HTTP 503 until it does.
 
 Args:
     archive: One PMTiles path or a list of paths, with distinct file stems.
-    host: Address to bind. Defaults to `"127.0.0.1"` (local access only).
+    host: Address to bind. Defaults to `{default:host}` (local access only).
         Use `"0.0.0.0"` or another address to expose it to the network.
-    port: Port to listen on. Defaults to 8080. Use 0 to pick a free port.
+    port: Port to listen on. Defaults to {default:port}. Use 0 to pick a free port.
     cors: Allow pages from these origins to read responses. Use
         `cors="https://pmtiles.io"` for one exact origin, a list of origin
         strings for multiple origins, or `cors="*"` for any origin.
