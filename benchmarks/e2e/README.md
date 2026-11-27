@@ -1,334 +1,68 @@
-# End-to-end benchmark: GeoParquet → PMTiles, tylertoo vs pinned tippecanoe
+# End-to-end benchmarks
 
-"Faster than tippecanoe for typical GeoParquet workflows" is the project's
-stated goal. This harness is the evidence for (or against) it. Measured
-numbers live in [RESULTS.md](RESULTS.md); this file is the method, including
-every place the comparison is not apples to apples.
-
-Issue: [#447](https://github.com/geoparquet-io/tylertoo/issues/447).
-Benchmarking in CI is [#448](https://github.com/geoparquet-io/tylertoo/issues/448)'s lane.
-The **output-parity gate** built on this harness's flag set —
-`compare_tippecanoe.py` + `tippecanoe_tolerances.toml`, run by
-`.github/workflows/tippecanoe-compare.yml` — is [#420](https://github.com/geoparquet-io/tylertoo/issues/420);
-see "Parity gate" below.
-
-## Quick start
+Use [the release runner](../release.sh) to reproduce the published benchmarks:
 
 ```bash
-./benchmarks/e2e/setup_tippecanoe.sh        # builds the pinned tippecanoe into <repo>/.tools
-cargo build --release -p tylertoo
-python3 benchmarks/e2e/run_e2e.py --repeat 3 --geojson --quality-matched
-python3 benchmarks/e2e/format_results.py benchmarks/e2e/results-<stamp>.json
-
-./benchmarks/e2e/run_corpus.sh                # the corpus tier (#447), one command:
-                                              # fetch + optimize corpus data, build both
-                                              # binaries, measure, print the tables
-
-uv run benchmarks/e2e/compare_tippecanoe.py   # the parity gate (#420); exit 1 on a breach
+benchmarks/release.sh
 ```
 
-A run writes `results-<UTC timestamp>.json` (gitignored), so an ad-hoc run
-never overwrites the committed record. The committed records are
-`benchmarks/results/e2e-fixtures.json` and `e2e-corpus.json`, each with a
-`provenance` block (commit, versions, host, kernel, allocator, input sha256).
-Replacing one is a deliberate act: pass
-`--out benchmarks/results/e2e-fixtures.json`, then run
-`uv run python scripts/gen_bench_docs.py` to regenerate the docs from it.
+See the [benchmark results and measurement method](../../docs/benchmarks.md#measurement-method)
+for the recorded host, tool versions, flags, timing procedure, and input pins.
+The release runner commits no files for you. It writes the results and
+regenerates the documentation for you to review in the release PR.
 
-Every run is timed by `benchmarks/run_manifest.py` (`timed`), the one owner of
-timed runs (#810): wall, user+sys CPU, effective cores and peak RSS from GNU
-`/usr/bin/time -v`, so the harness runs on Linux only. Within each round the
-tools alternate, and the order flips every round.
+## What the comparisons mean
 
-`run_e2e.py` is standard library only. The optional visual-parity renderer
-needs plotting packages and runs under `uv`:
+The harness compares these paths:
 
-```bash
-uv run --with pmtiles --with mapbox-vector-tile --with matplotlib \
-    python3 benchmarks/e2e/render_parity.py A.pmtiles B.pmtiles \
-        --zooms 6,9,12 --out /tmp/parity
-```
+| Path | What it measures |
+|---|---|
+| tylertoo defaults | GeoParquet to PMTiles with the default generalization settings |
+| tylertoo quality-matched | The same path with thinning disabled and simplification retained |
+| tippecanoe end to end | GeoParquet conversion to FlatGeobuf, then tiling to PMTiles |
+| tippecanoe tile only | Tiling from an existing FlatGeobuf file |
 
-## The four numbers, and why there are four
-
-tippecanoe cannot read GeoParquet, and at defaults the two tools do not emit
-the same map. Every "tylertoo vs tippecanoe" figure is therefore two decisions
-— what to put on tippecanoe's side of the scale, and whether to hold output
-constant — and those decisions are where this kind of benchmark usually lies.
-The harness makes all four measurements and prints all four:
-
-| | pipeline | what it answers |
-|---|---|---|
-| **A** | tylertoo, defaults: `parquet → pmtiles` | what a tylertoo user pays out of the box |
-| **A′** | tylertoo, quality-matched: `parquet → pmtiles` with the thinning ladder off | what tylertoo pays to emit the *same features* tippecanoe does |
-| **B** | tippecanoe e2e: `parquet → fgb → pmtiles` | what a tippecanoe user with a GeoParquet file pays |
-| **C** | tippecanoe tile-only: `fgb → pmtiles` | is the *tiler* faster, given a free head start |
-
-**A′ exists because A is not an output-parity comparison.** tylertoo's density
-budget thins features hard at coarse and mid zooms. tippecanoe's rate-based
-dropping applies only to points at defaults; its tiny-polygon reduction
-(disabled by `-pt`) still removes small polygons at low zooms, but on a
-contiguous polygon coverage it keeps far more of them and reaches every
-feature by a mid zoom. On the madagascar fixture tylertoo's default has 865 of
-17,465 admin polygons at z8 while tippecanoe reaches all 17,465 by z8 — a
-visibly different map, not a subtler one, and quoting A against it would be
-quoting a number for less work.
-
-A′ runs `--verbatim --simplify-factor 1.0`, which switches the whole
-thinning/visibility ladder off while keeping simplification (verbatim alone
-would drop that too, and tippecanoe does simplify). It reaches near-parity,
-not identical output: on madagascar, tile counts within 2 of tippecanoe's per
-zoom, distinct features within 0.4% at z8 and ~5% at z4, with 10 tiles hitting
-tylertoo's size valve. **A′ vs C is the number to quote to a skeptic.**
-
-**A vs B is the product comparison.** Reading GeoParquet natively is the
-product's thesis, not a benchmarking trick: a user who starts from GeoParquet
-really does have to run that conversion, and it really does cost wall time and
-disk. Claiming that number is fair. Claiming it *without* saying it includes a
-format conversion is not.
-
-**A vs C is the deliberately unflattering comparison.** It hands tippecanoe a
-pre-converted FlatGeobuf for free and asks whether tylertoo's tiling engine is
-faster on its own. Report both or report neither. RESULTS.md reports both, and
-the conversion's share of B is printed as its own column so a reader can do
-the subtraction themselves.
-
-## The baseline is pinned
-
-`setup_tippecanoe.sh` clones **felt/tippecanoe at tag `2.79.0`**, verifies the
-commit is `68ab8dcc229f95b8b25877697d5e8d66783af503`, builds it into the
-repo-root `.tools/` (next to go-pmtiles; `TIPPECANOE_TOOLS_DIR` overrides,
-`--print-path` emits the `PATH` export), and writes `tippecanoe.lock.json`. `run_e2e.py` refuses to run
-against a binary whose `--version` is not `tippecanoe v2.79.0` — the expected
-string is hard-coded in the harness, so the check holds with or without a
-lockfile (override with `TIPPECANOE_ALLOW_MISMATCH=1`, which is recorded in
-the results; say so in the write-up). The build tag and SHA are recorded only
-when the binary is the one the lockfile names; any other binary is recorded
-with `sha: null`. Re-pinning to another tag requires both `TIPPECANOE_TAG` and
-`TIPPECANOE_SHA`; the script refuses a tag without its expected commit.
-
-The **pin itself** lives in `setup_tippecanoe.sh` (`TIPPECANOE_TAG` /
-`TIPPECANOE_SHA`); the lockfile is a machine-local artifact naming a built
-binary, so it is gitignored. The tag and SHA that were actually measured are
-copied into the results file, which *is* committed — the record of a run travels
-with the run, not with the toolchain.
-
-Why not just use the one on `$PATH`: on the machine these numbers were taken
-on, `which tippecanoe` resolved to a **conda-forge build of v2.31.0** — the
-old mapbox lineage — while Homebrew had **2.79.0** installed but shadowed.
-Two tippecanoes on one machine, years of tiling changes apart. A harness that
-does not name its baseline's version is not reproducible.
-
-Homebrew's `tippecanoe` formula currently *is* 2.79.0, so
-`--tippecanoe /opt/homebrew/bin/tippecanoe` is a valid shortcut today. It will
-drift the next time the formula moves; the source pin will not.
+The end-to-end comparison includes the conversion that tippecanoe needs
+because it cannot read GeoParquet. The tile-only comparison excludes that
+conversion. Default settings can produce different maps. Use the
+quality-matched path to compare outputs with similar feature retention;
+it does not guarantee identical output.
 
 ## Settings parity
 
-tylertoo's `tiles` defaults, mapped onto the nearest tippecanoe flag. The
-harness passes exactly this and records the full argv of both tools in
-the results file.
+[The harness](run_e2e.py) owns the flag mapping in `tylertoo_argv()` and
+`tippecanoe_argv()`. The results record the arguments that each tool used.
 
-| knob | tylertoo (default) | tippecanoe flag passed | status |
-|---|---|---|---|
-| zoom range | `--min-zoom 0 --max-zoom 14` | `-Z 0 -z 14` | **matched** |
-| layer name | `--layer-name <id>` | `-l <id>` | **matched** |
-| tile buffer | `--tile-buffer 8` | `-b 8` (tippecanoe default is 5) | **matched**, by moving tippecanoe to tylertoo's value |
-| per-tile byte cap | `--max-compressed-tile-size 500000 --max-tile-size 0` (tylertoo's own defaults: `500K` = 512,000 bytes compressed, 2M raw) | `--maximum-tile-bytes 500000` (tippecanoe's default, on the compressed tile) | **matched**: the same compressed cap on both, and no raw cap, as tippecanoe has none |
-| oversize-tile valve | single non-iterative drop pass (always on) | `--drop-fraction-as-needed` | **approximated** — see asymmetries |
-| drop rate | *not passed* (default 2.5) | *not passed* (default 2.5) | **matched** |
-| gamma | `--drop-gamma 1.5` | *not passed* (tippecanoe default 0) | **not matched on purpose** |
-| simplification | `--simplify-factor 1.0` (× level GSD, metres) | *not passed* (tippecanoe `-S` default 1, tile units) | **not matched on purpose** |
+| Setting | How the harness compares it |
+|---|---|
+| Zoom range and layer name | Pass the same values to both tools. Corpus zoom ranges come from the corpus manifest. |
+| Tile buffer | Pass the same buffer to both tools. |
+| Tile size | Match the compressed byte cap and disable tylertoo's raw cap, since tippecanoe has no raw cap. |
+| Oversized tiles | Enable tippecanoe's iterative drop valve. This approximates tylertoo's drop pass. |
+| Thinning | Keep each tool's defaults for the default comparison. The quality-matched path disables tylertoo's thinning. |
+| Gamma and simplification | Retain each tool's own behavior. Gamma operates over different spatial groups, and simplification uses different units. |
 
-The buffer is moved on tippecanoe's side rather than tylertoo's because the
-buffer changes output *size*: letting tippecanoe write thinner tiles from a
-smaller buffer would flatter tylertoo on the archive-size column.
+The [corpus manifest](../../corpus/manifest.json) supplies additional
+per-dataset tippecanoe settings. The
+[setup script](setup_tippecanoe.sh) owns the tippecanoe pin. The harness
+checks the binary's version, and the results record the measured version.
 
-The drop rate is left at 2.5 in both tools; neither is passed a rate flag.
-The anchors still differ: tylertoo uses the full canonical count of budgeted
-kinds, while tippecanoe uses a per-tile basezoom count. The gated e2e run
-uses `--verbatim`, so tylertoo's density budget is off there anyway.
-Gamma and simplification deliberately remain at each tool's own default:
-gamma works per super-cell in tylertoo and per tile in tippecanoe, while
-simplification uses metres-of-GSD versus tile units. These show up as
-output-shape differences instead, and RESULTS.md reports them.
+## Output parity
 
-## Asymmetries that flags cannot close
-
-These are real and are not tuned away in either direction.
-
-| # | asymmetry | which way it cuts |
-|---|---|---|
-| 0 | **Defaults do not produce the same map.** tylertoo's density budget thins features hard at coarse and mid zooms; tippecanoe's rate-based dropping applies only to points at defaults, and its tiny-polygon reduction removes only small polygons at low zooms (it reaches all 17,465 madagascar polygons by z8). For a contiguous polygon coverage tylertoo's default output has visible holes where tippecanoe's is complete. | **favours tylertoo heavily in A.** This is why A′ exists; quote A′ vs C for output parity. |
-| 1 | **Input format.** tippecanoe cannot read GeoParquet; a conversion step is unavoidable. | favours tylertoo in A-vs-B. Neutralised in A-vs-C. |
-| 2 | **Generalization model.** tylertoo generalizes in world space, once per level, into a reusable overview file; tippecanoe generalizes in tile space, per tile, at encode time. They are not the same algorithm producing the same tiles faster — they are different algorithms with comparable *output intent*. Even in A′ the simplification is metres-of-GSD vs tile units, so vertex counts differ. | unquantifiable; this is why the visual-parity renderer exists |
-| 3 | **Oversize-tile valve.** tylertoo does one non-iterative drop pass; `--drop-fraction-as-needed` re-encodes the tile in a loop until it fits. | favours tylertoo on time, tippecanoe on tile-fill quality |
-| 4 | **Per-tile feature limit.** tippecanoe caps a tile at 200,000 features by default (`-pf` disables); tylertoo has no such cap. Left at tippecanoe's default — adding `-pf` would be a non-default setting. | favours tippecanoe on time at very dense zooms |
-| 5 | **Coarse-zoom emptiness.** With everything at defaults, tylertoo's visibility gate can generalize a small-extent dataset to nothing at z0–z4 and emit no tile there; tippecanoe emits a (nearly empty) tile at every zoom in range. Visible in the per-zoom counts. | favours tylertoo on tile count and archive size |
-| 6 | **tylertoo writes an intermediate.** `tiles` materialises the overview GeoParquet to a temp file and exports from it. That write is inside tylertoo's measured wall (it is not free, and it is not hidden), but it also means tylertoo's number includes producing an artifact tippecanoe never produces. | favours tippecanoe on time; favours tylertoo on what you get |
-| 7 | **Converter start-up.** `gpio` is a Python CLI (~0.3 s interpreter start-up); `ogr2ogr` is a C binary. On a 1,000-feature fixture the start-up *is* the conversion time. The harness times **both** converters and the e2e number uses the **faster**. A converter that fails on a dataset is recorded and skipped, not fatal — `gpio convert flatgeobuf` currently fails on the madagascar fixture (`NULL geometry not supported with spatial index`, although the parquet has no null, empty or invalid geometry), so `ogr2ogr` supplied that input. | neutralised |
-| 8 | **Thread counts.** Both tools use all cores; neither is pinned. tylertoo's export wave width is `auto` (memory-preflighted). Numbers are machine-specific, which is why the results file records CPU, core count and RAM. | neutral, but not portable |
-| 9 | **Warm cache.** A discarded warm-up run precedes the timed repeats for every stage, on both sides. No cold-cache numbers are published — macOS cannot drop caches without root. | neutral |
-| 10 | **Fixed run order.** Every dataset runs tylertoo first (defaults, then quality-matched), then the converters, then tippecanoe; runs are not interleaved. On a laptop, thermal state drifts across a run, so the later, longer tippecanoe stages may run on a hotter (throttled) or cooler machine than tylertoo's. | unknown direction; machine-dependent |
-
-## Parity gate (#420)
-
-`compare_tippecanoe.py` is the CI-facing sibling of `run_e2e.py`: same
-datasets, same flag mapping (imported from `run_e2e.py`, so they cannot
-drift), no timing. It tiles every fixture with tylertoo — the
-quality-matched run (`--verbatim --simplify-factor 1.0`) is gated, the
-defaults run is printed for #387 — and with the pinned tippecanoe, decodes
-both archives with the Python `pmtiles` + `mapbox-vector-tile` readers, and
-compares per zoom: tiles, MVT feature instances, distinct feature ids (where
-a dataset has a unique integer column, carried through as the MVT id on
-both sides), vertices, stored bytes, and the per-shared-tile feature-count
-median. Each ratio (tylertoo / tippecanoe) is checked against a band in
-`tippecanoe_tolerances.toml`, which has a comment per band saying what was
-measured and which divergence explains it. Exit 1 names the cell.
-
-Two things differ from `run_e2e.py` on purpose:
-
-- **tippecanoe's input is line-delimited GeoJSON written by the script
-  itself** (pyarrow + shapely), not FlatGeobuf from ogr2ogr/gpio. Ubuntu's
-  GDAL has no Parquet driver and gpio fails on the madagascar fixture, but
-  the real reason is determinism: ogr2ogr's FlatGeobuf writer builds a
-  spatial index and **reorders features along a Hilbert curve**, and
-  tippecanoe's tiny-polygon accumulator is order-dependent, so the
-  ogr2ogr-fed baseline carries roughly half the coarse-zoom placeholder
-  features of the row-order one (z2 madagascar: 5,441 vs 10,383 feature
-  instances). The gate's converter preserves row order and passes no `-P`,
-  which would reorder too. This is also why the gate's numbers are not the
-  RESULTS.md numbers.
-- **`--feature-id fid` / `--use-attribute-for-id=fid -aI`** on
-  madagascar-adm4, so distinct ids can be counted (METRICS.md §2's dedup).
+[The parity gate](compare_tippecanoe.py) imports the harness's flag mapping
+and compares decoded archives without timing them:
 
 ```bash
-uv run benchmarks/e2e/compare_tippecanoe.py                # all fixtures
-uv run benchmarks/e2e/compare_tippecanoe.py --only open-buildings --json out.json
-uv run benchmarks/e2e/compare_tippecanoe.py --work /tmp/cmp --keep   # keep archives
+uv run benchmarks/e2e/compare_tippecanoe.py
 ```
 
-When a change moves a ratio on purpose, update the band in
-`tippecanoe_tolerances.toml` in the same PR and put the new measurement in
-its comment.
+The gate converts fixtures to line-delimited GeoJSON while preserving row
+order. The timed harness uses FlatGeobuf, whose spatial index can reorder
+features. tippecanoe's polygon reduction depends on input order, so the
+outputs can differ between these paths.
 
-## Metrics
-
-Recorded per dataset, per stage, in the results file:
-
-- **wall** — GNU time's elapsed time, median of `--repeat` (default 3) timed
-  rounds after one discarded warm-up of every leg; the legs alternate within
-  each round. `min`, `max` and every individual run are kept.
-- **CPU** — user+sys seconds and `effective_cores` = CPU / wall, medians across
-  the rounds; `cpu_pct` is the same as a percentage (>100% means multi-core).
-- **peak RSS** — from GNU `/usr/bin/time -v`, i.e. the
-  kernel's `ru_maxrss`, not sampled. Reported as the **maximum across the
-  repeats** (a peak is a peak; taking its median would understate it), which
-  is why wall is a median and memory is not. For the two-process tippecanoe
-  pipeline the reported figure is the **larger of the two stages**, not their
-  sum, because they never run concurrently.
-- **output archive size** — bytes on disk.
-- **per-zoom tile counts and stored bytes** — from `tylertoo stats --json`,
-  which reads PMTiles directory entries only. The *same code* reads both
-  archives, so this column is not self-graded.
-- **tylertoo phase split** — `tiles --report` gives `convert` (parquet read +
-  generalization ladder) and `export` (MVT encode + archive write) wall
-  separately, plus row-groups read/total and feature counts.
-- **visual parity** — `render_parity.py`, separately, by eye.
-
-## Datasets
-
-The committed set is the in-repo real-data fixture set, so `git clone && run`
-reproduces the table:
-
-| id | features | size | class |
-|---|---|---|---|
-| `madagascar-adm4` | 17,465 | 28 MB | MultiPolygon (admin boundaries) |
-| `open-buildings` | 1,000 | 143 KB | Polygon |
-| `road-detections` | 1,000 | 90 KB | LineString |
-
-Fetch them with `gh release download fixtures-v1 --dir tests/fixtures/realdata/`.
-
-**Two of the three are ~1,000 features and are not the headline.** At that
-size both tools are dominated by process start-up and pyramid scaffolding and
-the ratio says nothing about tiling throughput. They are kept as the
-geometry-class smoke test. RESULTS.md says so in the table itself.
-
-For datasets that actually exercise the engines, there is the **corpus tier**
-(`--corpus`, or the whole thing as one command with `run_corpus.sh`): every
-dataset `corpus/manifest.json` defines, read from the gpio-optimized copies at
-`corpus/data/gpio/<id>.parquet` (build them with `corpus/fetch.sh &&
-corpus/optimize.sh`, ~2–3 GB download; datasets not on disk are skipped with
-the recipe). The headline rows:
-
-| id | class | ~features |
-|---|---|---|
-| `points-nyc-medium` | point | 458k |
-| `lines-portland-medium` | line | ~280k |
-| `polygons-portland-medium` | polygon | ~650k |
-| `polygons-ftw-moldova-large` | polygon | 632k (the dataset the pre-H3 pipeline lost 3.6× on) |
-
-Two corpus-specific deviations from the fixture runs, both recorded in the
-results file per dataset:
-
-- **tippecanoe gets the manifest's recorded flags** (the same ones
-  `corpus/goldens.sh` uses — `--simplification=10 --drop-densest-as-needed`
-  etc.) on top of the parity set, and the zoom range comes from the manifest.
-  tylertoo runs its own defaults against them: both tools in their production
-  configuration for that data, rather than both at bare defaults — a
-  650k-building z14 tippecanoe run without density dropping is a configuration
-  nobody ships. The per-zoom tile counts of both archives are in the record,
-  so the output difference sits next to the timing. Exact tile parity is not
-  expected and not claimed; the tolerance-gated parity comparison is #420's
-  `compare_tippecanoe.py`.
-- **The Overture datasets are not byte-pinned.** `corpus/manifest.json` pins
-  an Overture release, but Overture expires old releases from the bucket, so a
-  refetch may need `GPQ_OVERTURE_RELEASE=<newer>` and feature counts drift a
-  few percent. The Moldova parcels file is a direct download and stable. The
-  run's actual input sizes are in the results file.
-
-The committed corpus record is `benchmarks/results/e2e-corpus.json` (the
-fixture record is `e2e-fixtures.json` beside it);
-`format_results.py benchmarks/results/e2e-corpus.json` prints its tables.
-
-For a dataset of your own, pass it directly:
-
-```bash
-python3 run_e2e.py --dataset planet-buildings=/data/buildings.parquet \
-                   --only planet-buildings --max-zoom 13 --repeat 3
-```
-
-Everything — flags, parity rules, metrics — is identical for a supplied
-dataset. That is the path for cluster-scale runs.
-
-## Files
-
-| file | what it is |
-|---|---|
-| `setup_tippecanoe.sh` | clones + verifies + builds the pinned tippecanoe; writes `tippecanoe.lock.json` |
-| `run_e2e.py` | the harness (stdlib only, timed by `../run_manifest.py`); writes `results-<UTC timestamp>.json` (or `--out`) and a markdown table |
-| `run_corpus.sh` | one command for the corpus tier: fetch + optimize the corpus, build both binaries, run `run_e2e.py --corpus --quality-matched`, print the tables |
-| `format_results.py` | prints RESULTS.md's tables from a results file, so no number is retyped |
-| `render_parity.py` | side-by-side PNG renders of two archives at chosen zooms, with distinct-feature counts |
-| `compare_tippecanoe.py` | the parity gate (#420): tiles both tools, decodes both archives, per-zoom ratios vs `tippecanoe_tolerances.toml`; exit 1 on a breach |
-| `tippecanoe_tolerances.toml` | the gate's bands, one comment per band with the measured ratio and the divergence behind it |
-| `../visual/gate.py` | the visual gate (#869): both tools against the source, per tile; see `../visual/README.md` |
-| `../results/e2e-fixtures.json` | the recorded fixture run behind RESULTS.md (provenance, argv, every repeat) |
-| `../results/e2e-corpus.json` | the recorded corpus run (#447) behind RESULTS.md's corpus section |
-| `RESULTS.md` | measured numbers, machine, caveats |
-| `tippecanoe.lock.json` | local resolution of the pin (gitignored; written by setup) |
-| `<repo>/.tools/` | built tippecanoe, next to go-pmtiles (gitignored) |
-
-## Useful flags
-
-| flag | what for |
-|---|---|
-| `--quality-matched` | adds the A′ run (thinning ladder off) — the output-parity comparison |
-| `--geojson` | adds the ldGeoJSON + `-P` leg, evidence for "fgb is tippecanoe's best input" |
-| `--repeat N` | timed runs per measurement (median); default 3 |
-| `--dataset ID=PATH` | register your own GeoParquet; cluster-scale path |
-| `--corpus` | also register every `corpus/manifest.json` dataset (gpio copies; manifest zooms + recorded tippecanoe flags) |
-| `--tippecanoe-extra="…"` | probe a single tippecanoe flag's cost, recorded in the results file (use `=`, or argparse eats a leading `-`) |
-| `--work DIR --keep` | keep intermediates and archives, e.g. to feed `render_parity.py` |
-| `--tippecanoe PATH` | use a different tippecanoe (its `--version` must still be `tippecanoe v2.79.0`; recorded with `sha: null`) |
-| `--out FILE` | results file; default `results-<UTC timestamp>.json`. Name `../results/e2e-fixtures.json` (or `e2e-corpus.json`) only to replace the committed record |
+[The tolerance file](tippecanoe_tolerances.toml) defines the per-zoom bands
+for tile counts, features, vertices, and bytes. When you intentionally
+change output, update the affected band and its measurement comment in the
+same PR. For comparisons against the source geometry, see the
+[visual gate](../visual/README.md).

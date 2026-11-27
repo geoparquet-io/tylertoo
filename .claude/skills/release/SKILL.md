@@ -3,7 +3,7 @@ name: release
 description: Bump the tylertoo version and cut a release. Use when bumping versions, editing any version field, fixing version-check CI failures, or tagging a release.
 ---
 
-# Version Management
+# Version management
 
 **All versions MUST stay synchronized across these files:**
 
@@ -37,11 +37,21 @@ git tag -d vX.Y.Z
 # pre-commit hook runs `uv lock` and stages it. With
 # hooks disabled, run it yourself or CI's
 # `uv sync --locked` fails:
-cd crates/python && uv lock
+(cd crates/python && uv lock)
+
+# Check the build, then run the release benchmarks on the benchmark machine.
+# The run takes several hours and resumes after a failure.
+cargo check
+benchmarks/release.sh
+# Use --skip africa to leave the committed Africa result in place.
+# Commit benchmarks/results/, docs/benchmarks.md, and the READMEs.
+# Paste the --diff table printed by the run into the PR.
 
 # Push the branch, open the PR, merge it. Then:
 gh workflow run release.yml --ref main
 ```
+
+CI only warns when the results are older than the version in `Cargo.toml`; nothing blocks.
 
 Never `git push --tags` from the release branch. The
 release workflow's `verify` job refuses a tag whose
@@ -54,12 +64,12 @@ commit. To resume a failed release, run it on the tag:
 
 1. **Pre-commit hook** (`.githooks/pre-commit`): Validates version consistency before commit
 2. **CI version-check job**: Fails PRs with mismatched versions
-3. **Commitizen config** (`.cz.toml`): Single source of truth for version_files
+3. **Commitizen config** (`.cz.toml`): Single source of truth for `version_files`
 4. **Release `verify` job** (`.github/workflows/release.yml`): Publishes only from a commit on `main` whose `Cargo.toml` version matches the tag
 
-## DO NOT
+## Do not
 
-- Run `cz bump` from `crates/python/` (it has no commitizen config)
+- Run `cz bump` from `crates/python/` (it has no Commitizen config)
 - Manually edit versions without updating ALL files
 - Merge PRs that fail the version-check CI job
 - Push a release tag that points at a release-branch commit

@@ -2,7 +2,7 @@
 
 How to measure where time and memory go. The recorded performance
 history of the pipeline (what was measured, what was fixed) lives in
-[`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/PROFILE.md).
+[archived pipeline performance history](archive/bench/overview-PROFILE.md).
 
 ## Memory envelope
 
@@ -147,7 +147,7 @@ Its guard allows at most 2 million lines and `2M × 512` = 1.024 GB modeled
 geometry. The guard prices each line at `56 + 16 × vertices` bytes. The chain
 stage needs further workspace and keeps per-level results; the collection
 guard does not cap that peak. See
-[chain-stage memory](../docs/reference/tuning.md#memory).
+[chain-stage memory](../docs/OVERVIEW_TUNING.md#chain-stage-memory).
 `--no-coalesce-lines` removes that work but changes generalization.
 `--coalesce-max-level-rows` changes both guard limits and can change output.
 
@@ -303,7 +303,7 @@ job, then size the shards separately. Do not treat 64 GiB as a planet
 budget or the historical 192 GiB failure as a new measured requirement.
 The planet-scale figures here are arithmetic, not measured peaks.
 For scheduler cache accounting, see
-[Reading a job's MaxRSS](#reading-a-jobs-maxrss).
+[the scaling guide](../docs/guides/scaling.md#reading-a-jobs-maxrss).
 
 ### Design notes after 1.0
 
@@ -533,7 +533,7 @@ live bytes, and it includes each array's fixed struct overhead, which a
 coarse level's few-row batches spread over few rows. Both are real RAM while
 the batches are held, so neither is subtracted.
 
-See `docs/reference/tuning.md` (Memory and speed) for how to turn `bytes_per_row`
+See `docs/guides/scaling.md` (*Sizing the coarse job's memory*) for how to turn `bytes_per_row`
 into a box size.
 
 ### `pass0` (#788)
@@ -551,8 +551,7 @@ before pass 1, so both passes read from disk. The record says what it did:
   group, so with no earlier staging `bytes_fetched` equals `bytes_to_stage`
   (a coalescing window can add the gap bytes between merged chunks).
 - `max_in_flight`: the most requests in flight at once, across all parts.
-  It is capped by staging concurrency and the memory budget. See the
-  `ENVIRONMENT` const in `crates/core/src/environment.rs` for controls.
+  It is capped by `TYLERTOO_STAGING_CONCURRENCY` and by the memory budget.
 - `failed_requests`, `unstaged_bytes`: a failed request is retried once,
   split into its row groups. These count the requests that failed twice and
   the chunk bytes they kept out of the spill. The passes read those chunks
@@ -670,7 +669,7 @@ was on a cgroup v1 host, where `phase_cgroup` is `{}`, so the example shows
 
 Reading `memory.stat` makes the kernel flush per-CPU statistics, so
 `phase_cgroup` is taken only at phase boundaries, not on every tick.
-[Reading a job's MaxRSS](#reading-a-jobs-maxrss)
+`docs/guides/scaling.md` (*Reading a job's MaxRSS*)
 walks an operator through putting these fields together.
 
 The four `phase_walls` phases are **disjoint** windows of one conversion, so
@@ -856,7 +855,7 @@ injected, and `record --inject-threads` is refused. A phase the cell measures
 cell) missing from any round fails the check and makes `record` refuse to
 write. A matched baseline missing a field the gate compares (recorded before
 these fields), a cell, or `floors` fails on the pinned class (`PINNED_CLASS`,
-aarch64/0xd40/64, the `tylertoo-bench` runner) with the missing fields and the
+aarch64/0xd40/64) with the missing fields and the
 `record` command; on another recorded class it reports
 `baseline: NOT APPLICABLE (... run record)`. `record --cells X` merges into the host class entry (other
 cells and `floors` stay). A CPU core-seconds check that cannot run (baseline
@@ -1390,108 +1389,7 @@ open target/criterion/report/index.html
 
 ## Reproducing the published numbers
 
-The corpus-based storage/access/conversion benchmarks are scripted in
-`benchmarks/overview/` (see its README for the run order); the corpus
-itself is rebuilt from `corpus/fetch.sh` + `corpus/optimize.sh`.
-
-## Reading a job's MaxRSS
-
-The `MaxRSS` a scheduler reports can measure more than tylertoo's memory.
-One `--profile bounded` coarse job over 134M features was modeled at about
-10 GiB. It finished inside a 192 GiB Slurm cgroup with
-`MaxRSS 201,321,784 K` and was not killed. Page cache likely made up most of
-that charge, but the run recorded no breakdown to confirm it.
-
-tylertoo maps none of its data files. It reads the input and the intermediate
-overview, writes spill files, and writes the archive with ordinary `read` and
-`write` calls. That data stays out of the process's resident set. The kernel
-still caches those pages and charges them to the job's cgroup. Whether
-`MaxRSS` includes that cache depends on how Slurm gathers it:
-
-| Slurm setup | `MaxRSS` source | Includes page cache |
-| --- | --- | --- |
-| `jobacct_gather/cgroup`, cgroup v2 | `memory.current`, or `memory.peak` where available | Yes, unless `JobAcctGatherParams=no_file_cache` |
-| `jobacct_gather/cgroup`, cgroup v1 | `total_rss` from `memory.stat` | No |
-| `jobacct_gather/linux` | `/proc/<pid>/statm` summed over the job | No |
-
-On a compute node, `stat -fc %T /sys/fs/cgroup` prints `cgroup2fs` on
-cgroup v2. `scontrol show config` lists `JobAcctGatherType` and
-`JobAcctGatherParams`.
-
-On cgroup v2, a `MaxRSS` at the ceiling can be harmless cache. Setting
-`JobAcctGatherParams=no_file_cache` in `slurm.conf` subtracts that cache from
-the report. It also stops Slurm from reading `memory.peak`, so Slurm can miss
-short spikes. On cgroup v1 or `jobacct_gather/linux`, a `MaxRSS` at the
-ceiling is the job's own memory. Treat it like an out-of-memory failure.
-
-The cgroup kills the job when it cannot reclaim enough of the charge. The
-kernel drops clean page cache first. These parts are harder to reclaim:
-
-- Anonymous memory, the heap that `--profile` bounds.
-- tmpfs files. Spill files or an intermediate overview in a tmpfs `TMPDIR`
-  count as shared memory, and only swap can reclaim them.
-- Dirty pages and pages under write-back, such as the archive's latest writes. They must
-  reach disk first.
-- Kernel memory charged to the cgroup.
-
-### Get the breakdown
-
-With `TYLERTOO_PROFILE_JSON` set, the profile samples anonymous memory every
-250 ms. At each phase boundary it also records the resident set's split and
-the cgroup's own accounting:
-
-```bash
-TYLERTOO_PROFILE_JSON=profile.jsonl \
-  tylertoo tiles in.parquet out.pmtiles \
-  --profile bounded --layer-name fields
-# convert carries rss_sampler at the top level,
-# export carries it under .export
-jq '(.rss_sampler // .export.rss_sampler)
-    | {true_peak_mib, true_anon_peak_mib,
-       phase_anon_peaks_mib, phase_rss_breakdown,
-       phase_cgroup}' profile.jsonl
-```
-
-The export line of a run over the `sharding-grid` test fixture on a cgroup v1
-host, with `phase_rss_breakdown` trimmed to one phase:
-
-```json
-{
-  "true_peak_mib": 139.01171875,
-  "true_anon_peak_mib": 93.41015625,
-  "phase_anon_peaks_mib": { "finalize": 65.171875, "levels": 93.41015625, "scan": 23.796875 },
-  "phase_rss_breakdown": {
-    "levels": { "anon_kib": 64068, "file_kib": 46696, "rss_kib": 110764, "shmem_kib": 0, "swap_kib": 0 }
-  },
-  "phase_cgroup": {}
-}
-```
-
-| Field | Meaning |
-| --- | --- |
-| `true_anon_peak_mib`, `phase_anon_peaks_mib` | The process's sampled heap peak. Size jobs from these, or from `true_peak_mib`, plus headroom. |
-| `phase_rss_breakdown` | The resident set at the end of each phase, where `anon_kib` + `file_kib` + `shmem_kib` = `rss_kib`. This is a snapshot, not a peak. Above, `levels` peaked at 93.4 MiB of anonymous memory and ended at 62.6 MiB. `file_kib` is the binary's code. A nonzero `swap_kib` means the run already exceeded its budget. |
-| `phase_cgroup` | cgroup v2 only. `memory_current_bytes` and `memory_peak_bytes` match what Slurm reports. `anon_bytes`, `file_bytes`, `file_dirty_bytes`, `file_writeback_bytes`, and `shmem_bytes` break that charge down. |
-
-To diagnose a high `MaxRSS`:
-
-1. If `true_anon_peak_mib` approaches the limit, the profile is not holding
-   memory down. Report it with `profile.jsonl` attached.
-2. On cgroup v2, read `phase_cgroup`. If `file_bytes` covers the gap between
-   `anon_bytes` and `memory_current_bytes`, the gap is clean cache and the job
-   is healthy. A large `shmem_bytes` means spill files sit on tmpfs. Point
-   `--spill-dir` or `TMPDIR` at real disk. Large `file_dirty_bytes` plus
-   `file_writeback_bytes` means writes outrun the disk.
-3. On cgroup v1 or `jobacct_gather/linux`, `MaxRSS` should sit close to
-   `true_peak_mib`. A much higher figure means another process shares the
-   job's accounting.
-
-Off Linux, `phase_anon_peaks_mib` and `phase_rss_breakdown` are empty and
-`true_anon_peak_mib` is `null`. `phase_cgroup` is empty unless the process
-runs in a cgroup v2 hierarchy whose memory files it can read.
-
-tylertoo does not call `posix_fadvise(DONTNEED)` to shrink the reported
-figure. Deleting the spill files and the intermediate overview after use
-frees their cache outright. Pass 2 reads the input again for each level, so
-evicting its cache would turn cache hits into disk reads. The archive's last
-pages are still dirty, and `DONTNEED` leaves dirty pages in place.
+Run `benchmarks/release.sh` to reproduce the published benchmarks. For the
+method and settings parity, see the [end-to-end benchmark instructions](../benchmarks/e2e/README.md).
+The [archived performance history](archive/bench/overview-PROFILE.md) records
+the earlier storage, access, and conversion investigations.

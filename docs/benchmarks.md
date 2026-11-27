@@ -1,248 +1,249 @@
 # Benchmarks
 
-tylertoo against [tippecanoe](https://github.com/felt/tippecanoe), end to
-end: GeoParquet in, z0–z14 PMTiles out. Every number on this page is
-generated from a committed results file by `scripts/gen_bench_docs.py`, and
-CI fails if a number here differs from its record. Each table ends with a
-run line that names the commit, tool versions, host, and date.
+These measurements compare whole builds from GeoParquet to PMTiles.
 
-## Hardware, versions, and pinning
-
-- **Host.** The corpus and Overture runs used a 64-core arm64 (Neoverse-V1)
-  host with 124 GB of RAM and no other jobs running.
-- **tippecanoe** is v2.79.0, built from source at a verified pinned commit
-  by `benchmarks/e2e/setup_tippecanoe.sh`.
-- **tylertoo** is a release build of the commit in each run line.
-- **Disk.** A network disk (AWS gp3). The corpus, Brazil, and memory-profile
-  runs used 125 MB/s, much slower than a laptop's NVMe drive; the Africa run
-  started during the upgrade to 1,000 MB/s. Spilling runs are sensitive to
-  it.
-- **Inputs are pinned.** The Overture corpus extracts are pinned to release
-  `2026-10-21.0`, with each extract's ids hashed in `corpus/manifest.json`.
-  The Moldova parcels file is a stable direct download. Each Overture
-  buildings part in the at-scale run is pinned by ETag.
-
-## Streaming at scale: Africa, straight from S3
-
-One `tylertoo tiles` command reads Overture's buildings release
-`2026-10-21.0` in place on `s3://`, as the partitioned GeoParquet files
-Overture publishes, and writes one PMTiles archive. `--bbox` selects Africa;
-tylertoo reads only the row groups whose bbox statistics intersect it, and
-only the columns it tiles. Nothing is downloaded first, and no format
-conversion runs. tippecanoe can't do this at all: it reads neither
-GeoParquet nor S3, so this run has no tippecanoe row. A single run.
-
-<!-- bench:overture-buildings-africa/stream-at-scale -->
-Overture buildings 2026-10-21.0, Africa (bbox `-18,-35,52,37.5`): 526,532,679 features kept by `--bbox`. The bbox touches 118 of the release's partitioned GeoParquet files and 17,372 of its 84,224 row groups; those row groups hold 58.7 GB of the release's 276.9 GB.
-
-| run | wall | peak RSS | effective cores | fetched | peak local disk | archive |
-|---|---|---|---|---|---|---|
-| tylertoo, s3:// in place | 54 min (3,243 s) | 107.1 GB | 11.9 | 35.6 GB | 145.8 GB | 12.5 GB |
-| tylertoo, s3:// in place, `--profile bounded` | 50 min (3,018 s) | 41.1 GB | 13.6 | 35.6 GB | 194.9 GB | 12.5 GB |
-
-_Run: commit afb6b15, tylertoo 0.8.0, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
+<!-- bench:e2e-corpus/stamp -->
+Corpus: commit ae0363f, 2026-11-06. Africa: commit afb6b15, 2026-11-07. Release cells: commit afb6b15, 2026-11-07. tippecanoe v2.79.0. gpio 1.7.0.
 <!-- /bench -->
 
-- **Both profiles write the same archive,** byte for byte. `--profile
-  bounded` peaks at 41 GB, against the default's 107 GB on this 123 GB host,
-  so bounded is the one to use on a smaller machine.
-- **Disk:** the default run overlapped an upgrade of the host's disk from
-  125 to 1,000 MB/s; the bounded run had the fast disk throughout, which is
-  part of why it is faster here. On Brazil, on the same fast disk, bounded
-  is about a fifth slower than the default.
-- **Cores:** about 12–14 of 64 are busy on average. This run predates
-  the core-use work in #818, #878 and #881.
-- The bbox is a rectangle, so it also takes in the Middle East west of 52°E
-  and southern Europe below 37.5°N.
+## Against tippecanoe
 
-## Against tippecanoe at scale: Brazil
+<!-- bench:e2e-corpus/speedup -->
+tylertoo is **20×** faster than tippecanoe end to end, the geometric mean over 3 datasets.
 
-The Brazil bbox of the same release, 148 million buildings. tylertoo runs
-three ways: straight from `s3://` (median of 3), on a local GeoParquet
-extract of the bbox, and on that extract with `--profile bounded`.
-tippecanoe can't read GeoParquet or S3, so its time includes extracting the
-same bbox with gpio and converting the extract to FlatGeobuf; the extract
-alone took 10.5 minutes and every row but the `s3://` one pays it.
+Included: Portland buildings (polygon), Oregon roads (line), Moldova parcels (polygon, dense). Excluded: New York City places (point): the archives reach different max zooms (tylertoo z14, tippecanoe z16).
 
-<!-- bench:overture-buildings-brazil/vida-head-to-head -->
-Overture buildings 2026-10-21.0, Brazil (bbox `-74,-33.8,-34.7,5.3`): 148,088,547 features, 10.3 GB.
+GeoParquet to FlatGeobuf conversion as a share of tippecanoe's total wall time: Portland buildings (polygon): 2.8%, Oregon roads (line): 2.1%, Moldova parcels (polygon, dense): 2.2%. For tiling alone, the geometric mean is 20×. With thinning off, the geometric mean is 16× over 3 datasets.
 
-| tool | end-to-end wall | peak RSS | effective cores | archive | note |
-|---|---|---|---|---|---|
-| tylertoo, s3:// in place | 855 s | 50.3 GB | 13.6 | 4.2 GB | reads the parts in place; no extract |
-| tylertoo, local extract | 1,356 s | 48.3 GB | 15.8 | 4.2 GB | end to end includes the gpio extract |
-| tylertoo, local extract, `--profile bounded` | 1,341 s | 12.3 GB | 18.9 | 4.2 GB | end to end includes the gpio extract |
-| tippecanoe v2.79.0 | 5,905 s | 23.6 GB | 4.1 | 2.2 GB | extract + FlatGeobuf + tile |
-
-_Run: commit 395a55f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio 1.7.0, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
+_Run: commit ae0363f, tippecanoe v2.79.0, gpio 1.7.0, allocator: mimalloc, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
-- **On this disk, `--profile bounded` is not slower,** and it peaks at a
-  quarter of the default's memory, below tippecanoe's. At this size the default profile
-  spills its intermediate overview to disk anyway (35 GB), so the memory it
-  holds buys no speed. On inputs that fit in memory, bounded is slower; see
-  [memory profiles](#memory-profiles).
-- **Disk speed shows at this size.** These runs used a 125 MB/s network
-  disk, far slower than a laptop's NVMe drive. Convert's second pass is
-  bound by writing that spill: 275 s of the local run's 725 s. The same
-  tylertoo runs after the disk was upgraded to 1,000 MB/s (tippecanoe was
-  not re-run):
+<!-- bench:e2e-corpus/speedup-bars -->
+<figure class="tt-chart"><figcaption>End-to-end wall time, shorter is faster</figcaption>
+<p class="tt-legend"><span class="tt-key tt-a">tylertoo</span> <span class="tt-key tt-b">tippecanoe</span></p>
+<div class="tt-row"><span class="tt-label">New York City places (point)</span>
+<span class="tt-bar tt-a" style="--w:0.9%" aria-hidden="true"></span><span class="tt-val">1.6 s, 27× faster (max zoom differs)</span>
+<span class="tt-bar tt-b" style="--w:23.6%" aria-hidden="true"></span><span class="tt-val">42.7 s</span>
+</div>
+<div class="tt-row"><span class="tt-label">Portland buildings (polygon)</span>
+<span class="tt-bar tt-a" style="--w:2.0%" aria-hidden="true"></span><span class="tt-val">3.7 s, 23× faster</span>
+<span class="tt-bar tt-b" style="--w:46.9%" aria-hidden="true"></span><span class="tt-val">84.8 s</span>
+</div>
+<div class="tt-row"><span class="tt-label">Oregon roads (line)</span>
+<span class="tt-bar tt-a" style="--w:5.9%" aria-hidden="true"></span><span class="tt-val">10.7 s, 17× faster</span>
+<span class="tt-bar tt-b" style="--w:100.0%" aria-hidden="true"></span><span class="tt-val">180.7 s</span>
+</div>
+<div class="tt-row"><span class="tt-label">Moldova parcels (polygon, dense)</span>
+<span class="tt-bar tt-a" style="--w:4.3%" aria-hidden="true"></span><span class="tt-val">7.8 s, 21× faster</span>
+<span class="tt-bar tt-b" style="--w:92.6%" aria-hidden="true"></span><span class="tt-val">167.3 s</span>
+</div>
+</figure>
+<details markdown><summary>The figures as a table</summary>
 
-<!-- bench:overture-buildings-brazil/fast-disk -->
-| tylertoo run | wall | peak RSS | effective cores |
-|---|---|---|---|
-| s3:// in place | 653 s | 50.2 GB | 17.6 |
-| s3:// in place, `--profile bounded` | 793 s | 15.1 GB | 17.1 |
-| local extract | 530 s | 48.1 GB | 21.2 |
-| local extract, `--profile bounded` | 665 s | 12.3 GB | 20.2 |
+| Dataset | Features | tylertoo | tippecanoe end to end | tippecanoe tiling only | Speedup | Speedup with thinning off | tylertoo archive | tippecanoe archive |
+|---|---|---|---|---|---|---|---|---|
+| New York City places (point) | 630,065 | 1.6 s | 42.7 s | 40.9 s | 27× faster (max zoom differs) | 2.3× | 61.7 MB | 95.0 MB |
+| Portland buildings (polygon) | 813,456 | 3.7 s | 84.8 s | 82.5 s | 23× faster | 14× | 103.9 MB | 73.7 MB |
+| Oregon roads (line) | 1,203,997 | 10.7 s | 180.7 s | 177.0 s | 17× faster | 17× | 326.7 MB | 292.2 MB |
+| Moldova parcels (polygon, dense) | 631,910 | 7.8 s | 167.3 s | 163.6 s | 21× faster | 18× | 182.7 MB | 183.3 MB |
 
-_Run: commit 395a55f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio 1.7.0, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
+</details>
+
+_Run: commit ae0363f, tippecanoe v2.79.0, gpio 1.7.0, allocator: mimalloc, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
-  On the faster disk `bounded` costs about a fifth more wall time than the
-  default, in a quarter to a third of its memory.
-- **tylertoo's archive is 1.9× tippecanoe's because it keeps more
-  buildings.** tippecanoe's `--drop-densest-as-needed` thins a whole zoom
-  at once: at z13 it kept 27.9 million features to tylertoo's 152 million,
-  at z12 10 million to 100 million, and at z14 it dropped 40.8 million
-  buildings, about a quarter, from its densest tiles. tylertoo cuts only
-  the tiles over the size limit, by merging features, and drops none. z12
-  and z13 account for three quarters of the 2 GB gap. Per feature the two
-  are close: the same three properties, extent and gzip level. tylertoo
-  also does not simplify z14, where tippecanoe's `-S 10` simplifies every
-  zoom.
-- **The `s3://` and local archives differ by a few KB** of 4.2 GB. tylertoo's
-  `--bbox` and gpio's extract keep slightly different features on the bbox
-  edge (82 of 434 million overview rows); each path on its own is
-  byte-identical across runs.
+See [Coming from tippecanoe](guides/tippecanoe.md) for the map comparison.
 
-## Against tippecanoe on the corpus
+<!-- vale Tylertoo-Mechanics.Headings = NO -->
+## Streaming Overture from S3
+<!-- vale Tylertoo-Mechanics.Headings = YES -->
 
-Both tools run a production configuration, not a rigged one. tippecanoe
-runs its recorded flags for each dataset (`--drop-densest-as-needed`,
-`--simplification=10`, …); tylertoo runs its defaults. The "thinning off"
-column re-runs tylertoo with `--verbatim --simplify-factor 1.0`, so it
-cannot win by emitting fewer features. Each time is the median of 3 warm
-runs per tool, alternating the tools within each round. Both speedup
-columns are end to end.
+<!-- bench:overture-buildings-africa/hero -->
+<div class="tt-hero" markdown>
 
-<!-- bench:e2e-corpus/tippecanoe-table -->
-| dataset (class) | features | tylertoo | tippecanoe e2e | speedup | speedup, thinning off | peak RSS (tylertoo / tippecanoe) |
-|---|---|---|---|---|---|---|
-| NYC places (point) † | 630,065 | 1.57 s | 42.66 s | **27.2×** | 2.3×* | 2,210 / 1,352 MB |
-| Portland buildings (polygon) | 813,456 | 3.68 s | 84.81 s | **23.0×** | 13.7× | 3,132 / 2,127 MB |
-| Oregon roads (line) | 1,203,997 | 10.65 s | 180.69 s | **17.0×** | 17.3× | 9,051 / 2,435 MB |
-| Moldova parcels (polygon, dense) | 631,910 | 7.78 s | 167.27 s | **21.5×** | 17.9× | 4,520 / 2,431 MB |
+526,532,679 features. 54 min wall time. 107.1 GB peak memory. 35.6 GB fetched.
 
-_Run: commit ae0363f, tylertoo 0.8.0, tippecanoe v2.79.0, gpio geoparquet-io, version 1.7.0, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
+</div>
+
+`--profile bounded`: 50 min wall time, 41.1 GB peak memory, same archive.
+
+Overture release: 2026-10-21.0.
+
+_Run: commit afb6b15, allocator: mimalloc, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
 <!-- /bench -->
 
-The honest footnotes, which are the point of this table:
+<!-- bench:overture-buildings-africa/history -->
+54 min at commit afb6b15.
 
-- † *The point row is not a parity measurement at all.* tippecanoe's recorded
-  flags (`--extend-zooms-if-still-dropping`) had it building z15–z16 — 9,694
-  of its 10,543 tiles and 69% of its output bytes — while tylertoo stopped at
-  the requested z14. Both of that row's ratios include that extra work.
-- *The point row's "thinning off" 2.3× is the weakest number this harness has
-  produced, and it carries a second mismatch on top of †:* `--verbatim` makes
-  tylertoo carry all 630k points at every zoom (1.57 s → 18.38 s). The two
-  tools also thin points by different rules, so they keep different points
-  at each zoom ([#666](https://github.com/geoparquet-io/tylertoo/issues/666)
-  measures it on this dataset). Read the line and polygon rows for parity
-  numbers.
-- Archives are equal on Moldova (1.00×) and larger elsewhere: Oregon roads
-  1.12× at defaults (1.23× thinning off), Portland buildings 1.41× (1.47×).
-  For points, the 0.65× compares tylertoo's z0–14 archive against
-  tippecanoe's z0–16; at z0–14 on both sides tylertoo's is 2.1× bigger.
-- Converting GeoParquet for tippecanoe is only 2–4% of its end-to-end wall at
-  this scale — the gap is tiler vs tiler, not a format-conversion tax.
-- On a small contiguous admin coverage (the 17k-polygon fixture set, an
-  older 12-core laptop run), the parity-matched ratio was **≈7.5×**, well
-  below the corpus rows.
+<figure class="tt-chart"><figcaption>Africa wall time on aarch64, CPU 0xd40, 64 CPUs, shorter is faster</figcaption>
+<p class="tt-legend"><span class="tt-key tt-a">tylertoo</span></p>
+<div class="tt-row"><span class="tt-label">commit afb6b15</span>
+<span class="tt-bar tt-a" style="--w:100.0%" aria-hidden="true"></span><span class="tt-val">54.1 min</span>
+</div>
+</figure>
+<details markdown><summary>The figures as a table</summary>
+
+| Dataset | tylertoo |
+|---|---|
+| commit afb6b15 | 54.1 min |
+
+</details>
+
+_Run: commit afb6b15, allocator: mimalloc, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
+<!-- /bench -->
+
+<!-- bench:overture-buildings-africa/recipe -->
+```bash
+AWS_REGION=us-west-2 AWS_SKIP_SIGNATURE=true tylertoo tiles s3://overturemaps-us-west-2/release/2026-10-21.0/theme=buildings/type=building/ africa.pmtiles --min-zoom 0 --max-zoom 14 --layer-name buildings --tile-buffer 8 --max-compressed-tile-size 500000 --max-tile-size 0 --include-property class --include-property subtype --include-property height --bbox=-18,-35,52,37.5
+```
+
+_Run: commit afb6b15, allocator: mimalloc, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
+<!-- /bench -->
+
+The box is a rectangle, so it also covers parts of the Middle East and southern Europe.
+
+## Input types
+
+<!-- bench:release-cells/encodings -->
+_Not measured yet. `benchmarks/release.sh` fills this chart._
+<!-- /bench -->
+
+<!-- bench:release-cells/sources -->
+_Not measured yet. `benchmarks/release.sh` fills this chart._
+<!-- /bench -->
 
 ## Memory
 
-tylertoo's peak memory is **higher on all four datasets** — up to <!-- bench:e2e-corpus/max-memory-ratio -->3.7×<!-- /bench -->
-on lines. The speed is parallelism (19–29 of 64 cores busy vs tippecanoe's
-2–3) plus the native GeoParquet read, paid for in working set. Turning the
-thinning off costs memory as well as time. The export's concurrency,
-`--partition-wave auto`, sizes itself against available RAM, so peak memory
-moves with the machine; pin `--partition-wave N` before you compare memory
-across hosts.
+<!-- bench:e2e-corpus/memory-bars -->
+<figure class="tt-chart"><figcaption>Peak memory, shorter is less</figcaption>
+<p class="tt-legend"><span class="tt-key tt-a">tylertoo</span> <span class="tt-key tt-b">tippecanoe</span></p>
+<div class="tt-row"><span class="tt-label">New York City places (point)</span>
+<span class="tt-bar tt-a" style="--w:24.4%" aria-hidden="true"></span><span class="tt-val">2.3 GB</span>
+<span class="tt-bar tt-b" style="--w:14.9%" aria-hidden="true"></span><span class="tt-val">1.4 GB</span>
+</div>
+<div class="tt-row"><span class="tt-label">Portland buildings (polygon)</span>
+<span class="tt-bar tt-a" style="--w:34.6%" aria-hidden="true"></span><span class="tt-val">3.3 GB</span>
+<span class="tt-bar tt-b" style="--w:23.5%" aria-hidden="true"></span><span class="tt-val">2.2 GB</span>
+</div>
+<div class="tt-row"><span class="tt-label">Oregon roads (line)</span>
+<span class="tt-bar tt-a" style="--w:100.0%" aria-hidden="true"></span><span class="tt-val">9.5 GB</span>
+<span class="tt-bar tt-b" style="--w:26.9%" aria-hidden="true"></span><span class="tt-val">2.6 GB</span>
+</div>
+<div class="tt-row"><span class="tt-label">Moldova parcels (polygon, dense)</span>
+<span class="tt-bar tt-a" style="--w:49.9%" aria-hidden="true"></span><span class="tt-val">4.7 GB</span>
+<span class="tt-bar tt-b" style="--w:26.9%" aria-hidden="true"></span><span class="tt-val">2.5 GB</span>
+</div>
+</figure>
+<details markdown><summary>The figures as a table</summary>
 
-## Memory profiles
+| Dataset | tylertoo | tippecanoe |
+|---|---|---|
+| New York City places (point) | 2.3 GB | 1.4 GB |
+| Portland buildings (polygon) | 3.3 GB | 2.2 GB |
+| Oregon roads (line) | 9.5 GB | 2.6 GB |
+| Moldova parcels (polygon, dense) | 4.7 GB | 2.5 GB |
 
-`--profile auto`, the default, holds what fits in memory; `--profile
-bounded` caps every buffer and spills the rest. Three alternating rounds
-per input, same commit; the archives are byte-identical:
+</details>
 
-<!-- bench:memory-profiles/memory-profiles -->
-| input | `auto` wall | `bounded` wall | bounded costs | `auto` peak | `bounded` peak | same archive |
-|---|---|---|---|---|---|---|
-| Madagascar admin level 4, z0–12 | 1.15 s | 1.27 s | +10% | 1.4 GiB | 1.2 GiB | yes |
-| Moldova parcels, z0–14 | 4.33 s | 5.63 s | +30% | 3.7 GiB | 2.7 GiB | yes |
-| NZ parcels, z0–14 | 58.24 s | 79.03 s | +36% | 9.8 GiB | 4.7 GiB | yes |
-
-_Run: commit afb6b15, tylertoo 0.8.0, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
+_Run: commit ae0363f, tippecanoe v2.79.0, gpio 1.7.0, allocator: mimalloc, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
 <!-- /bench -->
 
-On inputs that fit in memory, bounded costs <!-- bench:memory-profiles/bounded-cost -->10–36%<!-- /bench -->
-of the wall for its lower peak. On Brazil, where the default spills anyway,
-the two tie on the slow disk; on the fast one bounded is about a fifth
-slower, in a quarter to a third of the memory. So `auto` stays the
-default, and `bounded` is the choice for inputs larger than the machine's
-memory or for jobs with a hard memory cap.
+<!-- bench:release-cells/profiles -->
+<figure class="tt-chart"><figcaption>Memory profiles, wall time</figcaption>
+<p class="tt-legend"><span class="tt-key tt-a">auto</span> <span class="tt-key tt-b">bounded</span></p>
+<div class="tt-row"><span class="tt-label">Madagascar admin boundaries</span>
+<span class="tt-bar tt-a" style="--w:1.5%" aria-hidden="true"></span><span class="tt-val">1.1 s</span>
+<span class="tt-bar tt-b" style="--w:1.6%" aria-hidden="true"></span><span class="tt-val">1.3 s</span>
+</div>
+<div class="tt-row"><span class="tt-label">Moldova parcels</span>
+<span class="tt-bar tt-a" style="--w:5.5%" aria-hidden="true"></span><span class="tt-val">4.3 s</span>
+<span class="tt-bar tt-b" style="--w:7.1%" aria-hidden="true"></span><span class="tt-val">5.6 s</span>
+</div>
+<div class="tt-row"><span class="tt-label">New Zealand parcels</span>
+<span class="tt-bar tt-a" style="--w:73.7%" aria-hidden="true"></span><span class="tt-val">58.2 s</span>
+<span class="tt-bar tt-b" style="--w:100.0%" aria-hidden="true"></span><span class="tt-val">79.0 s</span>
+</div>
+</figure>
+<details markdown><summary>The figures as a table</summary>
 
-## What the numbers don't show
+| Dataset | auto | bounded |
+|---|---|---|
+| Madagascar admin boundaries | 1.1 s | 1.3 s |
+| Moldova parcels | 4.3 s | 5.6 s |
+| New Zealand parcels | 58.2 s | 79.0 s |
 
-The corpus table times one local file per dataset, and only the at-scale
-`s3://` row shows a remote read. Neither table measures what tylertoo does
-that tippecanoe can't do at all:
+</details>
 
-- reading GeoParquet with no conversion step;
-- streaming `s3://`, `gs://`, or `https://` data in place, by byte range;
-- reading a directory, glob, prefix, or Hive layout as one dataset;
-- skipping row groups with `--bbox` and `--filter`;
-- sharding one build across machines and merging without re-encoding.
+<figure class="tt-chart"><figcaption>Memory profiles, peak memory</figcaption>
+<p class="tt-legend"><span class="tt-key tt-a">auto</span> <span class="tt-key tt-b">bounded</span></p>
+<div class="tt-row"><span class="tt-label">Madagascar admin boundaries</span>
+<span class="tt-bar tt-a" style="--w:14.2%" aria-hidden="true"></span><span class="tt-val">1.4 GiB</span>
+<span class="tt-bar tt-b" style="--w:12.6%" aria-hidden="true"></span><span class="tt-val">1.2 GiB</span>
+</div>
+<div class="tt-row"><span class="tt-label">Moldova parcels</span>
+<span class="tt-bar tt-a" style="--w:37.4%" aria-hidden="true"></span><span class="tt-val">3.7 GiB</span>
+<span class="tt-bar tt-b" style="--w:27.9%" aria-hidden="true"></span><span class="tt-val">2.7 GiB</span>
+</div>
+<div class="tt-row"><span class="tt-label">New Zealand parcels</span>
+<span class="tt-bar tt-a" style="--w:100.0%" aria-hidden="true"></span><span class="tt-val">9.8 GiB</span>
+<span class="tt-bar tt-b" style="--w:48.0%" aria-hidden="true"></span><span class="tt-val">4.7 GiB</span>
+</div>
+</figure>
+<details markdown><summary>The figures as a table</summary>
 
-## Methods and caveats
+| Dataset | auto | bounded |
+|---|---|---|
+| Madagascar admin boundaries | 1.4 GiB | 1.2 GiB |
+| Moldova parcels | 3.7 GiB | 2.7 GiB |
+| New Zealand parcels | 9.8 GiB | 4.7 GiB |
 
-- **Warm cache.** Each tool gets one discarded warm-up run, then 3 timed
-  runs; the page cache is warm for both tools. Cold-cache reads are not
-  measured.
-- **Quiet host, checked by hand.** No other job ran during the corpus
-  recording, but the corpus harness has no load gate and records no load
-  figure. Spread across the 3 repeats is at most 5.3% on every measurement
-  except two tylertoo runs: Oregon roads at defaults (16.8%) and Moldova
-  with thinning off (13.7%).
-- **The fastest converter.** tippecanoe's input conversion uses whichever
-  of `gpio` and `ogr2ogr` is faster, so the baseline never pays for a tool
-  choice. On the fixture set, FlatGeobuf was tippecanoe's fastest input:
-  line-delimited GeoJSON was slower to write and slower to read.
-- **Different thinning models.** Exact tile parity is neither expected nor
-  claimed. The per-zoom tile counts in the full record agree within a few
-  tiles per zoom on lines and polygons.
-- **Not swept.** Both tools get every core; neither is pinned to fewer
-  cores or swept across core counts.
+</details>
 
-The full record, with per-zoom tile counts, the input-conversion cost, both
-tools' phase split, run-to-run variance, and the asymmetry list, is
-[`benchmarks/e2e/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md).
-The method and the settings-parity mapping are in
-[`benchmarks/e2e/README.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/README.md).
-For a sharded build across machines, see [the Brazil tutorial](tutorials/brazil.md#2-split-the-same-build-into-shard-jobs).
+_Run: commit afb6b15, allocator: mimalloc, aarch64, CPU 0xd40, 64 CPUs, 2026-11-07._
+<!-- /bench -->
 
-## Reproduce
+`bounded` trades wall time for a lower peak. Use it when the input is larger than memory.
 
-- **The corpus table:** `./benchmarks/e2e/run_corpus.sh`, which writes
-  [`benchmarks/results/e2e-corpus.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/results/e2e-corpus.json).
-- **The at-scale run:** `benchmarks/showcase/showcase.py`; its
-  [README](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/showcase/README.md)
-  walks through picking a region, extracting it, and collecting the record.
-- **One build against another:** `benchmarks/run_manifest.py` times the
-  workloads in `benchmarks/manifest.toml` for two binaries, interleaved,
-  with a load gate. It records each output's sha256: equal hashes mean both
-  builds wrote the same bytes.
-- **The tables on this page:** copy a new record into `benchmarks/results/`,
-  then run `uv run python scripts/gen_bench_docs.py`. `--check` exits 1 if
-  any generated region is stale.
+## Measurement method
+
+<!-- bench:e2e-corpus/method -->
+- Host: Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39.
+- Rounds: 3.
+- Wall time: median of recorded rounds.
+- Warm cache: yes.
+- Allocator: mimalloc.
+- Inputs: pinned by sha256 in `e2e-corpus.json`.
+
+<details markdown><summary>Exact commands</summary>
+
+- New York City places (point):
+    - tylertoo: `'<repo>/target/release/tylertoo' tiles '<repo>/corpus/data/gpio/points-nyc-medium.parquet' '<work>/points-nyc-medium.tylertoo.pmtiles' --min-zoom 0 --max-zoom 14 --layer-name points-nyc-medium --tile-buffer 8 --max-compressed-tile-size 500000 --max-tile-size 0 --report '<work>/points-nyc-medium.tylertoo.report.json' --force`.
+    - tippecanoe tiling only: `'<repo>/.tools/tippecanoe-2.79.0/bin/tippecanoe' -o '<work>/points-nyc-medium.tippecanoe-fgb.pmtiles' -f -Z 0 -z 14 -l points-nyc-medium -b 8 --maximum-tile-bytes 500000 --drop-fraction-as-needed --quiet --drop-densest-as-needed --extend-zooms-if-still-dropping '<work>/points-nyc-medium.tippecanoe-input.fgb'`.
+    - GeoParquet to FlatGeobuf: `gpio convert flatgeobuf '<repo>/corpus/data/gpio/points-nyc-medium.parquet' '<work>/points-nyc-medium.gpio.fgb' --overwrite`.
+    - tylertoo with thinning off: `'<repo>/target/release/tylertoo' tiles '<repo>/corpus/data/gpio/points-nyc-medium.parquet' '<work>/points-nyc-medium.tylertoo-qm.pmtiles' --min-zoom 0 --max-zoom 14 --layer-name points-nyc-medium --tile-buffer 8 --max-compressed-tile-size 500000 --max-tile-size 0 --report '<work>/points-nyc-medium.tylertoo-qm.report.json' --force --verbatim --simplify-factor 1.0`.
+- Portland buildings (polygon):
+    - tylertoo: `'<repo>/target/release/tylertoo' tiles '<repo>/corpus/data/gpio/polygons-portland-medium.parquet' '<work>/polygons-portland-medium.tylertoo.pmtiles' --min-zoom 0 --max-zoom 14 --layer-name polygons-portland-medium --tile-buffer 8 --max-compressed-tile-size 500000 --max-tile-size 0 --report '<work>/polygons-portland-medium.tylertoo.report.json' --force`.
+    - tippecanoe tiling only: `'<repo>/.tools/tippecanoe-2.79.0/bin/tippecanoe' -o '<work>/polygons-portland-medium.tippecanoe-fgb.pmtiles' -f -Z 0 -z 14 -l polygons-portland-medium -b 8 --maximum-tile-bytes 500000 --drop-fraction-as-needed --quiet --simplification=10 --drop-densest-as-needed --coalesce-densest-as-needed '<work>/polygons-portland-medium.tippecanoe-input.fgb'`.
+    - GeoParquet to FlatGeobuf: `gpio convert flatgeobuf '<repo>/corpus/data/gpio/polygons-portland-medium.parquet' '<work>/polygons-portland-medium.gpio.fgb' --overwrite`.
+    - tylertoo with thinning off: `'<repo>/target/release/tylertoo' tiles '<repo>/corpus/data/gpio/polygons-portland-medium.parquet' '<work>/polygons-portland-medium.tylertoo-qm.pmtiles' --min-zoom 0 --max-zoom 14 --layer-name polygons-portland-medium --tile-buffer 8 --max-compressed-tile-size 500000 --max-tile-size 0 --report '<work>/polygons-portland-medium.tylertoo-qm.report.json' --force --verbatim --simplify-factor 1.0`.
+- Oregon roads (line):
+    - tylertoo: `'<repo>/target/release/tylertoo' tiles '<repo>/corpus/data/gpio/lines-oregon-large.parquet' '<work>/lines-oregon-large.tylertoo.pmtiles' --min-zoom 0 --max-zoom 14 --layer-name lines-oregon-large --tile-buffer 8 --max-compressed-tile-size 500000 --max-tile-size 0 --report '<work>/lines-oregon-large.tylertoo.report.json' --force`.
+    - tippecanoe tiling only: `'<repo>/.tools/tippecanoe-2.79.0/bin/tippecanoe' -o '<work>/lines-oregon-large.tippecanoe-fgb.pmtiles' -f -Z 0 -z 14 -l lines-oregon-large -b 8 --maximum-tile-bytes 500000 --drop-fraction-as-needed --quiet --simplification=10 --drop-densest-as-needed '<work>/lines-oregon-large.tippecanoe-input.fgb'`.
+    - GeoParquet to FlatGeobuf: `gpio convert flatgeobuf '<repo>/corpus/data/gpio/lines-oregon-large.parquet' '<work>/lines-oregon-large.gpio.fgb' --overwrite`.
+    - tylertoo with thinning off: `'<repo>/target/release/tylertoo' tiles '<repo>/corpus/data/gpio/lines-oregon-large.parquet' '<work>/lines-oregon-large.tylertoo-qm.pmtiles' --min-zoom 0 --max-zoom 14 --layer-name lines-oregon-large --tile-buffer 8 --max-compressed-tile-size 500000 --max-tile-size 0 --report '<work>/lines-oregon-large.tylertoo-qm.report.json' --force --verbatim --simplify-factor 1.0`.
+- Moldova parcels (polygon, dense):
+    - tylertoo: `'<repo>/target/release/tylertoo' tiles '<repo>/corpus/data/gpio/polygons-ftw-moldova-large.parquet' '<work>/polygons-ftw-moldova-large.tylertoo.pmtiles' --min-zoom 0 --max-zoom 14 --layer-name polygons-ftw-moldova-large --tile-buffer 8 --max-compressed-tile-size 500000 --max-tile-size 0 --report '<work>/polygons-ftw-moldova-large.tylertoo.report.json' --force`.
+    - tippecanoe tiling only: `'<repo>/.tools/tippecanoe-2.79.0/bin/tippecanoe' -o '<work>/polygons-ftw-moldova-large.tippecanoe-fgb.pmtiles' -f -Z 0 -z 14 -l polygons-ftw-moldova-large -b 8 --maximum-tile-bytes 500000 --drop-fraction-as-needed --quiet --simplification=10 --drop-densest-as-needed --coalesce-densest-as-needed '<work>/polygons-ftw-moldova-large.tippecanoe-input.fgb'`.
+    - GeoParquet to FlatGeobuf: `gpio convert flatgeobuf '<repo>/corpus/data/gpio/polygons-ftw-moldova-large.parquet' '<work>/polygons-ftw-moldova-large.gpio.fgb' --overwrite`.
+    - tylertoo with thinning off: `'<repo>/target/release/tylertoo' tiles '<repo>/corpus/data/gpio/polygons-ftw-moldova-large.parquet' '<work>/polygons-ftw-moldova-large.tylertoo-qm.pmtiles' --min-zoom 0 --max-zoom 14 --layer-name polygons-ftw-moldova-large --tile-buffer 8 --max-compressed-tile-size 500000 --max-tile-size 0 --report '<work>/polygons-ftw-moldova-large.tylertoo-qm.report.json' --force --verbatim --simplify-factor 1.0`.
+
+</details>
+
+_Run: commit ae0363f, tippecanoe v2.79.0, gpio 1.7.0, allocator: mimalloc, Neoverse-V1, 124 GB RAM, Linux-7.0.0-1014-aws-aarch64-with-glibc2.39, 2026-11-06._
+<!-- /bench -->
+
+See the [benchmark method](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/README.md) and [recorded results](https://github.com/geoparquet-io/tylertoo/tree/main/benchmarks/results).
+
+Reproduce: `benchmarks/release.sh`
+
+For sharded builds, follow the [Brazil tutorial's sharding step](tutorials/brazil.md#2-split-the-same-build-into-shard-jobs).

@@ -1,0 +1,253 @@
+{
+  "provenance": {
+    "commit": "abc1234",
+    "tylertoo_version": "tylertoo 0.9.0",
+    "host": "Test host",
+    "nproc": 4,
+    "kernel": "test",
+    "allocator": "mimalloc",
+    "tool_versions": {
+      "tippecanoe": "test-tip",
+      "gpio": "test-gpio"
+    },
+    "inputs": [],
+    "date": "2026-11-01T12:00:00Z"
+  },
+  "settings": {
+    "repeat": 3,
+    "warm_cache": true
+  },
+  "datasets": {
+    "a": {
+      "tylertoo": {
+        "wall_median_s": 1,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      },
+      "tippecanoe_e2e": {
+        "wall_median_s": 10,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      },
+      "tippecanoe_fgb": {
+        "wall_median_s": 9,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      },
+      "tylertoo_quality_matched": {
+        "wall_median_s": 2,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      },
+      "convert_fgb": {
+        "wall_median_s": 1,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      }
+    },
+    "b": {
+      "tylertoo": {
+        "wall_median_s": 1,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      },
+      "tippecanoe_e2e": {
+        "wall_median_s": 40,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      },
+      "tippecanoe_fgb": {
+        "wall_median_s": 39,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      },
+      "tylertoo_quality_matched": {
+        "wall_median_s": 2,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      },
+      "convert_fgb": {
+        "wall_median_s": 1,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      }
+    },
+    "different-zoom": {
+      "tylertoo": {
+        "wall_median_s": 1,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      },
+      "tippecanoe_e2e": {
+        "wall_median_s": 100,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      },
+      "tippecanoe_fgb": {
+        "wall_median_s": 99,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "3": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      },
+      "tylertoo_quality_matched": {
+        "wall_median_s": 2,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      },
+      "convert_fgb": {
+        "wall_median_s": 1,
+        "peak_rss_bytes": 1048576,
+        "output_bytes": 1024,
+        "per_zoom": {
+          "by_zoom": {
+            "2": {
+              "tiles": 1
+            }
+          }
+        },
+        "phases": {
+          "input_features": 10
+        }
+      }
+    }
+  }
+}

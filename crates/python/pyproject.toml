@@ -70,8 +70,6 @@ dev = [
 docs = [
     "zensical==0.0.68; python_version >= '3.11'",
     "geoparquet-io==1.7.0; python_version >= '3.11'",
-    "duckdb==1.5.6; python_version >= '3.11'",
-    "duckdb-cli==1.5.6; python_version >= '3.11'",
 ]
 
 [tool.maturin]

@@ -5,7 +5,7 @@
 The map shows step 1's archive for the whole country, read from
 [Source Cooperative](https://source.coop/nlebovits/tylertoo-brazil-demo)
 with HTTP range requests. It opens on all of Brazil, with A5 cells colored
-by `point_count` through z7. Zoom past z8 to see the field polygons, and
+by `point_count` through z7. Zoom to z8 or closer to see the field polygons, and
 click a feature to see its properties.
 
 <div id="brazil-map" class="tutorial-map" role="region" aria-label="Map of brazil.pmtiles"></div>

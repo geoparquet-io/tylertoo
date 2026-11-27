@@ -305,8 +305,9 @@ holes at coarse and middle zooms. The density budget thinned every kind,
 so `fieldmaps-madagascar-adm4` kept 865 of 17,465 polygons at z8 (#572),
 and a tile over the size cap dropped its smallest features in one pass
 without measuring the tile again (#246). The measurements and harness are in
-`benchmarks/coalesce/` (`RESULTS.md` has the tables; `run_matrix.py`,
-`tile_metrics.py`, and `render_coverage.py` reproduce them).
+`benchmarks/coalesce/` (`run_matrix.py`, `tile_metrics.py`, and
+`render_coverage.py` reproduce them); the tables are in
+[the archived coalesce investigation](../context/archive/bench/coalesce-RESULTS.md).
 
 The comparison covered three convert settings and, initially, four ways to
 handle an oversized tile:
@@ -381,8 +382,8 @@ The measurements showed the following:
   0.03–0.05% at the default and 0.01–0.02% at factor 0, so residual
   missing coverage with the fill on adm4 is 0.01–0.05%. Without the fill
   the loss includes placeholder-square gaps (#750). Archive 26.9 MB default,
-  29.3 MB at factor 0.25, 33.5 MB at factor 0. The old tuning-page table is no longer maintained; commands are in
-  `benchmarks/coalesce/RESULTS.md`.
+  29.3 MB at factor 0.25, 33.5 MB at factor 0. Commands are in
+  [the archived coalesce investigation](../context/archive/bench/coalesce-RESULTS.md).
 - `--polygon-visibility 0` once kept placeholder squares alive at every
   coarse cascade level (#749), drawing small features as very large
   squares. The cascade now dithers on canonical polygon parts, retaining

@@ -1,14 +1,16 @@
+Frozen history, moved from `benchmarks/coalesce/RESULTS.md` on 2026-11-27; not maintained.
+
 # Benchmark results for #745: complete tiles at coarse and middle zooms
 
 These benchmarks compare the new defaults (density budget on points only, placeholder squares,
 and merging oversized tiles) with the defaults before #745 for speed, memory use, and coverage.
 For the resulting decision, see
-[`corpus/SWEEPS.md` Decision 8](../../corpus/SWEEPS.md).
+[`corpus/SWEEPS.md` Decision 8](../../../corpus/SWEEPS.md).
 
 This file records the #745 investigation and measurements from builds made
 during that work. To rerun the measurements on the current binary, use
-`run.py` as described in the [benchmark instructions](README.md). You can find
-the current numbers in the [baseline reports](baseline/). The `README.md`
+`run.py` as described in the [benchmark instructions](../../../benchmarks/coalesce/README.md). You can find
+the current numbers in the [baseline reports](../../../benchmarks/coalesce/baseline/). The `README.md`
 comparison describes how those numbers differ from these measurements.
 These historical runs predate #883's buffer 5 and automatic line-only
 max-zoom simplification; see `corpus/SWEEPS.md`, Decision 12, for those defaults.

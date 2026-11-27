@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -561,7 +562,8 @@ def test_tippecanoe_key_includes_the_gpio_pin():
 
 
 def test_tippecanoe_pin_comes_from_the_setup_script():
-    assert run.tippecanoe_pin() == "68ab8dcc229f95b8b25877697d5e8d66783af503"
+    setup = (Path(__file__).resolve().parents[1] / "e2e/setup_tippecanoe.sh").read_text()
+    assert run.tippecanoe_pin() == re.search(r'^DEFAULT_SHA="([0-9a-f]{40})"$', setup, re.M)[1]
 
 
 def test_tippecanoe_failure_from_gnu_time_stderr():
