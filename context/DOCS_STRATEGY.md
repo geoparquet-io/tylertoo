@@ -48,6 +48,23 @@ memory preflight message prints the calculation for the user's data from the
 constants, and the tuning page explains the remedies in words only. The other
 rows follow their recommendation unless the maintainer says otherwise.
 
+**Instructions in messages and help strings must be checked by code.** The
+maintainer's condition for row 8, and the rule for every message or help
+string this overhaul touches:
+
+- No number is typed into a message. Each one is formatted from the constant
+  or the function that makes the decision, so the preflight message and the
+  preflight verdict share one owner.
+- A unit test renders the memory preflight message for sample inputs, parses
+  the numbers back out, and asserts they equal the computed estimate and the
+  constants.
+- A test in `crates/cli` renders the message and asserts that every `--flag`
+  it names exists in clap, on a command where the advice applies.
+- The widened link test (section 3) resolves the message's URL to a real page
+  and anchor.
+- The same three checks (numbers from constants, flags exist, links resolve)
+  apply to the help strings sections 4 and 5 edit.
+
 | # | Section | Decision | Recommendation |
 |---|---|---|---|
 | 1 | Tutorials | The new prepared Madagascar fixture must be attached to the `fixtures-v1` GitHub release (or a new fixtures release) before the PR's CI can pass. | Attach to `fixtures-v1`. |
