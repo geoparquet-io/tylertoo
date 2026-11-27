@@ -81,7 +81,7 @@ if has africa; then
   echo 'Preflight: benchmarks/showcase/showcase.py check-pins'
 fi
 if has upload; then
-  echo 'Preflight: aws s3 ls s3://nlebovits/tylertoo-benchmarks/ --profile source-coop; on failure run `source-coop login`'
+  echo 'Preflight: aws s3 ls s3://nlebovits/ --profile source-coop; on failure run `source-coop login`'
 fi
 if (( ! DRY )); then
   mkdir -p "$DATA"
@@ -99,7 +99,8 @@ if (( ! DRY )); then
     "${PY[@]}" benchmarks/showcase/showcase.py check-pins
   fi
   if has upload; then
-    aws s3 ls s3://nlebovits/tylertoo-benchmarks/ --profile source-coop || { echo 'run `source-coop login`' >&2; exit 1; }
+    # List the bucket, not the benchmarks prefix: an empty prefix exits 1 even with valid credentials.
+    aws s3 ls s3://nlebovits/ --profile source-coop >/dev/null || { echo 'run `source-coop login`' >&2; exit 1; }
   fi
   mkdir -p "$OUT/bin" "$OUT/tmp"
   export TMPDIR="$OUT/tmp"
