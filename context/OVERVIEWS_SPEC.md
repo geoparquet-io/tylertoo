@@ -29,6 +29,11 @@ not opt in is unaffected, and a file that does opt in remains a valid
 baseline overview file for readers that ignore the extension columns
 and metadata (§3.8).
 
+Overviews can also travel as a tile archive: §14 specifies a PMTiles
+archive embedded in a GeoParquet file under its own footer key,
+`geo:pmtiles`. It is independent of the row layout: a file may carry
+overview rows, an embedded archive, both, or neither.
+
 The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, MAY, and
 OPTIONAL are to be interpreted as in RFC 2119. Sections and blocks
 labeled **(informative)** carry no conformance requirements; RFC 2119
@@ -1307,7 +1312,84 @@ requirements of this spec.
 
 ---
 
-## 14. Changelog
+## 14. Embedded tile archive (`geo:pmtiles`)
+
+Overviews stored as rows (§2 to §13) can be queried; overviews stored
+as vector tiles are what a map renderer reads with the fewest bytes.
+This section lets one GeoParquet file carry both: its rows, unchanged,
+and a PMTiles v3 archive of the same data, embedded in the file. The
+convention has its own version, independent of the `geo:overviews`
+version (§3.8): this text specifies `geo:pmtiles` `0.1.0`.
+
+### 14.1 Layout (normative)
+
+```text
+PAR1 | row groups, page indexes | PMTiles v3 archive | FileMetaData | footer length | PAR1
+```
+
+- The archive MUST lie between the last byte any `FileMetaData` offset
+  addresses and the start of the footer. No offset of the original file
+  moves: a reader that follows the footer reads the GeoParquet file as
+  if the archive were absent.
+- The archive is a complete PMTiles v3 archive, copied byte for byte.
+  PMTiles offsets are relative to the archive's first byte, so a reader
+  reads byte `n` of the archive at file offset `offset + n`.
+- The file MUST remain valid GeoParquet: its `geo` metadata is
+  unchanged.
+
+### 14.2 Footer entry (normative)
+
+The footer's `key_value_metadata` MUST hold one entry with key
+`geo:pmtiles` whose value is a JSON object:
+
+| Member | Type | Meaning |
+|---|---|---|
+| `spec` | string | The version of this convention, `"0.1.0"`. |
+| `offset` | integer | The archive's first byte, from the start of the file. |
+| `length` | integer | The archive's size in bytes. |
+
+The entry SHOULD be the last entry of `key_value_metadata`, so a reader
+can find it in one read of the file's last few kilobytes without
+decoding the whole footer. The archive's own header already records the
+PMTiles version, tile type and compression; the entry MUST NOT repeat
+them.
+
+A writer SHOULD rewrite only `key_value_metadata` and copy every other
+footer byte, so removing the archive and the entry gives back the
+original file byte for byte.
+
+### 14.3 Reader validation (normative)
+
+A reader MUST use the archive only when all of these hold, and MUST
+otherwise treat the file as carrying no archive:
+
+1. `offset >= 4` and `offset + length` is at most the footer's first
+   byte.
+2. The archive's first 127 bytes are a PMTiles v3 header.
+3. Every section the header declares (root directory, metadata, leaf
+   directories, tile data) ends within `length`.
+
+A tool that rewrites a file's data while copying its footer metadata
+(a common behavior of Parquet libraries) carries `geo:pmtiles` into a
+file whose offset no longer addresses an archive. These checks make
+such a stale entry harmless. A writer that bakes a new archive into a
+file with a stale entry MUST replace the entry.
+
+### 14.4 Implementation note (informative)
+
+`tylertoo bake` writes and `tylertoo bake --strip` removes an embedded
+archive; `tylertoo tiles --bake PATH` writes a baked copy of its input
+next to the archive. Every tylertoo command that reads PMTiles
+(`stats`, `decode`, `merge`, `serve`) reads a baked file like the
+archive it carries; `serve` serves the embedded range as
+`/{name}.pmtiles`.
+
+## 15. Changelog
+
+- **Unreleased**: added the embedded tile archive (§14, `geo:pmtiles`
+  `0.1.0`). It is a separate footer key with its own version; files
+  without it are unchanged, and the `geo:overviews` version is
+  unchanged.
 
 - **Unreleased (additive, informative)**: `generalization.zoom_ceiling`
   marks a partial file (§3.5), and `coalescing.merged` records whether

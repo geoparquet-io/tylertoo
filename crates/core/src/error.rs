@@ -57,6 +57,7 @@ pub fn kind_of(e: &(dyn StdError + 'static)) -> Option<ErrorKind> {
         crate::overview::export::ExportError,
         crate::overview::tiles::TilesError,
         crate::decode::DecodeError,
+        crate::baked::BakeError,
         crate::input::InputError,
         crate::overview::convert::ClassRankingError,
         crate::pyramid::BandSpecError,

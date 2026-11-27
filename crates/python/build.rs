@@ -21,12 +21,16 @@ fn main() {
         "validate",
         "stats",
         "serve",
+        "bake",
+        "strip",
     ] {
         let mut defaults = command_defaults(name);
         let positional = match name {
             "validate" => "file",
             "stats" | "serve" => "archive",
             "pyramid" => "bands, output",
+            "bake" => "geoparquet, archive, output",
+            "strip" => "baked, output",
             _ => "input, output",
         };
         let mut signature = format!("({positional}");
@@ -53,6 +57,10 @@ fn main() {
             "archive, **kwargs"
         } else if name == "pyramid" {
             "bands, output, **kwargs"
+        } else if name == "bake" {
+            "geoparquet, archive, output"
+        } else if name == "strip" {
+            "baked, output"
         } else {
             "input, output, **kwargs"
         };

@@ -1,0 +1,23 @@
+Remove the archive baked into a GeoParquet file.
+
+Writes the bytes before the archive, then the footer without its
+`geo:pmtiles` entry: for a file `bake()` wrote, the original file. The
+output is overwritten if it exists.
+
+Args:
+    baked: GeoParquet file that holds a baked archive.
+    output: GeoParquet file to write.
+
+Returns:
+    Where the archive sat (`offset`, `length`), and the output's size.
+
+Raises:
+    ValueError: The file holds no baked archive, or its `geo:pmtiles`
+        entry does not point at one.
+    RuntimeError: Reading or writing failed.
+
+Example:
+    >>> _ = bake("buildings.parquet", "buildings.pmtiles", "baked.parquet")
+    >>> report = strip("baked.parquet", "plain.parquet")
+    >>> open("plain.parquet", "rb").read() == open("buildings.parquet", "rb").read()
+    True

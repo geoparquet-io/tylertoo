@@ -30,6 +30,7 @@ Exit status:
 | [`validate`](#tylertoo-validate) | Check a GeoParquet overview file against the overviews spec |
 | [`export-pmtiles`](#tylertoo-export-pmtiles) | Export a PMTiles archive from an overview GeoParquet file |
 | [`decode`](#tylertoo-decode) | Decode a PMTiles vector-tile archive back to GeoParquet |
+| [`bake`](#tylertoo-bake) | Bake a PMTiles archive into a GeoParquet file, or strip it back out |
 | [`stats`](#tylertoo-stats) | Report per-zoom tile sizes and optional per-layer stats for a PMTiles archive |
 | [`pyramid`](#tylertoo-pyramid) | Build one archive from several inputs, each owning a zoom range |
 | [`merge`](#tylertoo-merge) | Combine PMTiles archives that hold disjoint tiles into one |
@@ -92,6 +93,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 | `--layer-name <LAYER_NAME>` | Layer name for the tiles. Defaults to the input's file stem. |
 | `--layer-column <COLUMN>` | Put each feature in the layer named by its value in COLUMN, and null or blank values in `_unknown`. The column is not written as a property. Each layer has its own overview. The size caps apply to the joined tile, with one size valve across source layers. Tiles still over a cap are kept with a warning and counted in the report. |
 | `--keep-overview <PATH>` | Save the intermediate overview GeoParquet to PATH after export. Does not change the PMTiles output. |
+| `--bake <PATH>` | Also write a copy of the input GeoParquet with the PMTiles archive baked in to PATH. Parquet readers see the original file; `serve`, `stats` and `decode` read the tiles. Needs a single local input file. |
 | `--temp-compression <CODEC>` | Compression of the temporary intermediate overview: `lz4` takes 5-7% less CPU, `zstd` writes a file about a third smaller, for a host short of temp disk or on a slow disk. No effect with --keep-overview, whose file is always ZSTD. Does not change the PMTiles output. Default: `lz4`. Possible values: `lz4`, `zstd`. |
 
 ### Generalization
@@ -265,6 +267,31 @@ A source property named `zoom`, `layer`, `mvt_id`, or `geometry` is an error.
 | `--max-zoom <MAX_ZOOM>` | Maximum zoom level to decode. |
 | `--layer <NAME>` | Only decode features from this MVT layer. |
 | `--report <PATH>` | Write the JSON decode report to this path. |
+| `-f`, `--force` | Overwrite the output if it exists. |
+
+## `tylertoo bake`
+
+Bake a PMTiles archive into a GeoParquet file, or strip it back out.
+
+The archive goes between the data and the footer, and the footer gains a `geo:pmtiles` entry that points at it. Parquet readers see the original GeoParquet; `serve`, `stats`, `decode` and `merge` read the tiles. `--strip` gives back the original file, byte for byte.
+
+```text
+tylertoo bake [OPTIONS] --output <OUTPUT> <GEOPARQUET> [ARCHIVE]
+```
+
+### Arguments
+
+| Argument | Description |
+| --- | --- |
+| `<GEOPARQUET>` | GeoParquet file to bake the archive into, or with `--strip`, a baked file. |
+| `<ARCHIVE>` | PMTiles archive to bake. Omit it with `--strip`. |
+
+### Options
+
+| Option | Description |
+| --- | --- |
+| `-o`, `--output <OUTPUT>` | Output GeoParquet file. |
+| `--strip` | Remove the baked archive instead, giving back the original file. |
 | `-f`, `--force` | Overwrite the output if it exists. |
 
 ## `tylertoo stats`

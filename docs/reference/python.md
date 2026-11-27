@@ -444,6 +444,79 @@ Writes one row per feature per tile: the tiled representation, so features are s
 (['overview'], (10, 10))
 ```
 
+## `bake`
+
+```python
+bake(
+    geoparquet: str,
+    archive: str,
+    output: str,
+) -> BakeReport
+```
+
+Bake a PMTiles archive into a copy of a GeoParquet file.
+
+The archive goes between the data and the footer, and the footer gains a `geo:pmtiles` entry that points at it. Nothing before the archive moves, so Parquet readers (DuckDB, GDAL, `pyarrow`) see the original GeoParquet, while `stats()`, `decode()`, and `serve()` read the tiles. `strip()` gives back the original file. The output is overwritten if it exists.
+
+### Parameters
+
+* `geoparquet`: GeoParquet file to copy.
+* `archive`: PMTiles archive to bake in.
+* `output`: GeoParquet file to write.
+
+### Returns
+
+[`BakeReport`](#bakereport): Where the archive sits in the output (`offset`, `length`), and the output's size.
+
+### Raises
+
+* `ValueError`: Not a GeoParquet file, or a file that already holds a baked archive.
+* `RuntimeError`: Not a PMTiles archive, or reading or writing failed.
+
+### Example
+
+```python
+>>> report = bake("buildings.parquet", "buildings.pmtiles", "baked.parquet")
+>>> report["archive"]["offset"] > 0
+True
+```
+
+## `strip`
+
+```python
+strip(
+    baked: str,
+    output: str,
+) -> BakeReport
+```
+
+Remove the archive baked into a GeoParquet file.
+
+Writes the bytes before the archive, then the footer without its `geo:pmtiles` entry: for a file `bake()` wrote, the original file. The output is overwritten if it exists.
+
+### Parameters
+
+* `baked`: GeoParquet file that holds a baked archive.
+* `output`: GeoParquet file to write.
+
+### Returns
+
+[`BakeReport`](#bakereport): Where the archive sat (`offset`, `length`), and the output's size.
+
+### Raises
+
+* `ValueError`: The file holds no baked archive, or its `geo:pmtiles` entry does not point at one.
+* `RuntimeError`: Reading or writing failed.
+
+### Example
+
+```python
+>>> _ = bake("buildings.parquet", "buildings.pmtiles", "baked.parquet")
+>>> report = strip("baked.parquet", "plain.parquet")
+>>> open("plain.parquet", "rb").read() == open("buildings.parquet", "rb").read()
+True
+```
+
 ## `validate`
 
 ```python
@@ -599,6 +672,7 @@ convert(
     partition_wave: int = 0,
     feature_id: str | None = None,
     keep_overview: str | os.PathLike[str] | None = None,
+    bake: str | os.PathLike[str] | None = None,
     temp_compression: Literal['lz4', 'zstd'] = "lz4",
     tile_range: str | None = None,
     gsd_base: float = 1024.0,
@@ -692,6 +766,7 @@ Runs the same core facade as `tylertoo tiles`, with the same options and default
 * `partition_wave`: See `export_pmtiles()`.
 * `feature_id`: See `export_pmtiles()`.
 * `keep_overview`: Keep the intermediate overview file at this path instead of removing it. Its directory must exist.
+* `bake`: Also write a copy of the input with the archive baked in at this path (see `bake()`). Needs a single local input file.
 * `temp_compression`: Compression of the temporary intermediate overview, `"lz4"` (default) or `"zstd"`. `"zstd"` writes a file about a third smaller for 5-7% more CPU. No effect with `keep_overview`, whose file is always ZSTD.
 * `tile_range`: See `export_pmtiles()`.
 * `gsd_base`: See `overview()`.
@@ -1081,6 +1156,32 @@ class DecodeReport(TypedDict):
 * `layers`: MVT layers read, after the layer filter, sorted.
 * `zoom_range`: Coarsest and finest zoom written, or `None` when no feature matched the filters.
 * `elapsed_secs`: Wall-clock seconds.
+
+### `BakeReport`
+
+What `bake()` or `strip()` wrote.
+
+```python
+class BakeReport(TypedDict):
+    archive: BakedArchive
+    output_bytes: int
+```
+
+* `archive`: The archive baked in, or removed.
+* `output_bytes`: The output file's size in bytes.
+
+### `BakedArchive`
+
+Where a baked archive sits in its GeoParquet file.
+
+```python
+class BakedArchive(TypedDict):
+    offset: int
+    length: int
+```
+
+* `offset`: The archive's first byte, from the start of the file.
+* `length`: The archive's size in bytes.
 
 ### `ValidationReport`
 

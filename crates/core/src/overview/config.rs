@@ -270,6 +270,29 @@ pub enum ConfigError {
     /// write.
     #[error("--plan-only requires --save-plan: the plan is the run's only output")]
     PlanOnlyWithoutSavePlan,
+    /// `--bake` was given an input that is not one local file.
+    #[error(
+        "--bake copies the input file, so it needs a single local GeoParquet file; {} is not \
+         one. Tile it, then run `tylertoo bake` on a local copy",
+        input.display()
+    )]
+    #[non_exhaustive]
+    BakeNeedsLocalFile {
+        /// The input.
+        input: PathBuf,
+    },
+    /// `--bake` would overwrite the input or the archive.
+    #[error("--bake {} would overwrite the input or the archive; name another file", path.display())]
+    #[non_exhaustive]
+    BakeOverwritesInput {
+        /// The bake target.
+        path: PathBuf,
+    },
+    /// `--bake` on a shard job: a shard's archive holds part of the tiles.
+    #[error(
+        "--bake needs the whole archive; bake the merged archive with `tylertoo bake` instead"
+    )]
+    BakeSharded,
     /// `--keep-overview` names a directory that does not exist (#433).
     #[error("--keep-overview directory {} does not exist", dir.display())]
     #[non_exhaustive]

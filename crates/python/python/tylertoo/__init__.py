@@ -27,6 +27,7 @@ from typing import Any, Literal, TypedDict
 from tylertoo import _tylertoo
 
 from ._tylertoo import (
+    bake,
     convert,
     decode,
     export_pmtiles,
@@ -34,10 +35,13 @@ from ._tylertoo import (
     pyramid,
     serve,
     stats,
+    strip,
     validate,
 )
 
 __all__ = [
+    "BakeReport",
+    "BakedArchive",
     "ConfigError",
     "ConvertReport",
     "DecodeReport",
@@ -60,6 +64,7 @@ __all__ = [
     "ValidationReport",
     "VariableDepthReport",
     "ZoomReport",
+    "bake",
     "convert",
     "decode",
     "export_pmtiles",
@@ -67,6 +72,7 @@ __all__ = [
     "pyramid",
     "serve",
     "stats",
+    "strip",
     "validate",
 ]
 
@@ -523,6 +529,34 @@ Attributes:
     elapsed_secs: Wall-clock seconds."""
 
 
+BakedArchive = TypedDict(  # noqa: UP013 - keys describe serialized report data
+    "BakedArchive",
+    {
+        "offset": "int",
+        "length": "int",
+    },
+)
+BakedArchive.__doc__ = """Where a baked archive sits in its GeoParquet file.
+
+Attributes:
+    offset: The archive's first byte, from the start of the file.
+    length: The archive's size in bytes."""
+
+
+BakeReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
+    "BakeReport",
+    {
+        "archive": "BakedArchive",
+        "output_bytes": "int",
+    },
+)
+BakeReport.__doc__ = """What `bake()` or `strip()` wrote.
+
+Attributes:
+    archive: The archive baked in, or removed.
+    output_bytes: The output file's size in bytes."""
+
+
 ValidationCheck = TypedDict(  # noqa: UP013 - keys describe serialized report data
     "ValidationCheck",
     {
@@ -565,12 +599,14 @@ _defaults = _tylertoo._defaults
 __test__ = {
     function.__name__: function.__doc__ or ""
     for function in (
+        bake,
         convert,
         decode,
         export_pmtiles,
         overview,
         pyramid,
         stats,
+        strip,
         validate,
     )
 }

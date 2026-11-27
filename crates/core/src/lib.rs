@@ -108,6 +108,7 @@ mod vector_tile {
 
 mod archive_index;
 mod atomic_output;
+mod baked;
 mod batch_processor;
 mod box_pairs;
 mod clip;
@@ -201,6 +202,9 @@ pub use decode::{decode_pmtiles, DecodeError, DecodeOptions, DecodeReport};
 // Shared: option validation, diagnostics, errors and their classifier.
 pub use archive_index::ArchiveError;
 pub use atomic_output::OutputNotWritable;
+pub use baked::{
+    bake, locate_baked, strip, BakeError, BakeReport, BakedArchive, BAKED_KEY, BAKED_SPEC,
+};
 pub use compression::Compression;
 pub use diagnostics::{
     AccountingError, CoveringWarning, CrsWarning, Diagnostic, PolygonRepairKind, RangeContext,

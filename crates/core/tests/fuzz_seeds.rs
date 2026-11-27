@@ -146,6 +146,15 @@ fn archive_index_seeds() {
 }
 
 #[test]
+fn baked_footer_seeds() {
+    replay(
+        "baked_footer",
+        &[],
+        tylertoo_core::internal::fuzz::fuzz_baked_footer,
+    );
+}
+
+#[test]
 fn layer_zooms_seeds() {
     replay(
         "layer_zooms",

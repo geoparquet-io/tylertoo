@@ -115,6 +115,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "baked_footer"
+path = "fuzz_targets/baked_footer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "overview_file"
 path = "fuzz_targets/overview_file.rs"
 test = false

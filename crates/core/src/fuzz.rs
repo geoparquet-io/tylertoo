@@ -150,3 +150,39 @@ pub fn fuzz_cli_args(s: &str) {
     let _ = crate::overview::export::FeatureOrder::from_str(s);
     let _ = crate::input::url_scheme(s);
 }
+
+/// `thrift` as the footer of a GeoParquet file `bake`, `strip` or an
+/// archive reader opens: [`tylertoo_io::footer_key_values`], then a
+/// `geo:pmtiles` entry appended with [`tylertoo_io::FooterKeyValues::rewrite`].
+///
+/// Panics if a rewritten footer does not list the kept entries and the
+/// appended one, in order. Returns the entries read.
+///
+/// # Errors
+///
+/// The footer reader's refusal of a malformed footer.
+pub fn fuzz_baked_footer(thrift: &[u8]) -> Result<usize, tylertoo_io::Error> {
+    let Some(kv) = tylertoo_io::footer_key_values(thrift)? else {
+        return Ok(0);
+    };
+    let value = br#"{"spec":"0.1.0","offset":4,"length":127}"#;
+    let out = kv.rewrite(
+        thrift,
+        |e| e.key != crate::baked::BAKED_KEY,
+        &[(crate::baked::BAKED_KEY, value)],
+    );
+    let back = tylertoo_io::footer_key_values(&out)
+        .expect("a rewritten footer reads back")
+        .expect("a rewritten footer keeps its key-value field");
+    let want: Vec<&str> = kv
+        .entries
+        .iter()
+        .map(|e| e.key.as_str())
+        .filter(|k| *k != crate::baked::BAKED_KEY)
+        .chain([crate::baked::BAKED_KEY])
+        .collect();
+    let got: Vec<&str> = back.entries.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(got, want, "rewrite changed the entries");
+    assert_eq!(back.get(crate::baked::BAKED_KEY), Some(&value[..]));
+    Ok(kv.entries.len())
+}

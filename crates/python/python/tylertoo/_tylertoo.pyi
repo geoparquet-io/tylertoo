@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from typing import Any, Literal, Protocol, overload
 
 from . import (
+    BakeReport,
     ConvertReport,
     DecodeReport,
     ExportReport,
@@ -29,6 +30,7 @@ __all__ = [
     "ConfigError",
     "_defaults",
     "_run_cli",
+    "bake",
     "convert",
     "decode",
     "export_pmtiles",
@@ -36,6 +38,7 @@ __all__ = [
     "pyramid",
     "serve",
     "stats",
+    "strip",
     "validate",
 ]
 
@@ -192,6 +195,8 @@ def decode(
     max_zoom: int | None = None,
     min_zoom: int | None = None,
 ) -> DecodeReport: ...
+def bake(geoparquet: str, archive: str, output: str) -> BakeReport: ...
+def strip(baked: str, output: str) -> BakeReport: ...
 def stats(
     archive: str,
     *,
@@ -221,6 +226,7 @@ def convert(
     accumulate_attributes: dict[str, Literal["sum", "max", "min", "mean"]]
     | None = None,
     attribution: str | None = None,
+    bake: str | os.PathLike[str] | None = None,
     bands: Sequence[str] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
     cascade: bool = True,
@@ -312,6 +318,7 @@ def convert(
     accumulate_attributes: dict[str, Literal["sum", "max", "min", "mean"]]
     | None = None,
     attribution: str | None = None,
+    bake: str | os.PathLike[str] | None = None,
     bands: Sequence[str] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
     cascade: bool = True,

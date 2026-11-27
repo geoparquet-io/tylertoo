@@ -100,6 +100,47 @@ impl core::marker::Unpin for tylertoo_core::ArchiveError
 impl core::marker::UnsafeUnpin for tylertoo_core::ArchiveError
 impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ArchiveError
 impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::ArchiveError
+#[non_exhaustive] pub enum tylertoo_core::BakeError
+#[non_exhaustive] pub tylertoo_core::BakeError::AlreadyBaked
+pub tylertoo_core::BakeError::AlreadyBaked::path: std::path::PathBuf
+pub tylertoo_core::BakeError::Archive(tylertoo_core::Error)
+#[non_exhaustive] pub tylertoo_core::BakeError::Footer
+pub tylertoo_core::BakeError::Footer::path: std::path::PathBuf
+pub tylertoo_core::BakeError::Footer::reason: alloc::string::String
+#[non_exhaustive] pub tylertoo_core::BakeError::Io
+pub tylertoo_core::BakeError::Io::error: core::io::error::Error
+pub tylertoo_core::BakeError::Io::path: std::path::PathBuf
+#[non_exhaustive] pub tylertoo_core::BakeError::NotBaked
+pub tylertoo_core::BakeError::NotBaked::path: std::path::PathBuf
+#[non_exhaustive] pub tylertoo_core::BakeError::NotGeoParquet
+pub tylertoo_core::BakeError::NotGeoParquet::path: std::path::PathBuf
+#[non_exhaustive] pub tylertoo_core::BakeError::NotParquet
+pub tylertoo_core::BakeError::NotParquet::path: std::path::PathBuf
+pub tylertoo_core::BakeError::Output(tylertoo_core::OutputNotWritable)
+#[non_exhaustive] pub tylertoo_core::BakeError::StaleEntry
+pub tylertoo_core::BakeError::StaleEntry::path: std::path::PathBuf
+pub tylertoo_core::BakeError::StaleEntry::reason: alloc::string::String
+impl core::convert::From<tylertoo_core::BakeError> for tylertoo_core::TilesError
+pub fn tylertoo_core::TilesError::from(tylertoo_core::BakeError) -> Self
+impl core::convert::From<tylertoo_core::Error> for tylertoo_core::BakeError
+pub fn tylertoo_core::BakeError::from(tylertoo_core::Error) -> Self
+impl core::convert::From<tylertoo_core::OutputNotWritable> for tylertoo_core::BakeError
+pub fn tylertoo_core::BakeError::from(tylertoo_core::OutputNotWritable) -> Self
+impl core::error::Error for tylertoo_core::BakeError
+pub fn tylertoo_core::BakeError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for tylertoo_core::BakeError
+pub fn tylertoo_core::BakeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::BakeError
+pub fn tylertoo_core::BakeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl tylertoo_core::Classify for tylertoo_core::BakeError
+pub fn tylertoo_core::BakeError::kind(&self) -> tylertoo_core::ErrorKind
+impl core::marker::Freeze for tylertoo_core::BakeError
+impl core::marker::Send for tylertoo_core::BakeError
+impl core::marker::Sync for tylertoo_core::BakeError
+impl core::marker::Unpin for tylertoo_core::BakeError
+impl core::marker::UnsafeUnpin for tylertoo_core::BakeError
+impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::BakeError
+impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::BakeError
 #[non_exhaustive] pub enum tylertoo_core::BandSpecError
 #[non_exhaustive] pub tylertoo_core::BandSpecError::BadMaxZoom
 pub tylertoo_core::BandSpecError::BadMaxZoom::spec: alloc::string::String
@@ -270,6 +311,11 @@ impl core::marker::UnsafeUnpin for tylertoo_core::Compression
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::Compression
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::Compression
 #[non_exhaustive] pub enum tylertoo_core::ConfigError
+#[non_exhaustive] pub tylertoo_core::ConfigError::BakeNeedsLocalFile
+pub tylertoo_core::ConfigError::BakeNeedsLocalFile::input: std::path::PathBuf
+#[non_exhaustive] pub tylertoo_core::ConfigError::BakeOverwritesInput
+pub tylertoo_core::ConfigError::BakeOverwritesInput::path: std::path::PathBuf
+pub tylertoo_core::ConfigError::BakeSharded
 #[non_exhaustive] pub tylertoo_core::ConfigError::BandWithZoomOption
 pub tylertoo_core::ConfigError::BandWithZoomOption::option: &'static str
 #[non_exhaustive] pub tylertoo_core::ConfigError::BandsOverlap
@@ -786,6 +832,8 @@ impl core::convert::From<tylertoo_core::AccountingError> for tylertoo_core::Erro
 pub fn tylertoo_core::Error::from(tylertoo_core::AccountingError) -> Self
 impl core::convert::From<tylertoo_core::ArchiveError> for tylertoo_core::Error
 pub fn tylertoo_core::Error::from(tylertoo_core::ArchiveError) -> Self
+impl core::convert::From<tylertoo_core::Error> for tylertoo_core::BakeError
+pub fn tylertoo_core::BakeError::from(tylertoo_core::Error) -> Self
 impl core::convert::From<tylertoo_core::Error> for tylertoo_core::ConvertError
 pub fn tylertoo_core::ConvertError::from(tylertoo_core::Error) -> Self
 impl core::convert::From<tylertoo_core::Error> for tylertoo_core::DecodeError
@@ -2041,6 +2089,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::TileType
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::TileType
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TileType
 #[non_exhaustive] pub enum tylertoo_core::TilesError
+pub tylertoo_core::TilesError::Bake(tylertoo_core::BakeError)
 #[non_exhaustive] pub tylertoo_core::TilesError::CellBand
 pub tylertoo_core::TilesError::CellBand::band: alloc::string::String
 pub tylertoo_core::TilesError::CellBand::source: alloc::boxed::Box<tylertoo_core::TilesError>
@@ -2059,6 +2108,8 @@ pub tylertoo_core::TilesError::LayerColumn(tylertoo_core::LayerColumnError)
 pub tylertoo_core::TilesError::Merge(tylertoo_core::PyramidError)
 pub tylertoo_core::TilesError::Output(tylertoo_core::OutputNotWritable)
 pub tylertoo_core::TilesError::Shard(tylertoo_core::ShardError)
+impl core::convert::From<tylertoo_core::BakeError> for tylertoo_core::TilesError
+pub fn tylertoo_core::TilesError::from(tylertoo_core::BakeError) -> Self
 impl core::convert::From<tylertoo_core::ConfigError> for tylertoo_core::TilesError
 pub fn tylertoo_core::TilesError::from(tylertoo_core::ConfigError) -> Self
 impl core::convert::From<tylertoo_core::LayerColumnError> for tylertoo_core::TilesError
@@ -2263,6 +2314,48 @@ impl core::marker::Unpin for tylertoo_core::AssignConfig
 impl core::marker::UnsafeUnpin for tylertoo_core::AssignConfig
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::AssignConfig
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::AssignConfig
+pub struct tylertoo_core::BakeReport
+pub tylertoo_core::BakeReport::archive: tylertoo_core::BakedArchive
+pub tylertoo_core::BakeReport::output_bytes: u64
+impl core::clone::Clone for tylertoo_core::BakeReport
+pub fn tylertoo_core::BakeReport::clone(&self) -> tylertoo_core::BakeReport
+impl core::cmp::Eq for tylertoo_core::BakeReport
+impl core::cmp::PartialEq for tylertoo_core::BakeReport
+pub fn tylertoo_core::BakeReport::eq(&self, &tylertoo_core::BakeReport) -> bool
+impl core::fmt::Debug for tylertoo_core::BakeReport
+pub fn tylertoo_core::BakeReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::BakeReport
+impl core::marker::StructuralPartialEq for tylertoo_core::BakeReport
+impl serde_core::ser::Serialize for tylertoo_core::BakeReport
+pub fn tylertoo_core::BakeReport::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for tylertoo_core::BakeReport
+impl core::marker::Send for tylertoo_core::BakeReport
+impl core::marker::Sync for tylertoo_core::BakeReport
+impl core::marker::Unpin for tylertoo_core::BakeReport
+impl core::marker::UnsafeUnpin for tylertoo_core::BakeReport
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::BakeReport
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::BakeReport
+pub struct tylertoo_core::BakedArchive
+pub tylertoo_core::BakedArchive::length: u64
+pub tylertoo_core::BakedArchive::offset: u64
+impl core::clone::Clone for tylertoo_core::BakedArchive
+pub fn tylertoo_core::BakedArchive::clone(&self) -> tylertoo_core::BakedArchive
+impl core::cmp::Eq for tylertoo_core::BakedArchive
+impl core::cmp::PartialEq for tylertoo_core::BakedArchive
+pub fn tylertoo_core::BakedArchive::eq(&self, &tylertoo_core::BakedArchive) -> bool
+impl core::fmt::Debug for tylertoo_core::BakedArchive
+pub fn tylertoo_core::BakedArchive::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::BakedArchive
+impl core::marker::StructuralPartialEq for tylertoo_core::BakedArchive
+impl serde_core::ser::Serialize for tylertoo_core::BakedArchive
+pub fn tylertoo_core::BakedArchive::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for tylertoo_core::BakedArchive
+impl core::marker::Send for tylertoo_core::BakedArchive
+impl core::marker::Sync for tylertoo_core::BakedArchive
+impl core::marker::Unpin for tylertoo_core::BakedArchive
+impl core::marker::UnsafeUnpin for tylertoo_core::BakedArchive
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::BakedArchive
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::BakedArchive
 #[non_exhaustive] pub struct tylertoo_core::Band
 pub tylertoo_core::Band::cells: core::option::Option<tylertoo_core::CellSystem>
 pub tylertoo_core::Band::input: std::path::PathBuf
@@ -2978,6 +3071,8 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::OutOfRangeExemplar
 #[non_exhaustive] pub struct tylertoo_core::OutputNotWritable
 pub tylertoo_core::OutputNotWritable::path: std::path::PathBuf
 pub tylertoo_core::OutputNotWritable::reason: alloc::string::String
+impl core::convert::From<tylertoo_core::OutputNotWritable> for tylertoo_core::BakeError
+pub fn tylertoo_core::BakeError::from(tylertoo_core::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::OutputNotWritable> for tylertoo_core::ConfigError
 pub fn tylertoo_core::ConfigError::from(tylertoo_core::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::OutputNotWritable> for tylertoo_core::ConvertError
@@ -3467,6 +3562,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::TileRange
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::TileRange
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TileRange
 #[non_exhaustive] pub struct tylertoo_core::TilesOptions
+pub tylertoo_core::TilesOptions::bake: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::TilesOptions::cell_bands: alloc::vec::Vec<tylertoo_core::CellBand>
 pub tylertoo_core::TilesOptions::convert: tylertoo_core::ConvertOptions
 pub tylertoo_core::TilesOptions::export: tylertoo_core::ExportOptions
@@ -3476,6 +3572,7 @@ pub tylertoo_core::TilesOptions::layer_name: core::option::Option<alloc::string:
 pub tylertoo_core::TilesOptions::shard: core::option::Option<tylertoo_core::TilesShard>
 pub tylertoo_core::TilesOptions::temp_compression: tylertoo_core::OverviewCodec
 impl tylertoo_core::TilesOptions
+pub fn tylertoo_core::TilesOptions::with_bake(self, core::option::Option<std::path::PathBuf>) -> Self
 pub fn tylertoo_core::TilesOptions::with_cell_bands(self, alloc::vec::Vec<tylertoo_core::CellBand>) -> Self
 pub fn tylertoo_core::TilesOptions::with_convert(self, tylertoo_core::ConvertOptions) -> Self
 pub fn tylertoo_core::TilesOptions::with_export(self, tylertoo_core::ExportOptions) -> Self
@@ -3649,11 +3746,15 @@ impl core::marker::Unpin for tylertoo_core::ZoomReport
 impl core::marker::UnsafeUnpin for tylertoo_core::ZoomReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::ZoomReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::ZoomReport
+pub const tylertoo_core::BAKED_KEY: &str
+pub const tylertoo_core::BAKED_SPEC: &str
 pub const tylertoo_core::USER_WARNING_LOG_TARGET: &str
 pub trait tylertoo_core::Classify
 pub fn tylertoo_core::Classify::kind(&self) -> tylertoo_core::ErrorKind
 impl tylertoo_core::Classify for tylertoo_core::ArchiveError
 pub fn tylertoo_core::ArchiveError::kind(&self) -> tylertoo_core::ErrorKind
+impl tylertoo_core::Classify for tylertoo_core::BakeError
+pub fn tylertoo_core::BakeError::kind(&self) -> tylertoo_core::ErrorKind
 impl tylertoo_core::Classify for tylertoo_core::BandSpecError
 pub fn tylertoo_core::BandSpecError::kind(&self) -> tylertoo_core::ErrorKind
 impl tylertoo_core::Classify for tylertoo_core::ClassRankingError
@@ -3678,13 +3779,16 @@ impl tylertoo_core::Classify for tylertoo_core::TilesError
 pub fn tylertoo_core::TilesError::kind(&self) -> tylertoo_core::ErrorKind
 impl tylertoo_core::Classify for tylertoo_core::WriteError
 pub fn tylertoo_core::WriteError::kind(&self) -> tylertoo_core::ErrorKind
+pub fn tylertoo_core::bake(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<tylertoo_core::BakeReport, tylertoo_core::BakeError>
 pub fn tylertoo_core::build_pyramid(&[tylertoo_core::Band], &std::path::Path, &tylertoo_core::PyramidOptions) -> core::result::Result<tylertoo_core::PyramidReport, tylertoo_core::PyramidError>
 pub fn tylertoo_core::convert_to_overviews(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::ConvertOptions) -> core::result::Result<tylertoo_core::ConvertReport, tylertoo_core::ConvertError>
 pub fn tylertoo_core::convert_to_pmtiles(&tylertoo_core::TilesInput, &std::path::Path, &tylertoo_core::TilesOptions) -> core::result::Result<tylertoo_core::TilesOutcome, tylertoo_core::TilesError>
 pub fn tylertoo_core::decode_pmtiles(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::DecodeOptions) -> core::result::Result<tylertoo_core::DecodeReport, tylertoo_core::DecodeError>
 pub fn tylertoo_core::export_pmtiles(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::ExportOptions) -> core::result::Result<tylertoo_core::ExportReport, tylertoo_core::ExportError>
+pub fn tylertoo_core::locate_baked(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<core::option::Option<tylertoo_core::BakedArchive>, tylertoo_core::BakeError>
 pub fn tylertoo_core::merge_bands(&[tylertoo_core::Band], &std::path::Path) -> core::result::Result<tylertoo_core::PyramidReport, tylertoo_core::PyramidError>
 pub fn tylertoo_core::merge_bands_with_options(&[tylertoo_core::Band], &std::path::Path, &tylertoo_core::BandMergeOptions) -> core::result::Result<tylertoo_core::PyramidReport, tylertoo_core::PyramidError>
+pub fn tylertoo_core::strip(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<tylertoo_core::BakeReport, tylertoo_core::BakeError>
 pub fn tylertoo_core::validate_file<P: core::convert::AsRef<std::path::Path>>(P) -> core::result::Result<tylertoo_core::ValidationReport, tylertoo_core::CheckError>
 pub fn tylertoo_core::write_convert_plan(impl core::convert::AsRef<std::path::Path>, &tylertoo_core::ConvertOptions) -> core::result::Result<tylertoo_core::PlanReport, tylertoo_core::ConvertError>
 pub fn tylertoo_core::write_plan(&tylertoo_core::TilesInput, &tylertoo_core::TilesOptions) -> core::result::Result<tylertoo_core::PlanReport, tylertoo_core::TilesError>

@@ -376,7 +376,7 @@ impl Server {
                 };
                 match ext {
                     "json" => json(&tilejson(a, host.unwrap_or("localhost"))),
-                    "pmtiles" => raw(&a.path, req),
+                    "pmtiles" => raw(&a.path, a.index.window(), req),
                     _ => status(404),
                 }
             }
@@ -571,9 +571,11 @@ fn tilejson(a: &Served, host: &str) -> serde_json::Value {
     tj
 }
 
-/// The archive file itself, honouring one `Range: bytes=` span, so a
-/// PMTiles client (pmtiles.io, the `pmtiles` JS library) can read it.
-fn raw(path: &Path, req: &Request) -> Response<Box<dyn Read + Send>> {
+/// The archive itself, honouring one `Range: bytes=` span, so a PMTiles
+/// client (pmtiles.io, the `pmtiles` JS library) can read it. `window` is
+/// where the archive sits in its file: the whole file for a PMTiles file,
+/// the baked range for a GeoParquet file carrying one.
+fn raw(path: &Path, window: (u64, u64), req: &Request) -> Response<Box<dyn Read + Send>> {
     let (file, version) = match File::open(path).and_then(|f| {
         let m = f.metadata()?;
         Ok((f, stamp(&m)))
@@ -581,7 +583,11 @@ fn raw(path: &Path, req: &Request) -> Response<Box<dyn Read + Send>> {
         Ok(v) => v,
         Err(e) => return error(&e),
     };
-    let len = version.0;
+    let (base, len) = window;
+    // A file rewritten since it was opened may no longer hold the window.
+    if base.saturating_add(len) > version.0 {
+        return status(503).with_header(header("Retry-After", "1"));
+    }
     let tag = etag(version);
     let get = |name| request_header(req, name);
     // A client holding offsets from an older version must not get bytes
@@ -605,7 +611,7 @@ fn raw(path: &Path, req: &Request) -> Response<Box<dyn Read + Send>> {
         file: file.take(n),
         version,
     };
-    if let Err(e) = reader.file.get_mut().seek(SeekFrom::Start(start)) {
+    if let Err(e) = reader.file.get_mut().seek(SeekFrom::Start(base + start)) {
         return error(&e);
     }
     let mut headers = vec![

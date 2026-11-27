@@ -97,6 +97,40 @@ impl<W> core::marker::Unpin for tylertoo_io::BatchWriter<W> where parquet::arrow
 impl<W> core::marker::UnsafeUnpin for tylertoo_io::BatchWriter<W> where parquet::arrow::arrow_writer::ArrowWriter<W>: core::marker::UnsafeUnpin
 impl<W> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::BatchWriter<W>
 impl<W> !core::panic::unwind_safe::UnwindSafe for tylertoo_io::BatchWriter<W>
+pub struct tylertoo_io::FooterKeyValue
+pub tylertoo_io::FooterKeyValue::key: alloc::string::String
+pub tylertoo_io::FooterKeyValue::value: core::option::Option<alloc::vec::Vec<u8>>
+impl core::clone::Clone for tylertoo_io::FooterKeyValue
+pub fn tylertoo_io::FooterKeyValue::clone(&self) -> tylertoo_io::FooterKeyValue
+impl core::cmp::Eq for tylertoo_io::FooterKeyValue
+impl core::cmp::PartialEq for tylertoo_io::FooterKeyValue
+pub fn tylertoo_io::FooterKeyValue::eq(&self, &tylertoo_io::FooterKeyValue) -> bool
+impl core::fmt::Debug for tylertoo_io::FooterKeyValue
+pub fn tylertoo_io::FooterKeyValue::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_io::FooterKeyValue
+impl core::marker::Freeze for tylertoo_io::FooterKeyValue
+impl core::marker::Send for tylertoo_io::FooterKeyValue
+impl core::marker::Sync for tylertoo_io::FooterKeyValue
+impl core::marker::Unpin for tylertoo_io::FooterKeyValue
+impl core::marker::UnsafeUnpin for tylertoo_io::FooterKeyValue
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::FooterKeyValue
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_io::FooterKeyValue
+pub struct tylertoo_io::FooterKeyValues
+pub tylertoo_io::FooterKeyValues::entries: alloc::vec::Vec<tylertoo_io::FooterKeyValue>
+impl tylertoo_io::FooterKeyValues
+pub fn tylertoo_io::FooterKeyValues::get(&self, &str) -> core::option::Option<&[u8]>
+pub fn tylertoo_io::FooterKeyValues::rewrite(&self, &[u8], impl core::ops::function::Fn(&tylertoo_io::FooterKeyValue) -> bool, &[(&str, &[u8])]) -> alloc::vec::Vec<u8>
+impl core::clone::Clone for tylertoo_io::FooterKeyValues
+pub fn tylertoo_io::FooterKeyValues::clone(&self) -> tylertoo_io::FooterKeyValues
+impl core::fmt::Debug for tylertoo_io::FooterKeyValues
+pub fn tylertoo_io::FooterKeyValues::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_io::FooterKeyValues
+impl core::marker::Send for tylertoo_io::FooterKeyValues
+impl core::marker::Sync for tylertoo_io::FooterKeyValues
+impl core::marker::Unpin for tylertoo_io::FooterKeyValues
+impl core::marker::UnsafeUnpin for tylertoo_io::FooterKeyValues
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::FooterKeyValues
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_io::FooterKeyValues
 pub struct tylertoo_io::IpcFileWriter<W: core::io::write::Write>(_)
 impl<W: core::io::write::Write> tylertoo_io::IpcFileWriter<W>
 pub fn tylertoo_io::IpcFileWriter<W>::finish(&mut self) -> core::result::Result<(), arrow_schema::error::ArrowError>
@@ -286,6 +320,7 @@ pub fn tylertoo_io::concat_prefix_rows<'a>(impl core::iter::traits::collect::Int
 pub fn tylertoo_io::decode_footer(&[u8]) -> core::result::Result<parquet::file::metadata::ParquetMetaData, parquet::errors::ParquetError>
 pub fn tylertoo_io::decoded_batch_limit() -> u64
 pub fn tylertoo_io::decoded_input_bytes(&parquet::file::metadata::ParquetMetaData, core::option::Option<&[usize]>, impl core::ops::function::Fn(usize) -> bool) -> u64
+pub fn tylertoo_io::footer_key_values(&[u8]) -> core::result::Result<core::option::Option<tylertoo_io::FooterKeyValues>, tylertoo_io::Error>
 pub fn tylertoo_io::input_error<'a>(&'a (dyn core::error::Error + 'static)) -> core::option::Option<&'a tylertoo_io::Error>
 pub fn tylertoo_io::largest_byte_array_column(&parquet::file::metadata::ParquetMetaData, core::option::Option<&[usize]>, impl core::ops::function::Fn(usize) -> bool) -> core::option::Option<tylertoo_io::LargestByteArrayColumn>
 pub fn tylertoo_io::load_reader_metadata<R: parquet::file::reader::ChunkReader>(&R) -> core::result::Result<tylertoo_io::ReaderMetadata, parquet::errors::ParquetError>

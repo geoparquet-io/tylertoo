@@ -76,6 +76,8 @@ Args:
     feature_id: See `export_pmtiles()`.
     keep_overview: Keep the intermediate overview file at this path
         instead of removing it. Its directory must exist.
+    bake: Also write a copy of the input with the archive baked in
+        at this path (see `bake()`). Needs a single local input file.
     temp_compression: Compression of the temporary intermediate
         overview, `"lz4"` (default) or `"zstd"`. `"zstd"` writes a file
         about a third smaller for 5-7% more CPU. No effect with
