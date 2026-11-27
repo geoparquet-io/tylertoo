@@ -2119,6 +2119,34 @@ mod tests {
     }
 
     #[test]
+    fn pass1_memory_message_flags_exist_on_tiles_and_overview() {
+        let mut root = Cli::command();
+        root.build();
+        for message in tylertoo_core::internal::pass1_memory_messages_for_docs() {
+            let flags: Vec<_> = named_flags(&message).collect();
+            for required in [
+                "memory-limit",
+                "plan",
+                "coalesce-max-level-rows",
+                "no-coalesce-lines",
+            ] {
+                assert!(flags.contains(&required), "missing --{required}: {message}");
+            }
+            for name in ["tiles", "overview"] {
+                let command = root.find_subcommand(name).unwrap();
+                for flag in &flags {
+                    assert!(
+                        command
+                            .get_arguments()
+                            .any(|arg| arg.get_long() == Some(*flag)),
+                        "{name} has no --{flag}: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn every_flag_named_in_help_exists() {
         let mut root = Cli::command();
         root.build();

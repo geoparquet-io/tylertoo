@@ -229,6 +229,7 @@ pub use tile_format::{MltProfile, TileFormat};
 /// Any release may change or remove any item without a semver bump. The
 /// supported API is the crate root.
 pub mod internal {
+    pub use crate::overview::convert::pass1_memory_messages_for_docs;
     pub mod environment {
         pub use crate::environment::*;
     }

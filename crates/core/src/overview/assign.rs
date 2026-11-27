@@ -2875,7 +2875,8 @@ mod tests {
     /// `pass1_bytes_per_row_matches_the_feature_table`.
     ///
     /// This is the number `convert::PASS1_BYTES_PER_ROW` preflights against and
-    /// that `docs/guides/scaling.md` sizes coarse jobs with, so
+    /// that the preflight message prints for coarse jobs (see
+    /// <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>), so
     /// it is pinned here as well as there. The pre-#543 array-of-structs table
     /// was `size_of::<AssignFeature>()` = 64 B/row.
     #[test]
