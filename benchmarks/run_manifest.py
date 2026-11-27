@@ -438,8 +438,10 @@ def host_class_key(host: dict | None = None) -> str:
     return f"{host['machine']}/{host['cpu_model']}/{host['cpus']}"
 
 
-def release_version(root: Path) -> str | None:
-    """Workspace version at its release tag or in a clean release candidate."""
+def release_version(root: Path, prerelease: bool = False) -> str | None:
+    """Workspace version at its release tag or in a clean release candidate.
+    With `prerelease`, a clean tree past an existing tag is labelled by
+    `git describe` (v0.8.0-52-gabcdef0) instead of refused."""
     with (root / "Cargo.toml").open("rb") as f:
         version = tomllib.load(f)["workspace"]["package"]["version"]
 
@@ -473,7 +475,10 @@ def release_version(root: Path) -> str | None:
     if not tags.strip():
         return version
     tag = git("rev-parse", "--verify", f"refs/tags/v{version}^{{commit}}")
-    return version if tag is not None and tag.strip() == head.strip() else None
+    if tag is not None and tag.strip() == head.strip():
+        return version
+    label = git("describe", "--tags", "--match", "v*", "--always") if prerelease else None
+    return (label.strip() or None) if label else None
 
 
 def git_describe(rev: str | None = None) -> str | None:
@@ -1424,7 +1429,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--manifest", default=str(MANIFEST))
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="cells, inputs and sets")
-    sub.add_parser("release-version", help="print the workspace version for a release candidate")
+    rv = sub.add_parser("release-version", help="print the workspace version for a release candidate")
+    rv.add_argument("--prerelease", action="store_true",
+                    help="label a clean tree past the version's tag by git describe")
     for name in ("fetch", "run", "report"):
         p = sub.add_parser(name)
         p.add_argument("--data", default="~/bench-data/manifest", help="inputs/, setup/, results/")
@@ -1469,7 +1476,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--head", default="head")
     args = ap.parse_args(argv)
     if args.cmd == "release-version":
-        version = release_version(ROOT)
+        version = release_version(ROOT, prerelease=args.prerelease)
         if version is not None:
             print(version)
         return 0

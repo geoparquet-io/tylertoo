@@ -22,7 +22,7 @@ def preview(tmp_path):
 case "$*" in
   *"rev-parse HEAD"*) echo abc123 ;;
   *"status --porcelain"*) [ "${TEST_RC:-0}" = 1 ] || printf ' M source.rs\\0' ;;
-  *"tag --list"*) : ;;
+  *"tag --list"*) [ "${TEST_TAGGED:-0}" = 1 ] && echo v9.9.9 || : ;;
   *"describe"*) echo v-old-1-gabc123 ;;
   *) exit 1 ;;
 esac
@@ -148,7 +148,7 @@ def test_preflights_and_commands(preview):
 def test_documented_release_flags_exist(preview):
     help_text = preview[0]('--help').stdout
     for flag in set(re.findall(r'--[a-z][a-z-]*', help_text)):
-        assert flag in {'--data', '--force', '--dry-run', '--skip', '--only', '--help'}
+        assert flag in {'--data', '--force', '--dry-run', '--prerelease', '--skip', '--only', '--help'}
 
 
 def test_skipped_africa_keeps_committed_provenance_in_generated_page(preview, tmp_path):
@@ -203,3 +203,18 @@ chmod +x "{tip}"
     assert old['commit'] in page and old['date'][:10] in page
     assert (out / 'docs.done').exists()
     assert (root / 'benchmarks/results/comparison-pmtiles.json').exists()
+
+
+@pytest.mark.parametrize('args,clean,publishes', [
+    ([], '1', False),                  # the version is tagged elsewhere: refuse
+    (['--prerelease'], '1', True),     # opt-in: publish under the describe label
+    (['--prerelease'], '0', False),    # the clean-tree rule still holds
+])
+def test_prerelease_opt_in(preview, args, clean, publishes):
+    run, data = preview
+    result = run(*args, 'upload', 'docs', TEST_RC=clean, TEST_TAGGED='1')
+    assert result.returncode == 0, result.stderr
+    assert ('refuse' not in result.stdout) == publishes
+    if publishes:
+        assert re.search(r'^Output: .*/release/v-old-1-gabc123$', result.stdout, re.M)
+        assert '--version v-old-1-gabc123' in result.stdout

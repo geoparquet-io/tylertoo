@@ -219,3 +219,31 @@ def test_tutorial_map_failed_verification_leaves_no_record(tmp_path, monkeypatch
     with pytest.raises(ValueError, match='size'):
         cp.tutorial_map(tmp_path / 'work', out, Path('tylertoo'), 's3://test/map.pmtiles')
     assert not out.exists()
+
+
+def test_build_takes_prerelease_label(corpus, tmp_path):
+    work = corpus[0]
+    doc = cp.build(tmp_path / 'e2e.json', work, tmp_path / 'm.json', 'v9.9.9-52-gabcdef0')
+    assert doc['version'] == 'v9.9.9-52-gabcdef0'
+    assert doc['base_url'] == cp.BASE_URL + 'v9.9.9-52-gabcdef0/'
+
+
+def test_tutorial_map_from_existing_archive(tmp_path, monkeypatch):
+    archive = tmp_path / 'brazil.pmtiles'
+    archive.write_bytes(b'already published')
+    monkeypatch.setattr(rm, 'parse_bin', lambda spec: {'path': 'tylertoo'})
+    monkeypatch.setattr(rm, 'provenance', lambda *args: {})
+    monkeypatch.setattr(cp, 'gen_bench_docs', lambda: SimpleNamespace(tutorial_tile_count=lambda root: 4))
+    calls, heads = [], []
+    def run(argv, **kw):
+        calls.append(argv)
+        assert argv[1:3] == ['stats', '--json']  # nothing rebuilt, nothing uploaded
+        return cp.subprocess.CompletedProcess(argv, 0, '{"per_zoom": [{"tile_count": 4}]}', '')
+    monkeypatch.setattr(cp.subprocess, 'run', run)
+    monkeypatch.setattr(cp, 'verify_url', lambda *a: heads.append(a))
+    out = tmp_path / 'tutorial-map.json'
+    cp.tutorial_map(tmp_path / 'work', out, tmp_path / 'tylertoo', cp.MAP_TARGET, archive)
+    doc = json.loads(out.read_text())
+    assert doc['archive']['tiles'] == 4 and doc['archive']['bytes'] == len(b'already published')
+    assert heads == [(cp.MAP_URL, len(b'already published'))]
+    assert len(calls) == 1 and 'not rebuilt' in doc['provenance']['notes'][0]

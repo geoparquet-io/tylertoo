@@ -34,10 +34,12 @@ def archive_path(work: Path, did: str, tool: str) -> Path:
     return work / component(did) / f'{tool}.pmtiles'
 
 
-def build(corpus: Path, work: Path, out: Path) -> dict:
+def build(corpus: Path, work: Path, out: Path, version: str | None = None) -> dict:
+    """`version` names the upload prefix; it defaults to the run's release
+    version, and release.sh passes the git describe label for --prerelease."""
     source = json.loads(corpus.read_text())
     prov = {k: source['provenance'].get(k) for k in rm.PROVENANCE_KEYS}
-    version = component(prov['release_version'])
+    version = component(version or prov['release_version'])
     base = BASE_URL + version + '/'
     datasets = []
     for did, ds in source['datasets'].items():
@@ -123,16 +125,19 @@ def gen_bench_docs():
     return module
 
 
-def tutorial_map(work: Path, out: Path, binary: Path, target: str) -> None:
-    """Run tutorial step one, replace its map, and record verified facts."""
+def tutorial_map(work: Path, out: Path, binary: Path, target: str, source: Path | None = None) -> None:
+    """Run tutorial step one, replace its map, and record verified facts.
+    With `source`, record an archive that was already built and published:
+    nothing is rebuilt or uploaded, and the public object must match it."""
     work = work.expanduser().resolve()
     binary = binary.expanduser().resolve()
-    tmp = work / 'tmp'
-    tmp.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, 'PATH': f'{binary.parent}:{os.environ["PATH"]}', 'TMPDIR': str(tmp)}
-    subprocess.run(['bash', str(rm.ROOT / 'examples/brazil-fields/01-tiles.sh')],
-                   cwd=work, env=env, check=True)
-    archive = work / 'brazil.pmtiles'
+    if source is None:
+        tmp = work / 'tmp'
+        tmp.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, 'PATH': f'{binary.parent}:{os.environ["PATH"]}', 'TMPDIR': str(tmp)}
+        subprocess.run(['bash', str(rm.ROOT / 'examples/brazil-fields/01-tiles.sh')],
+                       cwd=work, env=env, check=True)
+    archive = source.expanduser().resolve() if source else work / 'brazil.pmtiles'
     stats = json.loads(subprocess.run([str(binary), 'stats', '--json', str(archive)],
                                      capture_output=True, text=True, check=True).stdout)
     facts = {'url': MAP_URL, 'bytes': archive.stat().st_size,
@@ -144,7 +149,10 @@ def tutorial_map(work: Path, out: Path, binary: Path, target: str) -> None:
         raise ValueError(f"brazil.pmtiles has {facts['tiles']} tiles; examples/brazil-fields/README.md "
                          f"expects {expected:,}; fix the tutorial or the build before uploading")
     prov = rm.provenance([rm.parse_bin(f'head={binary}')], {})
-    if target.startswith('s3://'):
+    if source is not None:
+        prov['notes'] = [f'Recorded from an existing archive ({archive.name}); not rebuilt by this run.']
+        verify_url(MAP_URL, facts['bytes'])
+    elif target.startswith('s3://'):
         subprocess.run(['aws', 's3', 'cp', str(archive), target, '--profile', 'source-coop'], check=True)
         verify_url(MAP_URL, facts['bytes'])
     else:
@@ -164,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument('--corpus', required=True, type=Path)
     b.add_argument('--work', required=True, type=Path)
     b.add_argument('--out', required=True, type=Path)
+    b.add_argument('--version', help='upload prefix (default: the run\'s release version)')
     u = sub.add_parser('upload')
     u.add_argument('--manifest', required=True, type=Path)
     u.add_argument('--work', required=True, type=Path)
@@ -174,15 +183,17 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument('--out', required=True, type=Path)
     m.add_argument('--tylertoo', required=True, type=Path)
     m.add_argument('--target', default=os.environ.get('MAP_TARGET', MAP_TARGET))
+    m.add_argument('--from', dest='source', type=Path,
+                   help='record this already-published archive instead of rebuilding it')
     args = parser.parse_args(argv)
     try:
         if args.command == 'build':
-            build(args.corpus, args.work, args.out)
+            build(args.corpus, args.work, args.out, args.version)
             print(f'Wrote {args.out}')
         elif args.command == 'upload':
             upload(args.manifest, args.work, args.target, args.force)
         else:
-            tutorial_map(args.work, args.out, args.tylertoo, args.target)
+            tutorial_map(args.work, args.out, args.tylertoo, args.target, args.source)
     except (ValueError, OSError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f'{exc}\n')
     return 0

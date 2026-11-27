@@ -12,15 +12,17 @@ STAGES=(build tippecanoe corpus cells africa tutorial-map upload docs)
 # The committed Africa default peaked at 146 GB (results/overture-buildings-africa.json peak_disk_bytes); retain headroom.
 AFRICA_DISK_GB=200
 DATA="${TYLERTOO_BENCH_DATA:-$HOME/bench-data}"
-FORCE=0 DRY=0
+FORCE=0 DRY=0 PRERELEASE=()
 skip="${SKIP:-}" only="${ONLY:-}"
-usage() { echo 'benchmarks/release.sh [--data DIR (all scratch; default ${TYLERTOO_BENCH_DATA:-$HOME/bench-data})] [--force] [--dry-run] [--skip "S ..."] [--only "S ..."] [STAGE ...]'; }
+usage() { echo 'benchmarks/release.sh [--data DIR (all scratch; default ${TYLERTOO_BENCH_DATA:-$HOME/bench-data})] [--force] [--dry-run] [--prerelease] [--skip "S ..."] [--only "S ..."] [STAGE ...]'; }
 invalid() { echo "Unknown stage or option: $1. Stages: ${STAGES[*]}" >&2; exit 2; }
 while (($#)); do
   case "$1" in
     --data) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; DATA="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
     --dry-run) DRY=1; shift ;;
+    # Publish from a clean tree past the version's tag, labelled by git describe.
+    --prerelease) PRERELEASE=(--prerelease); shift ;;
     --skip|--only)
       option="$1"; shift
       [[ $# -gt 0 && "$1" != --* ]] || { usage >&2; exit 2; }
@@ -46,7 +48,7 @@ has() { [[ " ${selected[*]} " == *" $1 "* ]]; }
 PY=(uv run --no-project --python 3.12 python -I)
 # Resolve local metadata offline even in a preview; no stage/check runs here.
 META=(uv run --offline --no-project --python 3.12 python -I)
-VERSION="$("${META[@]}" benchmarks/run_manifest.py release-version)"
+VERSION="$("${META[@]}" benchmarks/run_manifest.py release-version "${PRERELEASE[@]}")"
 RC=1
 if [[ -z "$VERSION" ]]; then
   RC=0
@@ -89,7 +91,7 @@ if (( ! DRY )); then
     echo 'tutorial-map, upload, and docs refuse: not a release candidate (source changes, an existing release tag at another commit, or unavailable git metadata).' >&2
     exit 1
   fi
-  if ! has tippecanoe; then check_tip; fi
+  if has corpus && ! has tippecanoe; then check_tip; fi
   gpio_version="$(uvx --from "$GPIO_PACKAGE" gpio --version)"
   [[ "${gpio_version##* }" == "$GPIO_PIN" ]] || { echo "Expected gpio $GPIO_PIN; got $gpio_version" >&2; exit 1; }
   if has africa; then
@@ -109,7 +111,7 @@ extra=()
 (( ! FORCE )) || extra+=(--force)
 for stage in "${selected[@]}"; do
   if [[ -f "$OUT/$stage.done" && "$FORCE" == 0 ]]; then echo "$stage: skip (done)"; continue; fi
-  if (( ! DRY && tip_check_pending )) && [[ "$stage" != build && "$stage" != tippecanoe ]]; then check_tip; fi
+  if (( ! DRY && tip_check_pending )) && [[ "$stage" == corpus ]]; then check_tip; fi
   echo "$stage:"
   case "$stage" in
     build) run cargo build --locked --release -p tylertoo ;;
@@ -139,12 +141,13 @@ for stage in "${selected[@]}"; do
         benchmarks/showcase/showcase.py collect-stream africa --data "$OUT" \
         --history-from benchmarks/results/overture-buildings-africa.json --out "$OUT/overture-buildings-africa.json" ;;
     tutorial-map)
+      # MAP_FROM records an archive already built and published instead of rebuilding it.
       run "${PY[@]}" benchmarks/comparison.py tutorial-map --work "$OUT/tutorial-map" \
-        --out "$OUT/tutorial-map.json" --tylertoo target/release/tylertoo \
+        --out "$OUT/tutorial-map.json" --tylertoo target/release/tylertoo ${MAP_FROM:+--from "$MAP_FROM"} \
         --target "${MAP_TARGET:-s3://nlebovits/tylertoo-brazil-demo/brazil.pmtiles}" ;;
     upload)
       run "${PY[@]}" benchmarks/comparison.py build --corpus "$OUT/e2e-corpus.json" \
-        --work "$OUT/corpus" --out "$OUT/comparison-pmtiles.json"
+        --work "$OUT/corpus" --out "$OUT/comparison-pmtiles.json" --version "$VERSION"
       run "${PY[@]}" benchmarks/comparison.py upload --manifest "$OUT/comparison-pmtiles.json" \
         --work "$OUT/corpus" --target "${UPLOAD_TARGET:-s3://nlebovits/tylertoo-benchmarks}" "${extra[@]}" ;;
     docs)

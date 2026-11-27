@@ -799,7 +799,7 @@ def test_release_version_does_not_treat_git_errors_as_missing_tags(tmp_path, mon
 
 @pytest.mark.parametrize("version", ["9.9.9", None])
 def test_release_version_subcommand_prints_only_version(monkeypatch, capsys, version):
-    monkeypatch.setattr(rm, "release_version", lambda root: version)
+    monkeypatch.setattr(rm, "release_version", lambda root, prerelease=False: version)
     assert rm.main(["release-version"]) == 0
     assert capsys.readouterr().out == (version + "\n" if version else "")
 
@@ -886,3 +886,33 @@ def test_failed_summary_does_not_skip_cell(tmp_path, monkeypatch):
         pairs=lambda cell: 1, data=tmp_path, input_dirs=[])
     with pytest.raises(RuntimeError, match='resuming failed cell'):
         rm.Runner.run_cell(runner, 'c')
+
+
+@pytest.mark.parametrize("prerelease,status,expected", [
+    (False, "", None),                       # tagged elsewhere: not a release candidate
+    (True, "", "v9.9.9-52-gabcdef0"),        # opt-in: label by git describe
+    (True, " M src/lib.rs\0", None),         # the clean-tree rule still holds
+])
+def test_release_version_prerelease_labels_by_describe(tmp_path, monkeypatch, prerelease, status, expected):
+    (tmp_path / "Cargo.toml").write_text('[workspace.package]\nversion = "9.9.9"\n')
+    def git(argv, **kwargs):
+        if "status" in argv:
+            return SimpleNamespace(returncode=0, stdout=status)
+        if "describe" in argv:
+            assert "--match" in argv and argv[argv.index("--match") + 1] == "v*"
+            return SimpleNamespace(returncode=0, stdout="v9.9.9-52-gabcdef0\n")
+        if argv[-1] == "HEAD":
+            return SimpleNamespace(returncode=0, stdout="head\n")
+        if "--list" in argv:
+            return SimpleNamespace(returncode=0, stdout="v9.9.9\n")
+        return SimpleNamespace(returncode=0, stdout="tagcommit\n")
+    monkeypatch.setattr(rm.subprocess, "run", git)
+    assert rm.release_version(tmp_path, prerelease=prerelease) == expected
+
+
+def test_release_version_subcommand_passes_prerelease(monkeypatch, capsys):
+    monkeypatch.setattr(rm, "release_version", lambda root, prerelease=False: "label" if prerelease else None)
+    assert rm.main(["release-version", "--prerelease"]) == 0
+    assert capsys.readouterr().out == "label\n"
+    assert rm.main(["release-version"]) == 0
+    assert capsys.readouterr().out == ""

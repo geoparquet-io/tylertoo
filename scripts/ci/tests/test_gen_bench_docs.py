@@ -104,7 +104,11 @@ def test_number_format(value, expected):
 def test_label_and_footer(results):
     p = results["e2e-corpus"]["provenance"]
     assert g.run_label(p) == "commit abc1234"
-    assert g.run_label({**p, "git_describe": "v0.8-2-gabc"}) == "v0.8-2-gabc"
+    # A run past a release tag says plainly that it measured unreleased code.
+    assert g.run_label({**p, "git_describe": "v0.8.0-52-gabcdef0"}) == "an unreleased commit abcdef0 after v0.8.0"
+    assert g.run_label({**p, "git_describe": "v0.8.0-52-gabcdef0-dirty"}) == \
+        "an unreleased commit abcdef0 after v0.8.0, with local changes"
+    assert g.run_label({**p, "git_describe": "v0.8.0"}) == "v0.8.0"
     assert g.run_label({**p, "git_describe": "other", "release_version": "0.9.0"}) == "0.9.0"
     out = g.footer(results["e2e-corpus"])
     for value in [p["commit"], p["allocator"], p["host"], p["date"][:10], *p["tool_versions"].values()]:

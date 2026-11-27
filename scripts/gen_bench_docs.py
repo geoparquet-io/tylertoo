@@ -91,8 +91,15 @@ def archive_size(value):
 
 
 def run_label(provenance):
-    return (provenance.get("release_version") or provenance.get("git_describe")
-            or f"commit {provenance.get('commit') or 'unknown'}")
+    if provenance.get("release_version"):
+        return provenance["release_version"]
+    describe = provenance.get("git_describe") or ""
+    # A describe past a release tag: say plainly that the code is unreleased.
+    m = re.fullmatch(r"(v[^-]+)-\d+-g([0-9a-f]+)(-dirty)?", describe)
+    if m:
+        return (f"an unreleased commit {m[2]} after {m[1]}"
+                + (", with local changes" if m[3] else ""))
+    return describe or f"commit {provenance.get('commit') or 'unknown'}"
 
 
 def tool_version(name, value):
