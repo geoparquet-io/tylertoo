@@ -22,9 +22,11 @@
 //! Every profile gets at least the phase's floor.
 
 use super::assign::FeatureTable;
+use super::chunked::{OverviewStore, StoreId};
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
 use super::pipeline::{probe_preflight_memory_limit, MemoryLimit};
+use std::sync::Arc;
 
 pub(super) const SINK_ROW_ALLOC_OVERHEAD_BYTES: u64 = 256;
 /// What a shared output row (#852) holds besides its geometry: its `u32`
@@ -85,6 +87,13 @@ const EXPORT_FRACTION: f64 = 0.5;
 /// export phases afford exactly half of the probed memory, the slots
 /// export always sized its waves to.
 const EXPORT_SHARE: f64 = EXPORT_FRACTION / ALLOWANCE_FRACTION;
+
+/// Share of the room outside the allowance the temporary overview may hold
+/// resident (#923); the other half is the live-headroom margin it evicts
+/// below. The allowance's complement is headroom for what no phase prices
+/// (allocator retention, stacks, page cache), which a file's page cache
+/// shared the same way.
+const OVERVIEW_OUTSIDE_SHARE: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MemoryPhase {
@@ -251,6 +260,10 @@ pub(super) struct MemoryBudget {
     /// The staging knobs [`stage_requests`](Self::stage_requests) and
     /// `bounded`'s staging cap read (#788).
     stage: crate::input::StageAdmission,
+    /// The temporary overview the export reads (#923): its resident chunks
+    /// count as a reservation, read live, and a grant or requirement that
+    /// would not fit evicts them before it shrinks or fails.
+    overview: Option<StoreId>,
 }
 
 fn sum(ledger: &[u64; MemoryPhase::COUNT]) -> u64 {
@@ -267,6 +280,44 @@ impl MemoryBudget {
             reserved: [0; MemoryPhase::COUNT],
             granted: [0; MemoryPhase::COUNT],
             stage: crate::input::stage_admission(),
+            overview: None,
+        }
+    }
+    /// Let this budget's grants relieve `store` (#923): its resident
+    /// chunks are evicted when the live headroom runs low. They are never
+    /// charged here: like the page cache of the file they replace, they sit
+    /// outside the allowance, so every figure this budget plans with is the
+    /// one it would be without them.
+    pub(super) fn hold_overview(&mut self, store: &Arc<OverviewStore>) {
+        self.overview = Some(store.id());
+    }
+    fn overview_store(&self) -> Option<Arc<OverviewStore>> {
+        self.overview.and_then(StoreId::get)
+    }
+    /// What the probed figure keeps outside the allowance: the share no
+    /// phase is granted. `0` when nothing was probed.
+    fn outside_allowance(&self) -> u64 {
+        self.limit.map_or(0, |l| {
+            let base = l.bytes.saturating_sub(sum(&self.reserved));
+            base.saturating_sub((base as f64 * ALLOWANCE_FRACTION) as u64)
+        })
+    }
+    /// Most bytes the temporary overview may hold resident (#923):
+    /// [`OVERVIEW_OUTSIDE_SHARE`] of what the allowance never hands out.
+    pub(super) fn overview_cap(&self) -> u64 {
+        (self.outside_allowance() as f64 * OVERVIEW_OUTSIDE_SHARE) as u64
+    }
+    /// The live headroom below which the overview evicts (#923): the rest
+    /// of the room outside the allowance, kept for what no phase prices.
+    pub(super) fn overview_margin(&self) -> u64 {
+        self.outside_allowance().saturating_sub(self.overview_cap())
+    }
+    /// Evict the overview's resident chunks while the live, uncached
+    /// headroom is below [`Self::overview_margin`] (#923). Changes no
+    /// figure this budget reports.
+    pub(super) fn relieve_overview(&self) {
+        if let Some(store) = self.overview_store() {
+            store.relieve(self.overview_margin());
         }
     }
     pub(super) fn with_available(available: Option<u64>) -> Self {
@@ -470,6 +521,7 @@ impl MemoryBudget {
         want: usize,
         floor: usize,
     ) -> Grant {
+        self.relieve_overview();
         let units = match profile {
             MemoryProfile::Bounded => self
                 .affordable(profile, phase, price)
@@ -665,6 +717,7 @@ impl MemoryBudget {
     }
 
     pub(super) fn require(&self, phase: MemoryPhase, needed: u64) -> Result<(), ConvertError> {
+        self.relieve_overview();
         if let Some(available) = self.available() {
             if needed > available {
                 return Err(ConvertError::BudgetExceeded {
@@ -695,6 +748,7 @@ impl MemoryBudget {
             "total_reserved": sum(&self.reserved),
             "total_granted": sum(&self.granted),
             "remaining": self.remaining(),
+            "overview_resident": self.overview_store().map_or(0, |s| s.resident_bytes()),
         })
     }
 
@@ -712,6 +766,7 @@ impl MemoryBudget {
         if self.limit.is_none() {
             return Ok(());
         }
+        self.relieve_overview();
         let available = self.room(profile);
         if needed > available {
             return Err(ConvertError::BudgetExceeded {
@@ -754,6 +809,55 @@ impl MemoryBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #923: a resident overview changes no figure the export plans with,
+    /// and its room is the half of the allowance's complement.
+    #[test]
+    fn a_resident_overview_changes_no_planning_figure() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::super::chunked::OverviewStore::new(dir.path().to_path_buf());
+        let mut sink = super::super::chunked::OverviewSink::Store(Arc::clone(&store));
+        for _ in 0..8 {
+            sink.write_all(&vec![7; 1 << 20]).unwrap();
+            sink.flush().unwrap();
+        }
+        assert_eq!(store.resident_bytes(), 8 << 20);
+        let plain = MemoryBudget::with_available(Some(10 << 20));
+        let mut held = plain;
+        held.hold_overview(&store);
+        let price = Price::new(1 << 20, PriceBasis::Measured);
+        for profile in [
+            MemoryProfile::Auto,
+            MemoryProfile::Speed,
+            MemoryProfile::Bounded,
+        ] {
+            for phase in MemoryPhase::ALL {
+                assert_eq!(
+                    held.affordable(profile, phase, price),
+                    plain.affordable(profile, phase, price)
+                );
+                let (mut a, mut b) = (plain, held);
+                assert_eq!(
+                    a.fit(profile, phase, price, 9, 1),
+                    b.fit(profile, phase, price, 9, 1)
+                );
+                assert_eq!(a.remaining(), b.remaining());
+            }
+            assert_eq!(held.room(profile), plain.room(profile));
+        }
+        assert_eq!(held.available(), plain.available());
+        assert_eq!(held.remaining(), plain.remaining());
+        held.require(MemoryPhase::ExportCollect, 5 << 20).unwrap();
+        // 40% of 10 MiB is outside the allowance: half held, half margin.
+        assert_eq!(plain.overview_cap(), 2 << 20);
+        assert_eq!(plain.overview_margin(), 2 << 20);
+        assert_eq!(MemoryBudget::with_available(None).overview_cap(), 0);
+        drop(sink);
+        drop(store);
+        held.relieve_overview();
+        assert_eq!(held.ledger_json()["overview_resident"], 0);
+    }
 
     #[test]
     fn bounded_holds_pass2_in_flight_to_its_cap_and_others_do_not() {

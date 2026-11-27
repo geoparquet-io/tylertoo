@@ -1732,15 +1732,18 @@ pub fn predicted_valve_floors(
 
 /// Intermediate archives run their ordinary valves; only over-limit tile
 /// reporting at shared zooms belongs to the merge.
+///
+/// `store` is the overview `tiles` held in memory (#923); `input` then only
+/// names it in messages.
 pub(crate) fn export_pmtiles_for_join(
-    input: &Path,
+    (input, store): (&Path, Option<&Arc<super::chunked::OverviewStore>>),
     output: &Path,
     options: &ExportOptions,
     shared_zooms: &[u8],
 ) -> Result<(ExportReport, JointMembers), ExportError> {
     let config = options.validate()?;
     export_pmtiles_validated(
-        input,
+        (input, store),
         output,
         &config,
         DEFAULT_PARTITION_TARGET,
@@ -2021,7 +2024,7 @@ fn export_pmtiles_run(
         .budget_available
         .map_or_else(export_budget, |b| MemoryBudget::with_available(Some(b)));
     export_pmtiles_validated(
-        input_path,
+        (input_path.as_ref(), None),
         output_path,
         &validated,
         partition_target,
@@ -2036,7 +2039,7 @@ fn export_pmtiles_run(
     reason = "#779: export orchestration keeps scan, writer and checkpoint lifetimes explicit"
 )]
 fn export_pmtiles_validated(
-    input_path: impl AsRef<Path>,
+    (input_path, store): (&Path, Option<&Arc<super::chunked::OverviewStore>>),
     output_path: impl AsRef<Path>,
     config: &super::config::ValidatedConfig<'_, ExportOptions>,
     partition_target: usize,
@@ -2060,9 +2063,14 @@ fn export_pmtiles_validated(
     let start = Instant::now();
     // #876: the per-tile trace, drained to its file when the export returns.
     let _tile_trace = crate::tile_trace::Session::start(diagnostics);
-    let input_path = input_path.as_ref();
-
-    let reader = OverviewReader::open(input_path)?;
+    let reader = match store {
+        Some(store) => {
+            // #923: this run's grants evict the overview under real pressure.
+            budget.hold_overview(store);
+            OverviewReader::open_store(store, input_path.to_path_buf())?
+        }
+        None => OverviewReader::open(input_path)?,
+    };
     let meta = reader.meta().clone();
     if options.variable_depth {
         variable_depth::check_file(&meta, reader.mode())?;

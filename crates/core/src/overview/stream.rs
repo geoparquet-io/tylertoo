@@ -13,7 +13,6 @@
 use super::pipeline::BufferOptions;
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{self, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1673,7 +1672,7 @@ fn grant_pass2_read(
 /// because every candidate collapsed during simplification (#211).
 fn run_pass2_levels(
     mut budget: MemoryBudget,
-    writer: &mut OverviewWriter<File>,
+    writer: &mut OverviewWriter<super::chunked::OverviewSink>,
     ctxs: &[LevelStreamCtx<'_>],
     hints: &[usize],
     inputs: Pass2Inputs<'_>,
@@ -2012,7 +2011,7 @@ fn resolve_ranking_tier(
 
 /// The writer and the three schemas pass 2 encodes against.
 struct LevelWriter {
-    writer: OverviewWriter<File>,
+    writer: OverviewWriter<super::chunked::OverviewSink>,
     source_schema: Schema,
     cluster_schema: Schema,
     out_schema: Schema,
@@ -2144,7 +2143,10 @@ fn pass2_coalesce(
 }
 
 fn create_level_writer(
-    output_path: &Path,
+    (output_path, store): (
+        &Path,
+        Option<&std::sync::Arc<super::chunked::OverviewStore>>,
+    ),
     descriptor: &ResolvedSchema,
     emitted: &[EmitLevel],
     options: &ConvertOptions,
@@ -2217,7 +2219,12 @@ fn create_level_writer(
     // levels' row groups; `bounded` keeps its one-level envelope.
     writer_opts.overlap_levels = !matches!(options.profile, super::level::MemoryProfile::Bounded);
 
-    let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
+    // #923: the in-memory overview keeps a chunk while it fits the room the
+    // writer's budget leaves outside its allowance.
+    if let Some(store) = store {
+        store.admit_under(budget.overview_cap(), budget.overview_margin());
+    }
+    let writer = OverviewWriter::create_sink(output_path, store, &out_schema, writer_opts)?;
 
     // Over pass 2's batches: the input's columns and its `input_row`.
     let non_geom_cols: Vec<usize> = (0..source_schema.fields().len())
@@ -3738,7 +3745,10 @@ fn finish_convert_rss(mut rss: RssTracker) -> (Option<f64>, Option<RssSamplerRep
 )]
 pub(crate) fn run_stages(
     source: &ConvertSource,
-    output_path: &Path,
+    (output_path, store): (
+        &Path,
+        Option<&std::sync::Arc<super::chunked::OverviewStore>>,
+    ),
     config: &super::config::ValidatedConfig<'_, ConvertOptions>,
     strategy: Pass2Strategy,
     diagnostics: &crate::diagnostics::Diagnostics,
@@ -3894,7 +3904,7 @@ pub(crate) fn run_stages(
         encode,
         drain_slot_bytes,
     } = create_level_writer(
-        output_path,
+        (output_path, store),
         &descriptor,
         emitted,
         options,
@@ -4069,7 +4079,7 @@ pub(crate) fn run_stages(
     );
     rss.log_phase("writer.finish");
     let (peak_rss_mib, rss_sampler_report) = finish_convert_rss(rss);
-    fill_level_bytes(output_path, &meta, &mut level_reports)?;
+    fill_level_bytes((output_path, store), &meta, &mut level_reports)?;
 
     let total_rows: usize = level_reports.iter().map(|l| l.feature_count).sum();
     let total_vertices: usize = level_reports.iter().map(|l| l.vertex_count).sum();
@@ -7007,7 +7017,7 @@ const STREAMED_OUTPUT_DEPTH: usize = 2;
 /// `TYLERTOO_PROFILE_JSON` accumulator, since the finest level streamed here
 /// never otherwise reaches `run_pass2_buffered`'s returned timers.
 fn write_level_streaming(
-    writer: &mut OverviewWriter<File>,
+    writer: &mut OverviewWriter<super::chunked::OverviewSink>,
     level_idx: usize,
     hint: usize,
     inputs: StreamRead<'_>,
@@ -10439,7 +10449,10 @@ pub(super) mod tests {
     fn stream_level(
         input: &Path,
         faults: EncodeFaults,
-    ) -> (Streamed, OverviewWriter<std::fs::File>) {
+    ) -> (
+        Streamed,
+        OverviewWriter<super::super::chunked::OverviewSink>,
+    ) {
         const ROWS: usize = STREAMED_ROWS;
         let tout = tempfile::NamedTempFile::new().unwrap();
 
@@ -10485,7 +10498,8 @@ pub(super) mod tests {
         .unwrap();
         writer_opts.max_row_group_size = 4;
         writer_opts.encode_concurrency = 2;
-        let mut writer = OverviewWriter::create(tout.path(), &out_schema, writer_opts).unwrap();
+        let mut writer =
+            OverviewWriter::create_sink(tout.path(), None, &out_schema, writer_opts).unwrap();
         writer.set_encode_faults(faults);
 
         // Every row is a member of the single (verbatim, canonical) level.

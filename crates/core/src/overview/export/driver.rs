@@ -703,8 +703,21 @@ pub(super) fn export_level_groups(
 ) -> Result<Vec<ZoomReport>, ExportError> {
     let LevelMemory { mut store, budget } = mem;
     let mut fills = build_fills_if_asked(levels, budget, &progress.profile.timers, diagnostics)?;
+    // #923: the in-memory overview drops what the export has read for the
+    // last time. The partitioning fill read every band, and the coverage
+    // fill above the finest; a duplicating level reads its own band only.
+    // Not under variable depth, whose probe reads levels alongside.
+    let overview = levels
+        .first()
+        .filter(|l| !l.options.variable_depth)
+        .and_then(|l| l.reader.store().map(|s| (s, l.reader)));
+    if let (Some((overview, _)), Some(_)) = (overview, &store) {
+        overview.free_below(u64::MAX);
+    }
     let mut zooms = Vec::with_capacity(levels.len());
     for group in groups {
+        // #923: evict the in-memory overview if memory runs short.
+        budget.relieve_overview();
         // #788: each level owns its zoom's fill, taken out of the map as
         // its group starts and dropped when the group is written.
         let group_fills: Vec<Option<coverage_fill::FillMap>> = levels[group.clone()]
@@ -732,6 +745,23 @@ pub(super) fn export_level_groups(
             progress,
             diagnostics,
         )?);
+        if let (Some((overview, reader)), None, Some(last)) =
+            (overview, &store, levels[group.clone()].last())
+        {
+            let duplicating = matches!(reader.mode(), Mode::Duplicating);
+            if let Some(&rg) = reader.band(last.level_idx)?.last().filter(|_| duplicating) {
+                let end = reader
+                    .parquet_metadata()
+                    .row_group(rg)
+                    .columns()
+                    .iter()
+                    .map(|c| {
+                        let (start, len) = c.byte_range();
+                        start + len
+                    });
+                overview.free_below(end.max().unwrap_or(0));
+            }
+        }
         crate::tile_trace::span("group", t_group, || {
             serde_json::json!({
                 "levels": group_levels.iter().map(|l| l.level_idx).collect::<Vec<_>>(),

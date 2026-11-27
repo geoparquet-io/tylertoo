@@ -8665,7 +8665,8 @@ fn joined_wave_prices_original_members_even_when_source_valve_output_is_small() 
         compressed_tile_size_limit: None,
         ..Default::default()
     };
-    let (_, members) = export_pmtiles_for_join(input.path(), output.path(), &opts, &[2]).unwrap();
+    let (_, members) =
+        export_pmtiles_for_join((input.path(), None), output.path(), &opts, &[2]).unwrap();
     let tiles = stored_tiles(&std::fs::read(output.path()).unwrap());
     let raw = compression::decompress(
         tiles.values().next().unwrap(),

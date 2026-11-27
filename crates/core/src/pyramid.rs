@@ -2506,7 +2506,7 @@ fn tile_source_band(
         ..opts.export.clone()
     };
     let (report, members) = crate::overview::export::export_pmtiles_for_join(
-        &overview,
+        (&overview, None),
         &archive,
         &export,
         shared_zooms,
