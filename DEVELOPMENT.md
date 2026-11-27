@@ -276,9 +276,11 @@ cargo bench --package tylertoo-core \
   --bench assign_scaling
 ```
 
-`benchmarks/overview/` scripts the corpus-scale storage, access, and
-conversion benchmarks. `context/PROFILING.md` covers profiling, including
-the `profiling` Cargo profile and sampling profilers such as samply.
+Run `benchmarks/release.sh` for the release benchmarks. The
+[archived performance history](context/archive/bench/overview-PROFILE.md)
+records earlier storage, access, and conversion investigations.
+`context/PROFILING.md` covers profiling, including the `profiling` Cargo
+profile and sampling profilers such as samply.
 
 #### CodSpeed
 

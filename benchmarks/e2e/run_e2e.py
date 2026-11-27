@@ -68,9 +68,8 @@ USAGE
     ./setup_tippecanoe.sh
     cargo build --release -p tylertoo
     python3 run_e2e.py --repeat 3 --geojson --quality-matched   # the full run
-        # -> results-<UTC timestamp>.json (gitignored); pass
-        #    --out ../results/e2e-fixtures.json only when deliberately
-        #    replacing the committed record, then run scripts/gen_bench_docs.py
+        # -> results-<UTC timestamp>.json (gitignored); the committed
+        #    corpus record is written only by benchmarks/release.sh
     python3 run_e2e.py --only madagascar-adm4 --repeat 5
     python3 run_e2e.py --dataset big=/data/planet-buildings.parquet \
                        --only big --max-zoom 12         # cluster-scale run
@@ -809,9 +808,8 @@ def main() -> int:
     ap.add_argument("--out", default=None,
                     help="results file (default: results-<UTC timestamp>.json "
                          "next to this script, gitignored). The committed "
-                         "records benchmarks/results/e2e-fixtures.json and "
-                         "e2e-corpus.json are only ever written when named "
-                         "here explicitly")
+                         "benchmarks/results/e2e-corpus.json is written "
+                         "only by benchmarks/release.sh")
     ap.add_argument("--markdown", default=None,
                     help="also write a markdown table here")
     inv = ap.add_argument_group(

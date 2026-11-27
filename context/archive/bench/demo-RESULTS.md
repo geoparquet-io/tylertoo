@@ -1,3 +1,5 @@
+Frozen history, moved from `demo/RESULTS.md` on 2026-11-27; not maintained.
+
 # Results — Brazil 2025 field predictions, filtered from a 630 GiB global collection
 
 A full-pyramid tiling run that starts from the **global** [Fields of The
@@ -22,7 +24,7 @@ pair, without downloading the collection or materializing an intermediate.
   Spark. Columns: `geometry`, `time` (prediction vintage; INT96 timestamp),
   `label` (`field` / `field_boundaries` / `non_field_background`), `bbox`.
   52 files intersect the Brazil bbox; those URLs are listed in
-  [`brazil-2025-manifest.txt`](./brazil-2025-manifest.txt).
+  [`brazil-2025-manifest.txt`](../../../demo/brazil-2025-manifest.txt).
 - **Machine:** 16 cores, 54 GiB RAM.
 - **Build:** tylertoo 0.6.0 (release) + this PR's timestamp-filter and
   null-CRS support.
@@ -164,9 +166,7 @@ Running this surfaced four things worth recording:
 - Tile / feature counts: the `export-pmtiles` JSON report and the PMTiles v3
   header.
 - Clipping and simplification differ from tippecanoe by design (see
-  [`context/ARCHITECTURE.md`](../context/ARCHITECTURE.md)); this demonstrates
+  [`context/ARCHITECTURE.md`](../../ARCHITECTURE.md)); this demonstrates
   a *pipeline and its output*, not byte-identical tiling.
 
-The archive is hosted on Source Cooperative (see [README.md](./README.md)).
-The headline numbers are summarized in the
-[scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/).
+The archive is hosted on Source Cooperative (see [README.md](../../../demo/README.md)).

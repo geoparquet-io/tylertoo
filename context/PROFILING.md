@@ -2,7 +2,7 @@
 
 How to measure where time and memory go. The recorded performance
 history of the pipeline (what was measured, what was fixed) lives in
-[`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/PROFILE.md).
+[archived pipeline performance history](archive/bench/overview-PROFILE.md).
 
 ## Memory envelope
 
@@ -1389,6 +1389,7 @@ open target/criterion/report/index.html
 
 ## Reproducing the published numbers
 
-The corpus-based storage/access/conversion benchmarks are scripted in
-`benchmarks/overview/` (see its README for the run order); the corpus
-itself is rebuilt from `corpus/fetch.sh` + `corpus/optimize.sh`.
+Run `benchmarks/release.sh` to reproduce the published benchmarks. For the
+method and settings parity, see the [end-to-end benchmark instructions](../benchmarks/e2e/README.md).
+The [archived performance history](archive/bench/overview-PROFILE.md) records
+the earlier storage, access, and conversion investigations.

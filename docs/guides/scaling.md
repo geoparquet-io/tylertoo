@@ -6,7 +6,7 @@ predictions out of the 629.6 GiB Fields of The World (FTW) collection:
 
 
 
-[`demo/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/demo/RESULTS.md)
+[`context/archive/bench/demo-RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/context/archive/bench/demo-RESULTS.md)
 records the commands and method. The controls below trade memory, disk, and
 speed without changing the PMTiles bytes. Sharding splits larger builds
 across machines. The coarse job still needs memory for the full input.

@@ -23,8 +23,11 @@ top-level README / DEVELOPMENT / CONTRIBUTING docs.
 | `plans/2026-03-13-drop-smallest-as-needed.md` | Implementation plan for the legacy `--drop-smallest-as-needed` flag (removed in #189). |
 | `plans/2026-04-08-geometry-coalescing-design.md` | Design for legacy tile-time geometry coalescing (`coalesce.rs`, removed in #189; distinct from the current `overview/coalesce.rs` line coalescing). |
 | `plans/2026-04-10-zoom-dependent-simplification.md` | Plan for per-tile zoom-dependent simplification (PR #158) — excised; see `context/TILE_SIMPLIFY_POSTMORTEM.md`. |
-| `bench/H3_NOTES.md` | H3(a)/(b) engineering notes: two-pass streaming convert (−94% peak RSS) and the bounded-memory export restructure. Summarized in `benchmarks/overview/PROFILE.md`. |
-| `bench/H3C_PROFILE.md` | H3(c) wall-time profile of convert/export on Moldova, the ranked optimization levers, and the post-lever results (convert 12.8× faster). Summarized in `benchmarks/overview/PROFILE.md`. |
-| `bench/EXPORT_NOTES.md` | E0 `export-pmtiles` design + validation notes (border-duplication accounting, the single-pass tile-size safety valve). Summarized in `benchmarks/overview/PROFILE.md`. |
+| [bench/overview-PROFILE.md](bench/overview-PROFILE.md) | Frozen overview pipeline performance history. |
+| [bench/coalesce-RESULTS.md](bench/coalesce-RESULTS.md) | Frozen coalesce investigation and measurements. |
+| [bench/demo-RESULTS.md](bench/demo-RESULTS.md) | Frozen Brazil field-prediction demo measurements. |
+| `bench/H3_NOTES.md` | H3(a)/(b) engineering notes: two-pass streaming convert (−94% peak RSS) and the bounded-memory export restructure. Summarized in [the archived performance history](bench/overview-PROFILE.md). |
+| `bench/H3C_PROFILE.md` | H3(c) wall-time profile of convert/export on Moldova, the ranked optimization levers, and the post-lever results (convert 12.8× faster). Summarized in [the archived performance history](bench/overview-PROFILE.md). |
+| `bench/EXPORT_NOTES.md` | E0 `export-pmtiles` design + validation notes (border-duplication accounting, the single-pass tile-size safety valve). Summarized in [the archived performance history](bench/overview-PROFILE.md). |
 | `corpus/V1_RESULTS.md` | V1 correctness-suite snapshot (2026-07-02, pre-Q2/H1/H3 numbers). Regenerate a current report with `corpus/verify.sh` (writes a fresh `corpus/V1_RESULTS.md`). |
 | `corpus/SWEEP_NOTES.md` | Portland roads lt×sf sweep + Q2 drop-rate calibration notes. Decisions consolidated into `corpus/SWEEPS.md`. |
