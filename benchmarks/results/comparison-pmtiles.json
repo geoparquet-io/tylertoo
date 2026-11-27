@@ -1,0 +1,298 @@
+{
+  "provenance": {
+    "commit": "f0e7d29e",
+    "tylertoo_version": "tylertoo 0.8.0",
+    "host": "aarch64, CPU 0xd40, 64 CPUs",
+    "nproc": 64,
+    "kernel": "7.0.0-1018-aws",
+    "allocator": "mimalloc",
+    "tool_versions": {
+      "head": "tylertoo 0.8.0",
+      "tippecanoe": "v2.82.0",
+      "tippecanoe_commit": null,
+      "ogr2ogr": "GDAL 3.8.4, released 2024/02/08",
+      "gpio": "geoparquet-io, version 1.7.0"
+    },
+    "inputs": [
+      {
+        "name": "points-nyc-medium",
+        "sha256": "1b5cc786cbc11d377183a9b262e4ad8dac9824943b54ea48b7a0c303172f3364"
+      },
+      {
+        "name": "polygons-portland-medium",
+        "sha256": "2a788d4e9b0df2d093d0845aa7602ce799a07df9e5cc51aa7fcb862456b5914e"
+      },
+      {
+        "name": "lines-oregon-large",
+        "sha256": "37ac1cda29845bb73fd17a124885a93de44a2813ca522be64bd3dc5c86a6ed4e"
+      },
+      {
+        "name": "polygons-ftw-moldova-large",
+        "sha256": "3f34ec4542471d90a01214b4b53bba227a9b8b441f7186fffcb1b4eb3dc411ee"
+      }
+    ],
+    "date": "2026-11-27T15:51:05Z",
+    "git_describe": "v0.8.0-1639-gf0e7d29e",
+    "host_class": "aarch64/0xd40/64",
+    "release_version": null,
+    "mem_gib": 247
+  },
+  "version": "v0.8.0-1639-gf0e7d29e",
+  "base_url": "https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/",
+  "datasets": [
+    {
+      "label": "New York City (5 boroughs)",
+      "geometry": "point",
+      "layer": "points-nyc-medium",
+      "features": 630065,
+      "id": "points-nyc-medium",
+      "tylertoo": {
+        "url": "https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/points-nyc-medium/tylertoo.pmtiles",
+        "bytes": 50042549,
+        "sha256": "6de09f89a23cc0d8ee2ff8e352440628ba115c26f85f4eaa1326f85792e4f349",
+        "min_zoom": 0,
+        "max_zoom": 14,
+        "argv": [
+          "target/release/tylertoo",
+          "tiles",
+          "<repo>/corpus/data/gpio/points-nyc-medium.parquet",
+          "<work>/points-nyc-medium/tylertoo.pmtiles",
+          "--min-zoom",
+          "0",
+          "--max-zoom",
+          "14",
+          "--layer-name",
+          "points-nyc-medium",
+          "--tile-buffer",
+          "8",
+          "--max-compressed-tile-size",
+          "500000",
+          "--max-tile-size",
+          "0",
+          "--report",
+          "<work>/points-nyc-medium.tylertoo.report.json",
+          "--force"
+        ]
+      },
+      "tippecanoe": {
+        "url": "https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/points-nyc-medium/tippecanoe.pmtiles",
+        "bytes": 95043769,
+        "sha256": "dddbf25a4ade67e2801ca6bca1dac881ea271cf1089665c3e4bc3994312460b2",
+        "min_zoom": 0,
+        "max_zoom": 16,
+        "argv": [
+          "/scratch/tools/tippecanoe-2.82.0/bin/tippecanoe",
+          "-o",
+          "<work>/points-nyc-medium/tippecanoe.pmtiles",
+          "-f",
+          "-Z",
+          "0",
+          "-z",
+          "14",
+          "-l",
+          "points-nyc-medium",
+          "-b",
+          "8",
+          "--maximum-tile-bytes",
+          "500000",
+          "--drop-fraction-as-needed",
+          "--quiet",
+          "--drop-densest-as-needed",
+          "--extend-zooms-if-still-dropping",
+          "<work>/points-nyc-medium.tippecanoe-input.fgb"
+        ]
+      }
+    },
+    {
+      "label": "Portland, OR metro",
+      "geometry": "polygon",
+      "layer": "polygons-portland-medium",
+      "features": 813456,
+      "id": "polygons-portland-medium",
+      "tylertoo": {
+        "url": "https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/polygons-portland-medium/tylertoo.pmtiles",
+        "bytes": 99368594,
+        "sha256": "b2e2f10729df6d9036530ad80bd7e83d43db3b4add8ac26465157946274cb45c",
+        "min_zoom": 2,
+        "max_zoom": 14,
+        "argv": [
+          "target/release/tylertoo",
+          "tiles",
+          "<repo>/corpus/data/gpio/polygons-portland-medium.parquet",
+          "<work>/polygons-portland-medium/tylertoo.pmtiles",
+          "--min-zoom",
+          "0",
+          "--max-zoom",
+          "14",
+          "--layer-name",
+          "polygons-portland-medium",
+          "--tile-buffer",
+          "8",
+          "--max-compressed-tile-size",
+          "500000",
+          "--max-tile-size",
+          "0",
+          "--report",
+          "<work>/polygons-portland-medium.tylertoo.report.json",
+          "--force"
+        ]
+      },
+      "tippecanoe": {
+        "url": "https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/polygons-portland-medium/tippecanoe.pmtiles",
+        "bytes": 73656973,
+        "sha256": "3a1a73e4689257dda34e876df4c000fb6511f06b85336eafc1c2520edabaaa21",
+        "min_zoom": 1,
+        "max_zoom": 14,
+        "argv": [
+          "/scratch/tools/tippecanoe-2.82.0/bin/tippecanoe",
+          "-o",
+          "<work>/polygons-portland-medium/tippecanoe.pmtiles",
+          "-f",
+          "-Z",
+          "0",
+          "-z",
+          "14",
+          "-l",
+          "polygons-portland-medium",
+          "-b",
+          "8",
+          "--maximum-tile-bytes",
+          "500000",
+          "--drop-fraction-as-needed",
+          "--quiet",
+          "--simplification=10",
+          "--drop-densest-as-needed",
+          "--coalesce-densest-as-needed",
+          "<work>/polygons-portland-medium.tippecanoe-input.fgb"
+        ]
+      }
+    },
+    {
+      "label": "State of Oregon, USA",
+      "geometry": "line",
+      "layer": "lines-oregon-large",
+      "features": 1203997,
+      "id": "lines-oregon-large",
+      "tylertoo": {
+        "url": "https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/lines-oregon-large/tylertoo.pmtiles",
+        "bytes": 306363824,
+        "sha256": "b9dc936be70b7ad29709e833375af7ca438d532d9fd7dedbca29c0abd62e7847",
+        "min_zoom": 0,
+        "max_zoom": 14,
+        "argv": [
+          "target/release/tylertoo",
+          "tiles",
+          "<repo>/corpus/data/gpio/lines-oregon-large.parquet",
+          "<work>/lines-oregon-large/tylertoo.pmtiles",
+          "--min-zoom",
+          "0",
+          "--max-zoom",
+          "14",
+          "--layer-name",
+          "lines-oregon-large",
+          "--tile-buffer",
+          "8",
+          "--max-compressed-tile-size",
+          "500000",
+          "--max-tile-size",
+          "0",
+          "--report",
+          "<work>/lines-oregon-large.tylertoo.report.json",
+          "--force"
+        ]
+      },
+      "tippecanoe": {
+        "url": "https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/lines-oregon-large/tippecanoe.pmtiles",
+        "bytes": 292222925,
+        "sha256": "136e9140a6e7abe74df059ae228d3790c206c09c3d429719bfaf94c369ae13af",
+        "min_zoom": 0,
+        "max_zoom": 14,
+        "argv": [
+          "/scratch/tools/tippecanoe-2.82.0/bin/tippecanoe",
+          "-o",
+          "<work>/lines-oregon-large/tippecanoe.pmtiles",
+          "-f",
+          "-Z",
+          "0",
+          "-z",
+          "14",
+          "-l",
+          "lines-oregon-large",
+          "-b",
+          "8",
+          "--maximum-tile-bytes",
+          "500000",
+          "--drop-fraction-as-needed",
+          "--quiet",
+          "--simplification=10",
+          "--drop-densest-as-needed",
+          "<work>/lines-oregon-large.tippecanoe-input.fgb"
+        ]
+      }
+    },
+    {
+      "label": "Moldova agricultural field boundaries (Fields of the World, alpha predictions)",
+      "geometry": "polygon",
+      "layer": "polygons-ftw-moldova-large",
+      "features": 631910,
+      "id": "polygons-ftw-moldova-large",
+      "tylertoo": {
+        "url": "https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/polygons-ftw-moldova-large/tylertoo.pmtiles",
+        "bytes": 177468973,
+        "sha256": "a5a7265a96d969dc9fdb2cb82e8f99299a8dd38b68db03a8f95792bec9de84ef",
+        "min_zoom": 0,
+        "max_zoom": 14,
+        "argv": [
+          "target/release/tylertoo",
+          "tiles",
+          "<repo>/corpus/data/gpio/polygons-ftw-moldova-large.parquet",
+          "<work>/polygons-ftw-moldova-large/tylertoo.pmtiles",
+          "--min-zoom",
+          "0",
+          "--max-zoom",
+          "14",
+          "--layer-name",
+          "polygons-ftw-moldova-large",
+          "--tile-buffer",
+          "8",
+          "--max-compressed-tile-size",
+          "500000",
+          "--max-tile-size",
+          "0",
+          "--report",
+          "<work>/polygons-ftw-moldova-large.tylertoo.report.json",
+          "--force"
+        ]
+      },
+      "tippecanoe": {
+        "url": "https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/polygons-ftw-moldova-large/tippecanoe.pmtiles",
+        "bytes": 166381380,
+        "sha256": "28eeb56d7a680fdff12575a1c96768c279dfb22ba8e7e0430e6ef23f9fde4271",
+        "min_zoom": 0,
+        "max_zoom": 14,
+        "argv": [
+          "/scratch/tools/tippecanoe-2.82.0/bin/tippecanoe",
+          "-o",
+          "<work>/polygons-ftw-moldova-large/tippecanoe.pmtiles",
+          "-f",
+          "-Z",
+          "0",
+          "-z",
+          "14",
+          "-l",
+          "polygons-ftw-moldova-large",
+          "-b",
+          "8",
+          "--maximum-tile-bytes",
+          "500000",
+          "--drop-fraction-as-needed",
+          "--quiet",
+          "--simplification=10",
+          "--drop-densest-as-needed",
+          "--coalesce-densest-as-needed",
+          "<work>/polygons-ftw-moldova-large.tippecanoe-input.fgb"
+        ]
+      }
+    }
+  ]
+}

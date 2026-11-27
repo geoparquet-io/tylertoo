@@ -1,0 +1,28 @@
+{
+  "provenance": {
+    "commit": "f0e7d29e",
+    "tylertoo_version": "tylertoo 0.8.0",
+    "host": "aarch64, CPU 0xd40, 64 CPUs",
+    "nproc": 64,
+    "kernel": "7.0.0-1018-aws",
+    "allocator": "mimalloc",
+    "tool_versions": {
+      "head": "tylertoo 0.8.0"
+    },
+    "inputs": [],
+    "date": "2026-11-27T15:50:42Z",
+    "git_describe": "v0.8.0-1639-gf0e7d29e",
+    "host_class": "aarch64/0xd40/64",
+    "release_version": null,
+    "mem_gib": 123,
+    "notes": [
+      "Recorded from an existing archive (brazil.pmtiles); not rebuilt by this run."
+    ]
+  },
+  "archive": {
+    "url": "https://data.source.coop/nlebovits/tylertoo-brazil-demo/brazil.pmtiles",
+    "bytes": 3141473252,
+    "sha256": "9b236196cb47efec16da29ac9f7416d4531a64ac38523ce8f74e18c09343b292",
+    "tiles": 850534
+  }
+}
