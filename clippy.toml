@@ -63,6 +63,9 @@ disallowed-methods = [
     # crates/core/src/atomic_output.rs (#427): a crash or error never leaves
     # a truncated archive at the destination path.
     { path = "std::fs::File::create", reason = "write output through atomic_output (#427); File::create truncates the destination in place" },
+    # The manylinux2014 wheels link against glibc 2.17. glibc added the
+    # gettid() wrapper in 2.30, so a call to it fails to link there.
+    { path = "libc::gettid", reason = "glibc 2.30+ only; the manylinux2014 wheel (glibc 2.17) fails to link. Use libc::syscall(libc::SYS_gettid)" },
 ]
 
 # New global warning gates must use the per-operation Diagnostics channel.
