@@ -966,7 +966,7 @@ fn forty_plus_zoom_levels_rejected() {
 /// reachable at the ceiling with line or polygon data. Deliberately not tested
 /// here: the point of this file is fast adversarial coverage, and a z30 line
 /// would take longer than every other test combined. See the max-zoom section
-/// of `docs/OVERVIEW_TUNING.md`.
+/// of `docs/reference/tuning.md`.
 #[test]
 fn points_at_the_max_zoom_ceiling_convert() {
     let tin = tempfile::NamedTempFile::new().unwrap();

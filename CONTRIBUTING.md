@@ -64,13 +64,13 @@ For public docstrings, CLI help, and `///` docs:
 - Leave out issue numbers, references to sweeps or decision files, restated
   defaults, internal crate names, memory formulas, and tuning history.
 - Give a performance-only knob one sentence and a link to the
-  [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/).
+  [tuning reference](https://geoparquet-io.github.io/tylertoo/reference/tuning/).
   Put tippecanoe comparisons in the
   [tippecanoe guide](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/),
   and benchmark numbers on the
   [benchmarks page](https://geoparquet-io.github.io/tylertoo/benchmarks/).
 - Keep one short runnable example per function. Move removed material
-  users still need to `docs/OVERVIEW_TUNING.md`, a guide, or
+  users still need to the [tuning reference](https://geoparquet-io.github.io/tylertoo/reference/tuning/), a guide, or
   `CHANGELOG.md`.
 
 ## Releasing (maintainers)

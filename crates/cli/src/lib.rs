@@ -99,33 +99,43 @@ enum Command {
     /// Combine PMTiles archives that hold disjoint tiles into one.
     Merge(MergeArgs),
     /// Cut a dataset's tile space into N disjoint shards for a sharded build.
+    ///
+    /// If row groups lack usable bounding-box statistics, or cover too much
+    /// of the pivot zoom, their rows are spread evenly instead of balanced.
+    /// Prepare tighter row groups with `gpio sort hilbert --add-bbox`.
+    /// Empty ranges are legal and produce empty archives that `merge` skips.
+    /// If many ranges are empty, reduce `--shards` or use a finer `--pivot`.
+    /// Choose a pivot with a few populated tiles per shard, within the build's
+    /// finest zoom. See
+    /// <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-same-build-into-shard-jobs>.
     ShardPlan(ShardPlanArgs),
     /// Serve PMTiles archives over HTTP with a map viewer.
-    ///
-    /// Run until Ctrl-C. The viewer at `/` handles MVT and MLT archives.
-    /// It loads MapLibre GL JS from unpkg.com and needs internet access.
-    ///
-    /// `/index.json` lists archive names. Each `{name}` is the archive's file
-    /// stem. `/{name}.json` returns TileJSON; `/{name}/{z}/{x}/{y}` returns
-    /// tiles, with HTTP 204 for absent tiles. `/{name}/metadata.json` returns
-    /// archive metadata; `/{name}/stats.json` returns tile-size statistics.
-    /// `/{name}.pmtiles` serves the archive with HTTP Range support.
-    /// It honours `If-Match` and `If-Range` against its `ETag`.
-    /// If a Range read detects the file being rewritten in place during the
-    /// read, it returns HTTP 412 for requests with `If-Match` or `If-Range`,
-    /// or HTTP 503 otherwise. A whole-file download caught by a rewrite is
-    /// cut off before its `Content-Length`. Renaming another file over the
-    /// path does not affect a download in progress.
-    ///
-    /// At most 64 responses can be in flight at once. Further requests get
-    /// HTTP 503 with `Retry-After: 1`.
-    ///
-    /// `serve` returns HTTP 204 for missing tiles without scaling up a stored
-    /// ancestor, so variable-depth archives (`--generate-variable-depth-tile-pyramid`)
-    /// show holes below stopped tiles; `serve` warns when it opens one.
-    ///
-    /// An archive rewritten on disk is reopened on the next request for it;
-    /// if it does not reopen, requests for it return HTTP 503 until it does.
+    #[command(long_about = format!(r#"Serve PMTiles archives over HTTP with a map viewer.
+
+Run until Ctrl-C. The viewer at `/` handles MVT and MLT archives.
+It loads MapLibre GL JS from unpkg.com and needs internet access.
+
+`/index.json` lists archive names. Each `{{name}}` is the archive's file
+stem. `/{{name}}.json` returns TileJSON; `/{{name}}/{{z}}/{{x}}/{{y}}` returns
+tiles, with HTTP 204 for absent tiles. `/{{name}}/metadata.json` returns
+archive metadata; `/{{name}}/stats.json` returns tile-size statistics.
+`/{{name}}.pmtiles` serves the archive with HTTP Range support.
+It honors `If-Match` and `If-Range` against its `ETag`.
+If a Range read detects the file being rewritten in place during the
+read, it returns HTTP 412 for requests with `If-Match` or `If-Range`,
+or HTTP 503 otherwise. A whole-file download caught by a rewrite is
+cut off before its `Content-Length`. Renaming another file over the
+path does not affect a download in progress.
+
+At most {responses} responses can be in flight at once. Further requests get
+HTTP 503 with a `Retry-After` header.
+
+`serve` returns HTTP 204 for missing tiles without scaling up a stored
+ancestor, so variable-depth archives (`tiles --generate-variable-depth-tile-pyramid`)
+show holes below stopped tiles; `serve` warns when it opens one.
+
+An archive rewritten on disk is reopened on the next request for it;
+if it does not reopen, requests for it return HTTP 503 until it does."#, responses = tylertoo_core::internal::serve::MAX_RESPONSES))]
     Serve(ServeArgs),
     /// Emit the full CLI reference as Markdown (docs generator, hidden).
     ///
@@ -134,7 +144,16 @@ enum Command {
     /// of the production binary.
     #[cfg(feature = "gen-docs")]
     #[command(hide = true)]
-    GenReferenceDocs,
+    GenReferenceDocs {
+        #[arg(value_enum)]
+        mode: Option<ReferenceDocsMode>,
+    },
+}
+
+#[cfg(feature = "gen-docs")]
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum ReferenceDocsMode {
+    Tippecanoe,
 }
 
 /// Print a composed archive's publication metadata (`merge`, `pyramid`).
@@ -185,7 +204,8 @@ fn quoted_preview(value: &str) -> String {
 /// Arguments for `tylertoo merge`.
 ///
 /// The merge copies tile bodies unchanged and refuses inputs whose tile
-/// ids overlap; see the sharded builds guide.
+/// ids overlap. Empty archives are skipped. See
+/// <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-same-build-into-shard-jobs>.
 #[derive(Parser, Debug)]
 pub struct MergeArgs {
     /// Output PMTiles archive.
@@ -302,13 +322,13 @@ pub struct ShardPlanArgs {
     pub output: PathBuf,
 
     /// Number of data shards. Run one `tiles --shard i/N` job per
-    /// shard plus one `--shard coarse` job, then merge all N+1 archives.
+    /// shard plus one `--shard coarse` job, then merge the data archives and the coarse archive.
     #[arg(long, value_name = "N")]
     pub shards: usize,
 
-    /// Pivot zoom: data shards cover this zoom through `--max-zoom`; the
+    /// Pivot zoom: data shards cover this zoom through `tiles --max-zoom`; the
     /// coarse job covers lower zooms. Choose a zoom with a few populated
-    /// tiles per shard, usually z4 to z8.
+    /// tiles per shard.
     #[arg(long, value_name = "ZOOM", default_value = "6")]
     pub pivot: u8,
 
@@ -461,8 +481,14 @@ where
         Command::Serve(args) => run_serve(&args),
         Command::Tiles(args) => run_tiles(*args),
         #[cfg(feature = "gen-docs")]
-        Command::GenReferenceDocs => {
-            print!("{}", gen_reference_markdown());
+        Command::GenReferenceDocs { mode } => {
+            print!(
+                "{}",
+                match mode {
+                    Some(ReferenceDocsMode::Tippecanoe) => tippecanoe_doc::render(),
+                    None => gen_reference_markdown(),
+                }
+            );
             Ok(())
         }
     };
@@ -522,6 +548,9 @@ where
 
 #[cfg(feature = "gen-docs")]
 mod reference_docs;
+
+#[cfg(feature = "gen-docs")]
+mod tippecanoe_doc;
 
 /// Render the CLI reference from the clap help strings and option definitions.
 #[cfg(feature = "gen-docs")]
@@ -2060,7 +2089,478 @@ fn format_number(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    // Foreign tools may be named when comparing their controls with ours.
+    const FOREIGN_FLAGS: &[&str] = &[
+        "buffer",
+        "coalesce-densest-as-needed",
+        "layer-by-column",
+        "use-attribute-for-id",
+        "no-default-features",
+    ];
+    // Publication, plumbing, and fleet orchestration belong to their references.
+    const UNTUNED_FLAGS: &[&str] = &[
+        "help",
+        "version",
+        "quiet",
+        "verbose",
+        "name",
+        "description",
+        "attribution",
+        "report",
+        "force",
+        "files-from",
+        "shard",
+        "shard-plan",
+        "plan-only",
+        "tile-range",
+        "zoom-ceiling",
+        "preset",
+    ];
+
+    /// Split the literal shell examples without executing a shell. Reject
+    /// substitutions so examples stay self-contained and safe to validate.
+    fn tuning_shell_words(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut quote = None;
+        let mut escape = false;
+        for c in line.chars() {
+            assert!(!matches!(c, '$' | '`'), "nonliteral example: {line}");
+            if escape {
+                word.push(c);
+                escape = false;
+            } else if c == '\\' && quote != Some('\'') {
+                escape = true;
+            } else if quote == Some(c) {
+                quote = None;
+            } else if quote.is_none() && matches!(c, '\'' | '"') {
+                quote = Some(c);
+            } else if quote.is_none() && c.is_whitespace() {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            } else {
+                word.push(c);
+            }
+        }
+        assert!(quote.is_none() && !escape, "unfinished shell word: {line}");
+        if !word.is_empty() {
+            words.push(word);
+        }
+        words
+    }
+
+    #[test]
+    fn tuning_page_follows_the_cli() {
+        let page = include_str!("../../../docs/reference/tuning.md");
+        let mut root = Cli::command();
+        root.build();
+        let mut known = Vec::new();
+        walk_commands(&root, &mut |command| {
+            for arg in command.get_arguments() {
+                known.extend(arg.get_long().map(str::to_owned));
+                known.extend(
+                    arg.get_all_aliases()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(str::to_owned),
+                );
+            }
+        });
+        // Rules 1 and 2: spellings and coverage follow clap.
+        let mentioned: Vec<_> = named_flags(page).collect();
+        for flag in &mentioned {
+            assert!(
+                known.iter().any(|s| s == flag) || FOREIGN_FLAGS.contains(flag),
+                "unknown --{flag}"
+            );
+        }
+        for name in ["tiles", "overview", "export-pmtiles", "pyramid"] {
+            for arg in root
+                .find_subcommand(name)
+                .unwrap()
+                .get_arguments()
+                .filter(|a| !a.is_hide_set())
+            {
+                if let Some(flag) = arg.get_long() {
+                    assert!(
+                        mentioned.contains(&flag) || UNTUNED_FLAGS.contains(&flag),
+                        "mention --{flag} in docs/reference/tuning.md or add it to UNTUNED_FLAGS"
+                    );
+                }
+            }
+        }
+        let lower = page.to_lowercase();
+        // Rule 3: no default table or numeric default statement.
+        for line in lower.lines() {
+            assert!(
+                !line.split('|').any(|cell| cell.trim() == "default"),
+                "default table: {line}"
+            );
+            for rest in line.split("default").skip(1) {
+                let rest = rest.trim_start();
+                let rest = rest
+                    .strip_prefix("is ")
+                    .or_else(|| rest.strip_prefix("of "))
+                    .unwrap_or(rest);
+                assert!(
+                    !rest.starts_with(|c: char| c.is_ascii_digit()),
+                    "numeric default: {line}"
+                );
+                if line.contains("(default") {
+                    assert!(
+                        !rest
+                            .split(')')
+                            .next()
+                            .unwrap()
+                            .contains(|c: char| c.is_ascii_digit()),
+                        "numeric default: {line}"
+                    );
+                }
+            }
+        }
+        // Rules 4 and 5: no measurements in prose, or issue citations anywhere.
+        let mut fence = None;
+        let mut bench = false;
+        for line in page.lines() {
+            if line.contains("<!-- bench:") {
+                bench = true;
+            }
+            if line.contains("<!-- /bench") {
+                bench = false;
+            }
+            for rest in line.split('#').skip(1) {
+                let digits = rest.chars().take_while(char::is_ascii_digit).count();
+                assert!(
+                    digits == 0 || rest[digits..].starts_with('-'),
+                    "issue citation: {line}"
+                );
+            }
+            if let Some(lang) = line.strip_prefix("```") {
+                fence = if fence.is_some() {
+                    None
+                } else {
+                    Some(lang.trim())
+                };
+                continue;
+            }
+            if fence.is_none() && !bench {
+                for (i, c) in line.char_indices().filter(|(_, c)| c.is_ascii_digit()) {
+                    let tail = &line[i + c.len_utf8()..];
+                    assert!(
+                        !["s", "ms", "MB", "GB", "MiB", "GiB", "%", "×", "x"]
+                            .iter()
+                            .any(|u| tail.starts_with(u)),
+                        "measurement: {line}"
+                    );
+                }
+            }
+            // Rule 7: parse commands, then invoke the same pre-I/O owner as dispatch.
+            if fence == Some("bash") && line.trim_start().starts_with("tylertoo ") {
+                let cli = Cli::try_parse_from(tuning_shell_words(line))
+                    .unwrap_or_else(|e| panic!("{line}: {e}"));
+                match cli.command {
+                    Command::Tiles(args) => {
+                        tiles_options(&args).unwrap().validate().unwrap();
+                    }
+                    Command::Overview(args) => {
+                        overview_options(&args).unwrap().validate().unwrap();
+                    }
+                    Command::ExportPmtiles(args) => {
+                        export_options(&args).unwrap().validate().unwrap();
+                    }
+                    _ => panic!("add pre-I/O validation for example: {line}"),
+                }
+            }
+        }
+        // Rule 6: Python spellings follow the core keyword registry.
+        let keys: std::collections::BTreeSet<_> =
+            ["convert", "overview", "export_pmtiles", "pyramid"]
+                .into_iter()
+                .flat_map(|name| {
+                    tylertoo_core::internal::overview::config::keywords::command_defaults(name)
+                        .into_iter()
+                        .map(|(key, _)| key)
+                })
+                .collect();
+        for (i, token) in page.split('`').enumerate().filter(|(i, _)| i % 2 == 1) {
+            let prefix = page.split('`').take(i).collect::<Vec<_>>().join("`");
+            if !token.starts_with('-') && (token.ends_with('=') || prefix.ends_with("Python ")) {
+                let key = token.trim_end_matches('=');
+                assert!(keys.contains(key), "unknown Python keyword: {key}");
+            }
+        }
+        // Rule 8: keep this a short guide to choices.
+        assert!(page.lines().count() <= 350);
+    }
     use super::*;
+
+    fn help_texts(command: &clap::Command) -> Vec<String> {
+        command
+            .get_arguments()
+            .flat_map(|arg| [arg.get_help(), arg.get_long_help()])
+            .chain([command.get_about(), command.get_long_about()])
+            .flatten()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn has_measurement(text: &str) -> bool {
+        text.char_indices().any(|(index, c)| {
+            if !c.is_ascii_digit() {
+                return false;
+            }
+            let rest = text[index..]
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.')
+                .trim_start();
+            ["%", "×", "x ", "ms", "min", "s"].iter().any(|unit| {
+                rest.strip_prefix(unit).is_some_and(|after| {
+                    matches!(*unit, "%" | "×" | "x ")
+                        || after.chars().next().is_none_or(|c| !c.is_alphanumeric())
+                })
+            })
+        })
+    }
+
+    #[test]
+    fn help_states_no_measurements() {
+        assert!(has_measurement("costs 5-7% more"));
+        assert!(has_measurement("takes 1.5x longer"));
+        assert!(has_measurement("takes 10 ms"));
+        assert!(!has_measurement("limit 1024 bytes"));
+        let mut failures = Vec::new();
+        walk_commands(&Cli::command(), &mut |command| {
+            for text in help_texts(command) {
+                if has_measurement(&text) {
+                    failures.push(format!("{}: {text}", command.get_name()));
+                }
+            }
+        });
+        assert!(failures.is_empty(), "measured claims: {failures:#?}");
+    }
+
+    fn named_flags(text: &str) -> impl Iterator<Item = &str> {
+        text.split("--")
+            .skip(1)
+            .map(|rest| {
+                rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                    .next()
+                    .unwrap()
+            })
+            .filter(|flag| flag.starts_with(|c: char| c.is_ascii_alphanumeric()))
+    }
+
+    #[test]
+    fn pass1_memory_message_flags_exist_on_tiles_and_overview() {
+        let mut root = Cli::command();
+        root.build();
+        for message in tylertoo_core::internal::pass1_memory_messages_for_docs() {
+            let flags: Vec<_> = named_flags(&message).collect();
+            for required in [
+                "memory-limit",
+                "plan",
+                "coalesce-max-level-rows",
+                "no-coalesce-lines",
+            ] {
+                assert!(flags.contains(&required), "missing --{required}: {message}");
+            }
+            for name in ["tiles", "overview"] {
+                let command = root.find_subcommand(name).unwrap();
+                for flag in &flags {
+                    assert!(
+                        command
+                            .get_arguments()
+                            .any(|arg| arg.get_long() == Some(*flag)),
+                        "{name} has no --{flag}: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tile_memory_message_flags_exist_on_tiles_and_overview() {
+        let message = tylertoo_core::internal::overview::export::tile_memory_message_for_docs();
+        let mut root = Cli::command();
+        root.build();
+        for name in ["tiles", "overview"] {
+            let command = root.find_subcommand(name).unwrap();
+            for flag in named_flags(&message).chain(named_flags(
+                tylertoo_core::internal::diagnostics::EMPTY_LEVEL_ADVICE,
+            )) {
+                // The export-only partition control cannot fix this failure;
+                // the diagnostic should focus on remedies available to both.
+                assert!(
+                    command.get_arguments().any(|a| a.get_long() == Some(flag)),
+                    "{name}: --{flag}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_batch_help_range_matches_validation() {
+        use tylertoo_core::internal::overview::convert::{
+            READ_BATCH_SIZE_MAX, READ_BATCH_SIZE_MIN, READ_WORKERS_MAX,
+        };
+        let root = Cli::command();
+        let help = root
+            .find_subcommand("tiles")
+            .unwrap()
+            .get_arguments()
+            .find(|a| a.get_long() == Some("read-batch-size"))
+            .unwrap()
+            .get_help()
+            .unwrap()
+            .to_string();
+        let range = help
+            .split("range ")
+            .nth(1)
+            .expect("missing range")
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let numbers: Vec<usize> = range
+            .trim_end_matches('.')
+            .split("..=")
+            .map(|n| n.parse().unwrap())
+            .collect();
+        assert_eq!(numbers, [READ_BATCH_SIZE_MIN, READ_BATCH_SIZE_MAX]);
+        let help = root
+            .find_subcommand("tiles")
+            .unwrap()
+            .get_arguments()
+            .find(|a| a.get_long() == Some("read-workers"))
+            .unwrap()
+            .get_help()
+            .unwrap()
+            .to_string();
+        let cap: usize = help
+            .split("up to ")
+            .nth(1)
+            .unwrap()
+            .split('.')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(cap, READ_WORKERS_MAX);
+        let message =
+            tylertoo_core::internal::overview::convert::InvalidOption::ReadBatchSize.to_string();
+        let numbers: Vec<usize> = message
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(numbers, [READ_BATCH_SIZE_MIN, READ_BATCH_SIZE_MAX]);
+    }
+
+    #[test]
+    fn shard_plan_help_explains_unplaced_rows_and_empty_ranges() {
+        let mut root = Cli::command();
+        root.build();
+        let help = root
+            .find_subcommand_mut("shard-plan")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for remedy in [
+            "gpio sort hilbert --add-bbox",
+            "empty",
+            "--shards",
+            "--pivot",
+        ] {
+            assert!(help.contains(remedy), "missing {remedy}: {help}");
+        }
+    }
+
+    #[cfg(feature = "gen-docs")]
+    #[test]
+    fn reference_has_option_row_anchors() {
+        let text = gen_reference_markdown();
+        for anchor in ["option-point-thinning", "option-max-zoom", "option-band"] {
+            assert!(
+                text.contains(&format!("<a id=\"{anchor}\"></a>")),
+                "missing {anchor}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_flag_named_in_help_exists() {
+        let mut root = Cli::command();
+        root.build();
+        let mut failures = Vec::new();
+        walk_commands(&root, &mut |command| {
+            for text in help_texts(command) {
+                let allowed: Vec<_> = std::iter::once(command)
+                    .chain(root.get_subcommands().filter(|sibling| {
+                        text.contains(&format!("`{}", sibling.get_name()))
+                            || text.contains(&format!("tylertoo {}", sibling.get_name()))
+                    }))
+                    .flat_map(|cmd| cmd.get_arguments())
+                    .flat_map(|arg| {
+                        arg.get_long()
+                            .into_iter()
+                            .chain(arg.get_all_aliases().unwrap_or_default())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                // External tippecanoe spellings, only when named explicitly.
+                const TIPPECANOE: &[&str] = &["generate-variable-depth-tile-pyramid"];
+                for flag in named_flags(&text) {
+                    if !allowed.contains(&flag)
+                        && !(text.contains("gpio sort hilbert") && flag == "add-bbox")
+                        && !(text.contains("tippecanoe") && TIPPECANOE.contains(&flag))
+                    {
+                        failures.push(format!("{}: --{flag} in {text}", command.get_name()));
+                    }
+                }
+            }
+        });
+        assert!(failures.is_empty(), "unknown help flags: {failures:#?}");
+    }
+
+    #[test]
+    fn server_help_response_limit_matches_owner() {
+        let command = Cli::command();
+        let text = command
+            .find_subcommand("serve")
+            .unwrap()
+            .get_long_about()
+            .unwrap()
+            .to_string();
+        let rendered: usize = text
+            .split("At most ")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(rendered, tylertoo_core::internal::serve::MAX_RESPONSES);
+    }
+
+    fn walk_commands(command: &clap::Command, visit: &mut impl FnMut(&clap::Command)) {
+        visit(command);
+        for child in command.get_subcommands() {
+            walk_commands(child, visit);
+        }
+    }
+
+    #[test]
+    fn no_option_hides_its_default() {
+        let mut hidden = std::collections::BTreeSet::new();
+        walk_commands(&Cli::command(), &mut |command| {
+            for arg in command.get_arguments() {
+                if arg.is_hide_default_value_set() {
+                    hidden.insert(arg.get_id().to_string());
+                }
+            }
+        });
+        assert!(hidden.is_empty(), "hidden defaults: {hidden:?}");
+    }
     use tylertoo_core::internal::overview::config::cli::resolve_level_plan;
     use tylertoo_core::internal::overview::config::cli::{
         parse_in_flight_batches, parse_partition_wave, parse_read_workers, parse_size_bytes,

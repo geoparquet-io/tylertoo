@@ -24,7 +24,7 @@ it skips completed work if the inputs haven't changed:
 | `fetch` | The profile's inputs from the [`bench-coalesce-v1`](https://github.com/geoparquet-io/tylertoo/releases/tag/bench-coalesce-v1) release, plus MapLibre GL JS 4.7.1 and pmtiles.js 3.2.1, each checked against its sha256 in `bench.toml` | file and sha256 |
 | `build` | `cargo build --release --bin tylertoo`; skipped with `--bin PATH` | cargo |
 | `tile` | `tylertoo overview` then `export-pmtiles` for each dataset and setting, `repeats` times each, under GNU time with a wall and RSS cap (`run_matrix.run_cell`) | binary sha256, `run_matrix.py`, input, flags, repeats |
-| `tippecanoe` | The pinned tippecanoe (`benchmarks/e2e/setup_tippecanoe.sh`: 2.82.0, commit 4f26211) on FlatGeobuf input, with #745's arguments | tippecanoe commit, input, arguments, gpio version |
+| `tippecanoe` | The pinned tippecanoe (`benchmarks/e2e/setup_tippecanoe.sh`) on FlatGeobuf input, with #745's arguments | tippecanoe commit, input, arguments, gpio version |
 | `score` | `render_maplibre.py` for each window, `render_coverage.py` and `tile_metrics.py` for each check | archive sha256s, input, scorer script, and the entry's config |
 | `report` | `report-<profile>.json` and `.md` in `<work>/runs/<binary>/`; the latest run's also as `<work>/report.json` and `report.md` | — |
 

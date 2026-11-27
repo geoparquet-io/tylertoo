@@ -789,8 +789,8 @@ impl From<Vec<AssignFeature>> for FeatureTable {
 /// the old 4×GSD eligibility gate was strictly stricter than what
 /// survives writing and starved coarse zooms for no benefit — 4→2
 /// gives 3–5× more coarse-level polygons on the Moldova corpus at
-/// +0.1% file size, while values below 2 only admit candidates that
-/// RDP kills anyway (wasted density-budget slots).
+/// +0.1% file size in that sweep. Collapsed polygons now contribute
+/// placeholder squares, so that sweep does not establish a lower useful gate.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
@@ -799,33 +799,28 @@ pub struct AssignConfig {
     /// Grid-cell multiplier for points (coarser grid ⇒ more aggressive thin).
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().point_thinning))]
-    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
-    #[cfg_attr(feature = "cli", arg(help = "Point thinning grid cell, as a multiple of the level's GSD (default 4.0, or 16.0 with `--cluster`). Larger cells keep fewer points", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Point thinning grid cell, as a multiple of the level's GSD. With `--cluster`, the default is {CLUSTER_POINT_THINNING_DEFAULT}. Larger cells keep fewer points"), long_help = None))]
     pub point_thinning: f64,
     /// Grid-cell multiplier for lines.
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().line_thinning))]
-    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
-    #[cfg_attr(feature = "cli", arg(help = "Line thinning grid cell, as a multiple of the level's GSD (default 1.0). Larger cells keep fewer lines", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Line thinning grid cell, as a multiple of the level's GSD. Larger cells keep fewer lines", long_help = None))]
     pub line_thinning: f64,
     /// Grid-cell multiplier for polygons.
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().polygon_thinning))]
-    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
-    #[cfg_attr(feature = "cli", arg(help = "Polygon thinning grid cell, as a multiple of the level's GSD (default 0, off). Larger cells keep fewer polygons and can remove a polygon whose center falls in a larger neighbor's cell", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Polygon thinning grid cell, as a multiple of the level's GSD. Larger cells keep fewer polygons and can remove a polygon whose center falls in a larger neighbor's cell", long_help = None))]
     pub polygon_thinning: f64,
     /// A line is eligible at level `z` only if `diag >= line_visibility·gsd(z)`.
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().line_visibility))]
-    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
-    #[cfg_attr(feature = "cli", arg(help = "Drop lines whose bbox diagonal is shorter than this many GSDs at a level (default 2.0)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Drop lines whose bbox diagonal is shorter than this many GSDs at a level", long_help = None))]
     pub line_visibility: f64,
     /// A polygon is eligible at level `z` only if
     /// `diag >= polygon_visibility·gsd(z)`.
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().polygon_visibility))]
-    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
-    #[cfg_attr(feature = "cli", arg(help = "Drop polygons whose bbox diagonal is shorter than this many GSDs at a level (default 2.0)", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Gate polygons whose bbox diagonal is shorter than this many GSDs at a level. In duplicating mode, rejected polygons contribute area to collapse squares unless a point or drop disposition applies; lowering this gate keeps more source geometry, not necessarily more visible area", long_help = None))]
     pub polygon_visibility: f64,
     /// Whether larger or smaller `sort_key` wins.
     #[serde(
@@ -2048,7 +2043,7 @@ pub struct DensityBudgetConfig {
         default_value_t = Self::default().drop_rate,
         help_heading = "Density budget"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Density budget decay: each coarser level keeps 1/rate of the next finer level's feature budget. Larger values thin mid zooms more", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Density budget decay: each coarser level keeps the next finer level's budget divided by this rate. Larger values thin mid zooms more. A rate at or below one silently disables the budget", long_help = None))]
     pub drop_rate: f64,
     /// Spatial-fairness strength (`>= 1`; smaller is rejected by validation). `1.0` = proportional cut; larger =
     /// sublinear, protecting sparse neighborhoods (dense areas kept to the
@@ -2880,7 +2875,8 @@ mod tests {
     /// `pass1_bytes_per_row_matches_the_feature_table`.
     ///
     /// This is the number `convert::PASS1_BYTES_PER_ROW` preflights against and
-    /// that `docs/guides/scaling.md` sizes coarse jobs with, so
+    /// that the preflight message prints for coarse jobs (see
+    /// <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>), so
     /// it is pinned here as well as there. The pre-#543 array-of-structs table
     /// was `size_of::<AssignFeature>()` = 64 B/row.
     #[test]

@@ -18,7 +18,7 @@ Args:
     mode: `"duplicating"` makes each level a complete map;
         `"partitioning"` stores each feature once.
     min_zoom: Coarsest zoom.
-    max_zoom: Finest zoom, `"auto"` to estimate it (at most 16), or
+    max_zoom: Finest zoom, `"auto"` to estimate it (at most {const:AUTO_MAX_ZOOM_CEILING}), or
         `"auto:14"` to cap the estimate at z14.
     gsds: Per-level GSDs in meters, coarse to fine, instead of
         zooms.
@@ -48,7 +48,7 @@ Args:
         or pre-levelled input. Sets the defaults of the options
         below to off; an option you pass still applies.
     simplify_factor: Simplification tolerance, in GSDs, or `None`
-        for 1 (0 with `verbatim`).
+        for {default:simplify_factor} (zero with `verbatim`).
     collapse: Represent small polygons as points instead of the
         default placeholder squares.
     collapse_square: Represent small polygons as placeholder
@@ -64,20 +64,20 @@ Args:
         `"0-7:point,8-14:geom"`.
     cascade: Speed up simplification by deriving each level from
         the next finer one.
-    point_thinning: Point grid cell size in GSDs, or `None` for 4
-        (16 with `cluster`, 0 with `verbatim`).
-    line_thinning: Line grid cell size in GSDs, or `None` for 1
-        (0 with `verbatim`).
+    point_thinning: Point grid cell size in GSDs, or `None` for {default:point_thinning}
+        ({const:CLUSTER_POINT_THINNING_DEFAULT} with `cluster`, zero with `verbatim`).
+    line_thinning: Line grid cell size in GSDs, or `None` for {default:line_thinning}
+        (zero with `verbatim`).
     polygon_thinning: Polygon grid cell size in GSDs, or `None` for
-        0 (off).
+        {default:polygon_thinning} (off).
     line_visibility: Smallest line bounding-box diagonal kept, in
-        GSDs, or `None` for 2 (0 with `verbatim`).
+        GSDs, or `None` for {default:line_visibility} (zero with `verbatim`).
     polygon_visibility: Smallest polygon bounding-box diagonal kept,
-        in GSDs, or `None` for 2 (0 with `verbatim`).
+        in GSDs, or `None` for {default:polygon_visibility} (zero with `verbatim`).
     drop_rate: Ratio between feature budgets of adjacent levels.
     drop_gamma: How strongly the budget spares sparse areas.
     density_drop: Apply the per-level feature budget, or `None` for
-        on (off with `verbatim`). It thins points only unless
+        `{default:density_drop}` (off with `verbatim`). It thins points only unless
         `drop_lines` or `drop_polygons` is set.
     drop_lines: Apply the feature budget to lines too.
     drop_polygons: Apply the feature budget to polygons too, which
@@ -89,13 +89,13 @@ Args:
     accumulate_attributes: Aggregation method for each column in
         a cluster.
     cluster_categories: String column to count per cluster in `COL:value`
-        columns, or `None` for off. Requires `cluster`. Keep up to 100
+        columns, or `None` for off. Requires `cluster`. Keep up to {const:MAX_CLUSTER_CATEGORIES}
         values by frequency, breaking ties by ascending value; count the
         rest, nulls, and literal `other` in `COL:other` when needed.
         Null count cells mean zero. A point outside any cluster counts 1
         for its own value; each row's counts sum to `point_count`.
     coalesce_lines: Join touching same-class lines at coarse levels,
-        or `None` for on (off with `verbatim`). `True` is refused in
+        or `None` for `{default:coalesce_lines}` (off with `verbatim`). `True` is refused in
         partitioning mode.
     coalesce_snap: Largest gap between joined line ends, in GSDs.
     coalesce_junction_angle: Largest turn through a junction, in
@@ -116,7 +116,7 @@ Args:
         double the row-group cap per zoom coarser than the finest.
     full_column_stats: Keep Parquet statistics for every column.
     read_batch_size: Rows per
-        [read batch](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
+        [read batch](https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory).
     bbox: Keep features that intersect this lon/lat box, also one
         ±360° wrap away, as for 0..360 data.
     mask: Keep features whose geometry intersects polygons or
@@ -132,7 +132,7 @@ Args:
         WKB/shapely masks have no CRS: use EPSG:3857 for EPSG:3857 input,
         otherwise lon/lat EPSG:4326, including for reprojected input.
     filter: SQL-style predicate, such as `"confidence > 0.8"`.
-    profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles):
+    profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory):
         `"speed"` holds everything in RAM, `"bounded"` uses disk and
         holds the least, and `"auto"` sizes to the machine's memory.
         Wheels use mimalloc. Under `"bounded"`, it purges freed pages
@@ -141,23 +141,23 @@ Args:
         restored; overlapping calls on other threads share it while any
         `"bounded"` call runs. A non-musl source build uses the system allocator with
         `maturin build --no-default-features` (musl always uses mimalloc).
-    workers: [Worker threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#worker-threads)
+    workers: [Worker threads](https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory)
         for the whole run. `None` (default) uses `RAYON_NUM_THREADS`
         when set, else every core under `"auto"` and `"speed"` and at
-        most 40 under `"bounded"`. `0` is an error. The pool is
+        most {const:WORKER_THREADS_MAX} under `"bounded"`. `0` is an error. The pool is
         process-wide, so the first call in a process sets it and later
         calls keep it.
-    memory_limit: [Memory limit](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-limit)
-        in bytes, such as `24 * 2**30`, used in place of the detected
+    memory_limit: [Memory limit](https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory)
+        in bytes, used in place of the detected
         available memory (cgroup limit or `MemAvailable`). It overrides
         `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. `0` is an error. The limit is
         process-wide: it stays in force for later calls in the process
         until another call sets one.
-    in_flight_batches: [Concurrent batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency),
+    in_flight_batches: [Concurrent batches](https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory),
         or `0` to size from the CPU count.
-    read_workers: [Reader threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency),
+    read_workers: [Reader threads](https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory),
         or `0` to size from the CPU count.
-    spill_dir: [Staging directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files)
+    spill_dir: [Staging directory](https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory)
         for remote input.
     save_plan: Save the convert plan (pass 1 and the level
         assignment) here and continue converting.

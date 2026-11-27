@@ -1523,6 +1523,28 @@ fn rg_can_match(expr: &BoundExpr, rg: &RowGroupMetaData, chunk_idx: &HashMap<&st
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tuning_page_filter_examples_parse() {
+        let page = include_str!("../../../../docs/reference/tuning.md");
+        let block = page
+            .split_once("<!-- check:filter -->")
+            .expect("missing checked filter examples")
+            .1;
+        let block = block
+            .split_once("```")
+            .unwrap()
+            .1
+            .split_once('\n')
+            .unwrap()
+            .1
+            .split_once("```")
+            .unwrap()
+            .0;
+        assert!(!block.trim().is_empty());
+        for expression in block.lines().filter(|line| !line.trim().is_empty()) {
+            super::parse_filter(expression).unwrap_or_else(|e| panic!("{expression}: {e}"));
+        }
+    }
     use super::*;
     use arrow_array::{
         ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
@@ -1917,7 +1939,7 @@ mod tests {
     /// The `IS NULL` pair is the awkward corner and is pinned on purpose: a
     /// NaN is a present value, so `IS NULL` does NOT match it and
     /// `IS NOT NULL` does. Together with the rule above, no predicate selects
-    /// NaN rows — documented in `docs/OVERVIEW_TUNING.md`.
+    /// NaN rows, documented in `docs/reference/tuning.md#expression-syntax`.
     #[test]
     fn eval_nan_is_unknown_not_a_comparable_value() {
         let schema = Arc::new(Schema::new(vec![Field::new(

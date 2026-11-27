@@ -617,9 +617,9 @@ pub struct ConvertSyntax {
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Generalization"))]
     pub no_collapse: bool,
     /// Polygon representation by zoom band: comma-separated
-    /// `LO-HI:KIND`, where `KIND` is `geom`, `point`, or `square`, such as
-    /// `0-7:point,8-14:geom`. Band rules:
-    /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
+    /// `LO-HI:KIND`, where `KIND` is `geom`, `point`, or `square`.
+    /// Ranges are inclusive. Band rules:
+    /// <https://geoparquet-io.github.io/tylertoo/reference/tuning/#collapse-and-representation>.
     #[cfg_attr(
         feature = "cli",
         arg(long, value_name = "SPEC", help_heading = "Generalization")
@@ -656,6 +656,30 @@ impl Default for ConvertSyntax {
             explicit_coalesce_lines: false,
         }
     }
+}
+
+/// Numeric facts used by the generated Python docstrings.
+pub fn doc_constant(name: &str) -> Option<String> {
+    use crate::overview::{assign, auto_zoom, cluster, convert, export};
+    Some(match name {
+        "CLUSTER_POINT_THINNING_DEFAULT" => assign::CLUSTER_POINT_THINNING_DEFAULT.to_string(),
+        "AUTO_MAX_ZOOM_CEILING" => auto_zoom::AUTO_MAX_ZOOM_CEILING.to_string(),
+        "MAX_CLUSTER_CATEGORIES" => cluster::MAX_CLUSTER_CATEGORIES.to_string(),
+        "WORKER_THREADS_MAX" => convert::WORKER_THREADS_MAX.to_string(),
+        "READ_WORKERS_MAX" => convert::READ_WORKERS_MAX.to_string(),
+        "MAX_EXACT_DOUBLE_INTEGER" => crate::tile_format::MAX_EXACT_DOUBLE_INTEGER.to_string(),
+        "U32_BITS" => u32::BITS.to_string(),
+        "U64_BITS" => u64::BITS.to_string(),
+        "MAX_TILE_BUFFER_PX" => export::MAX_TILE_BUFFER_PX.to_string(),
+        "DEFAULT_TILE_SIZE_LIMIT" => convert::human_bytes(export::DEFAULT_TILE_SIZE_LIMIT as u64),
+        "DEFAULT_COMPRESSED_TILE_SIZE_LIMIT" => {
+            convert::human_bytes(export::DEFAULT_COMPRESSED_TILE_SIZE_LIMIT as u64)
+        }
+        "DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR" => {
+            export::DEFAULT_LINE_MAX_ZOOM_SIMPLIFY_FACTOR.to_string()
+        }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

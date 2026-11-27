@@ -71,12 +71,14 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --package tylertoo
 
-      # The docs tests stage this fixture for every tutorial's working
-      # directory, including the ones that do not read it.
-      - name: Download the Madagascar fixture
+      # The docs tests stage these fixtures (stage_input in doc_blocks.py)
+      # for every tutorial's working directory, including the ones that do
+      # not read them.
+      - name: Download the staged fixtures
         run: |
           gh release download fixtures-v1 --dir tests/fixtures/realdata/ \
-            --pattern fieldmaps-madagascar-adm4-hilbert.parquet --clobber
+            --pattern fieldmaps-madagascar-adm4-hilbert.parquet \
+            --pattern open-buildings.parquet --clobber
         env:
           GH_TOKEN: ${{ github.token }}
 

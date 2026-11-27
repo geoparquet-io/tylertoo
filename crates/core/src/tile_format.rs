@@ -174,6 +174,9 @@ fn mvt_to_mlt(mvt: &[u8], profile: MltProfile) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Largest integer magnitude exactly representable as a double.
+pub(crate) const MAX_EXACT_DOUBLE_INTEGER: i128 = 1 << f64::MANTISSA_DIGITS;
+
 /// `layer` with each integer column the encoder would store as 64-bit (a
 /// value outside both `i32` and `u32` ranges) turned into doubles, when
 /// every value is exact in one (|v| <= 2^53). GL JS reads a 64-bit integer
@@ -181,7 +184,6 @@ fn mvt_to_mlt(mvt: &[u8], profile: MltProfile) -> Result<Vec<u8>, String> {
 #[cfg(feature = "mlt")]
 fn doubles_for_gl_js(layer: mlt_core::TileLayer) -> mlt_core::MltResult<mlt_core::TileLayer> {
     use mlt_core::{PropKind, PropValue};
-    const EXACT: i128 = 1 << 53;
     let int = |v: &PropValue| match v {
         PropValue::I64(v) => v.map(i128::from),
         PropValue::U64(v) => v.map(i128::from),
@@ -203,7 +205,7 @@ fn doubles_for_gl_js(layer: mlt_core::TileLayer) -> mlt_core::MltResult<mlt_core
             };
             let fits_32 = (min >= 0 && max <= i128::from(u32::MAX))
                 || (min >= i128::from(i32::MIN) && max <= i128::from(i32::MAX));
-            !fits_32 && min >= -EXACT && max <= EXACT
+            !fits_32 && min >= -MAX_EXACT_DOUBLE_INTEGER && max <= MAX_EXACT_DOUBLE_INTEGER
         })
         .collect();
     if !widen.contains(&true) {

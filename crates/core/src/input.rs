@@ -38,11 +38,16 @@
 //! - **L3**, one network range request, taken only on the first touch of a
 //!   chunk.
 //!
-//! See `docs/remote-reads.md` for the fetch-count implications.
+//! See the `ENVIRONMENT` const in `environment.rs` for the staging controls.
 //!
 //! Remote support is compiled behind the `remote` cargo feature; the CLI and
 //! Python bindings enable it by default. Without the feature, URL inputs
 //! fail with a clear `InputError::RemoteDisabled` error.
+
+// Environment variable names are shared with the generated reference.
+pub(crate) const CONCURRENCY_VAR: &str = "TYLERTOO_STAGING_CONCURRENCY";
+pub(crate) const MEM_BUDGET_VAR: &str = "TYLERTOO_STAGING_MEM_BUDGET_BYTES";
+pub(crate) const COALESCE_VAR: &str = "TYLERTOO_STAGING_COALESCE_BYTES";
 
 use std::fs::File;
 use std::io::Read;
@@ -2257,7 +2262,7 @@ pub(crate) mod remote {
     /// e.g. `TYLERTOO_HTTP_HTTP2_ONLY=true`, `TYLERTOO_HTTP_TIMEOUT=60s`) on
     /// every remote store, whatever the scheme, so one sweep knob works on
     /// both https and s3 hosts. Experimental, like the `TYLERTOO_STAGING_*`
-    /// knobs: see `docs/OVERVIEW_TUNING.md` ("Remote staging (env)").
+    /// knobs: see the `ENVIRONMENT` const in `environment.rs`.
     const CLIENT_VAR_PREFIX: &str = "TYLERTOO_HTTP_";
 
     /// Parse `TYLERTOO_HTTP_*` variables out of `vars` into client options,
@@ -2454,7 +2459,7 @@ pub(crate) mod remote {
     /// overridable through a `TYLERTOO_STAGING_*` environment variable so the
     /// #290 parameter sweep can vary them per run without rebuilding.
     /// Experimental sweep knobs, not stable API — see
-    /// `docs/OVERVIEW_TUNING.md` ("Remote staging (env)").
+    /// the `ENVIRONMENT` const in `environment.rs`.
     ///
     /// The knobs change I/O *scheduling* only (how many range requests are in
     /// flight at once, and where one request ends and the next begins): the
@@ -2465,14 +2470,14 @@ pub(crate) mod remote {
     mod staging_tunables {
         use super::{STAGE_COALESCE_WINDOW, STAGE_MAX_CONCURRENCY, STAGE_MEM_BUDGET};
 
+        /// Override for [`STAGE_COALESCE_WINDOW`], in bytes.
+        pub(super) use crate::input::COALESCE_VAR;
         /// Override for [`STAGE_MAX_CONCURRENCY`]: ceiling on in-flight
         /// row-group spans.
-        pub(super) const CONCURRENCY_VAR: &str = "TYLERTOO_STAGING_CONCURRENCY";
+        pub(super) use crate::input::CONCURRENCY_VAR;
         /// Override for [`STAGE_MEM_BUDGET`]: transient-memory budget, in
         /// bytes (same unit as `TYLERTOO_AUTO_MEM_LIMIT_BYTES`).
-        pub(super) const MEM_BUDGET_VAR: &str = "TYLERTOO_STAGING_MEM_BUDGET_BYTES";
-        /// Override for [`STAGE_COALESCE_WINDOW`], in bytes.
-        pub(super) const COALESCE_VAR: &str = "TYLERTOO_STAGING_COALESCE_BYTES";
+        pub(super) use crate::input::MEM_BUDGET_VAR;
 
         /// Hard ceiling on the concurrency override: each in-flight span is a
         /// task holding a whole row group's bytes, so an absurd value is a

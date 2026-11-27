@@ -239,8 +239,8 @@ MAX_TILE_BYTES = 500_000
 
 # The pinned baseline, exactly as `tippecanoe --version` prints it. Enforced on
 # every run, whether or not the gitignored, machine-local tippecanoe.lock.json
-# exists: a missing lockfile must never mean "any binary will do". Keep in
-# step with TIPPECANOE_TAG in setup_tippecanoe.sh.
+# exists: a missing lockfile must never mean "any binary will do". Read from
+# DEFAULT_TAG in setup_tippecanoe.sh, its one owner.
 def tippecanoe_pin(setup: Path = HERE / "setup_tippecanoe.sh") -> str:
     """The setup script owns the expected baseline tag."""
     match = re.search(r'^DEFAULT_TAG="([^"]+)"$', setup.read_text(), re.MULTILINE)

@@ -481,7 +481,7 @@ pub struct PyramidArgs {
     /// `LO-HI=[SYSTEM=]INPUT[=LAYER]` (repeatable; layer defaults to file stem).
     /// Omit SYSTEM to tile GeoParquet or reuse PMTiles; grid/h3/s2/a5 aggregate
     /// GeoParquet centroids into cells:
-    /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
+    /// <https://geoparquet-io.github.io/tylertoo/reference/tuning/#several-layers>.
     #[arg(
         long = "band",
         required = true,
@@ -587,6 +587,10 @@ pub struct OverviewArgs {
     /// Input GeoParquet. Pass a file, directory, glob, URL, or `s3://` or
     /// `gs://` prefix, or omit it with `--files-from`.
     ///
+    /// Quote a presigned or SAS URL; logs and saved plans redact its query.
+    /// Directory and prefix walks skip names starting with `.` or `_`;
+    /// `key=value` partition keys do not become columns.
+    ///
     /// EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are
     /// reprojected to EPSG:4326 as they are read when they name an EPSG code
     /// (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4
@@ -644,6 +648,10 @@ pub struct TilesArgs {
     /// Input GeoParquet. Pass a file, directory, glob, URL, or `s3://` or
     /// `gs://` prefix, or omit it with `--files-from`.
     ///
+    /// Quote a presigned or SAS URL; logs and saved plans redact its query.
+    /// Directory and prefix walks skip names starting with `.` or `_`;
+    /// `key=value` partition keys do not become columns.
+    ///
     /// EPSG:4326 and EPSG:3857 input is read directly. Other CRSs are
     /// reprojected to EPSG:4326 as they are read when they name an EPSG code
     /// (PROJJSON `id`, `EPSG:n` string, or Parquet `srid:n`) with a usable proj4
@@ -693,7 +701,7 @@ pub struct TilesArgs {
     /// h3, s2 or a5 for cells in the same layer. Requires contiguous
     /// feature bands. No overlaps. Excludes `--min-zoom`, `--max-zoom`,
     /// `--gsd` and `--representation`. See
-    /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
+    /// <https://geoparquet-io.github.io/tylertoo/reference/tuning/#several-layers>.
     // Exclusive with the zoom flags: clap's rule here, core's
     // (`ConfigError::BandWithZoomOption`) for Python's keywords.
     #[arg(
@@ -717,7 +725,7 @@ pub struct TilesArgs {
     /// Build one shard: `I/N` for data shard I of N, or
     /// `coarse` for the zooms below the pivot. Requires `--shard-plan`, and
     /// data shards also need `--plan`. See
-    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#sharded-builds>.
+    /// <https://geoparquet-io.github.io/tylertoo/tutorials/brazil/#2-split-the-same-build-into-shard-jobs>.
     #[arg(
         long,
         value_name = "I/N|coarse",
@@ -727,6 +735,9 @@ pub struct TilesArgs {
     pub shard: Option<String>,
 
     /// The shard plan from `tylertoo shard-plan` that every job shares.
+    /// Give every job the same inputs and settings. If a saved convert plan
+    /// no longer matches the inputs or selection settings, rebuild it with
+    /// `--plan-only` and `--save-plan` before restarting the data jobs.
     #[arg(long, value_name = "PATH", help_heading = "Sharded builds")]
     pub shard_plan: Option<PathBuf>,
 
@@ -738,7 +749,9 @@ pub struct TilesArgs {
     pub tile_range: Option<String>,
 
     /// Write the convert plan (`--save-plan`) and stop, with no export and
-    /// no OUTPUT. Use it for a coarse job whose tiles the fleet discards.
+    /// no OUTPUT. Requires `--save-plan`. Use it when only the data jobs need
+    /// tiles. The plan still covers the whole input and its selection settings;
+    /// it does not create the separate `--shard-plan`.
     // Needs --save-plan: core's rule (`ConfigError::PlanOnlyWithoutSavePlan`).
     #[arg(long, help_heading = "Sharded builds")]
     pub plan_only: bool,

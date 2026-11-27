@@ -202,7 +202,7 @@ feat(cli): add --report flag to export-pmtiles
 |----------|---------|
 | `context/ARCHITECTURE.md` | Design decisions, module map, tippecanoe divergences |
 | `context/OVERVIEWS_SPEC.md` | The `geo:overviews` format spec (draft — single source of truth for the format) |
-| `docs/OVERVIEW_TUNING.md` | Every generalization knob, default, and interaction |
+| `docs/reference/tuning.md` | Generalization choices and links to the generated options |
 | `corpus/SWEEPS.md` | The sweep-derived default-value decisions |
 | `corpus/HOSTILE_GEOMETRY.md` | The clipping-engine scorecard (i_overlay vs wagyu-rs, #205) and how to re-run it |
 | `examples/` | The two tutorials (Madagascar local, Brazil remote and sharded) as runnable scripts; `crates/python/tests/docs` runs them and checks the site shows them verbatim |
