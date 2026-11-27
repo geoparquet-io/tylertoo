@@ -151,19 +151,20 @@ fn scan_and_assign<T: Send>(
 ) -> Result<Vec<T>, ConvertError> {
     let (scanned, assigned) = rayon::join(
         || ranges.par_iter().map(scan).collect(),
-        || push_held(stream, held, ctx.diagnostics),
+        || push_held(stream, held, ctx),
     );
     assigned?;
     held.clear();
     Ok(scanned)
 }
 
-/// #928: assign the held batch, if the streamed path is on, and record
-/// the warning that its maps outgrew the preflight's prediction.
+/// #928: assign the held batch, if the streamed path is on, record the
+/// warning that its maps outgrew the preflight's prediction, and stop once
+/// they outgrow the memory budget.
 fn push_held(
     stream: Option<&mut StreamAssigner>,
     held: &[StreamChunk],
-    diagnostics: &crate::diagnostics::Diagnostics,
+    ctx: &Pass1Ctx<'_>,
 ) -> Result<(), ConvertError> {
     let Some(stream) = stream else {
         return Ok(());
@@ -174,9 +175,10 @@ fn push_held(
         .collect();
     let pushed = stream.push_batch(&refs);
     if let Some(warning) = stream.take_warning() {
-        diagnostics.once(warning);
+        ctx.diagnostics.once(warning);
     }
-    pushed
+    pushed?;
+    stream.require_fits(ctx.budget)
 }
 
 struct WriterProvenance<'a> {
@@ -6836,7 +6838,7 @@ fn run_pass1_with_chunk_rows(
                 )?;
                 Pass1Timers::add(&timers_ref.keys, t_keys);
             }
-            push_held(stream.as_mut(), &held, ctx.diagnostics)
+            push_held(stream.as_mut(), &held, ctx)
         },
     )?;
 
@@ -11628,6 +11630,66 @@ pub(super) mod tests {
         assert_eq!(a.kinds, b.kinds, "{what}: kinds");
         assert!(a.coalesce_build.is_none() && b.coalesce_build.is_none());
         assert!(a.cluster_tables.is_none() && b.cluster_tables.is_none());
+    }
+
+    /// The preflight prices the patch maps by an allowance, not a bound:
+    /// tiny polygons 400 m apart with no footer bounds each hold their own
+    /// patch at both accumulating levels (z12, z13), and nothing evicts.
+    /// Past the memory budget the run must stop with `BudgetExceeded`, not
+    /// grow until the process is OOM-killed.
+    #[test]
+    fn unbounded_patch_maps_stop_at_the_memory_budget() {
+        use super::super::assign_stream::KindSet;
+        const ROWS: usize = 20_000;
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 12,
+                max_zoom: 14,
+            },
+            ..Default::default()
+        };
+        let level_specs = options.levels.resolve(options.gsd_base).unwrap();
+        let reprs =
+            super::super::convert::level_representations(&level_specs, &options.representation);
+        let polygons = KindSet {
+            polygons: true,
+            lines: false,
+        };
+        let feats: Vec<AssignFeature> = (0..ROWS)
+            .map(|i| {
+                let x = i as f64 * 400.0;
+                AssignFeature {
+                    index: i,
+                    bbox: [x, 0.0, x + 1.0, 1.0],
+                    kind: FeatureKind::Polygon,
+                    sort_key: None,
+                    entry_level: None,
+                }
+            })
+            .collect();
+        let t = table(&feats);
+        let areas = vec![1.0f32; ROWS];
+        let run = |budget: &MemoryBudget| {
+            let mut assigner = StreamAssigner::new(
+                polygons,
+                &options,
+                &level_specs,
+                &reprs,
+                Crs::Epsg3857,
+                (ROWS, &[]),
+            );
+            assigner.push_batch(&[(&t, &areas[..], 0, ROWS)]).unwrap();
+            assigner.require_fits(budget)
+        };
+        assert!(run(&MemoryBudget::with_available(None)).is_ok());
+        assert!(run(&MemoryBudget::with_available(Some(64 << 20))).is_ok());
+        match run(&MemoryBudget::with_available(Some(1 << 20))) {
+            // 40,000 live patches at 100 B each, plus the row tables.
+            Err(ConvertError::BudgetExceeded { needed, .. }) => {
+                assert!(needed > 4_000_000, "{needed}");
+            }
+            other => panic!("live patch maps past the budget must stop the run: {other:?}"),
+        }
     }
 
     /// #928: the streamed assignment's tables equal the table path's, for

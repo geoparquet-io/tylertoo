@@ -31,6 +31,7 @@ use super::assign::{
 };
 use super::convert::{ConvertError, ConvertOptions, Pass1Price};
 use super::level::Crs;
+use super::memory::{MemoryBudget, MemoryPhase};
 use super::simplify::Representation;
 use crate::diagnostics::Diagnostic;
 
@@ -788,6 +789,22 @@ impl StreamAssigner {
     /// The [`Self::watch_estimate`] warning, once it fired.
     pub(super) fn take_warning(&mut self) -> Option<Diagnostic> {
         self.low_estimate.take()
+    }
+
+    /// Fail with `BudgetExceeded` once the row tables and the live cells and
+    /// patches outgrow `budget`. The preflight prices the maps by an
+    /// estimate (an allowance for patches without an eviction), so maps past
+    /// it would otherwise grow until the process is OOM-killed.
+    pub(super) fn require_fits(&self, budget: &MemoryBudget) -> Result<(), ConvertError> {
+        let kinds = self
+            .kinds
+            .as_ref()
+            .map_or(0, |k| k.capacity() * std::mem::size_of::<FeatureKind>());
+        let maps = ((self.live_cells + self.live_patches) as u64).saturating_mul(MAP_ENTRY_BYTES);
+        budget.require(
+            MemoryPhase::Assign,
+            (self.min_levels.capacity() + kinds) as u64 + maps,
+        )
     }
 
     fn check_estimate(&mut self) {
