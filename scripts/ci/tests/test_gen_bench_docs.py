@@ -376,9 +376,11 @@ def test_history_derives_legacy_host_class(results):
     assert out.count('<figure') == 1 and '→' in out
 
 
-def test_committed_history_still_has_one_chart():
-    out = g.history(g.load_results()['overture-buildings-africa'])
-    assert out.count('<figure') == 1 and '→' not in out
+def test_committed_history_has_one_chart_per_host():
+    r = g.load_results()['overture-buildings-africa']
+    entries = [*r.get('history', []), r]
+    hosts = {g.history_host(e['provenance']) or ('unknown', i) for i, e in enumerate(entries)}
+    assert g.history(r).count('<figure') == len(hosts)
 
 
 def test_diff_skips_memory_change(results, monkeypatch, capsys):

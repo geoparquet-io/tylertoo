@@ -64,7 +64,7 @@ DISPLAY = {
 PROFILE_INPUTS = {"tiles-madagascar": "Madagascar admin boundaries", "polygons": "Moldova parcels",
                   "tiles-nz": "New Zealand parcels"}
 ENCODINGS = {"polygons": "GeoParquet WKB", "in-geoarrow": "native GeoArrow",
-             "in-geo2": "GeoParquet GEOMETRY", "in-geo-only": "GEOMETRY without geo metadata"}
+             "in-geo2": "GeoParquet GEOMETRY", "in-geo-only": "GEOMETRY without GeoParquet metadata"}
 SOURCES = {"polygons": "Local file", "in-parts13": "Multi-file list",
            "in-dir13": "Partitioned directory", "in-http13": "HTTPS"}
 MARKER = re.compile(r"<!-- bench:(\S+) -->(.*?)<!-- /bench -->", re.S)
@@ -122,7 +122,8 @@ def footer(r):
     commit = f"commit {p.get('commit') or 'unknown'}"
     tools = [f"{k} {tool_version(k, v)}" for k, v in p["tool_versions"].items()
              if k in ("tippecanoe", "gpio") and v is not None]
-    fields = [label] + ([] if label == commit else [commit]) + tools
+    # The unreleased-commit label already names the commit.
+    fields = [label] + ([] if (p.get('commit') or 'unknown') in label else [commit]) + tools
     fields += [f"allocator: {p['allocator']}", host_text(p), (p["date"] or "undated")[:10]]
     return "_Run: " + ", ".join(str(v) for v in fields) + "._"
 

@@ -210,6 +210,15 @@ def median(xs: list[float]) -> float | None:
     return statistics.median(xs) if xs else None
 
 
+def recorded_argv(argv: list[str]) -> list[str]:
+    """The command as the page shows it: no host paths for the binary or the
+    output archive, which use the manifest's `tylertoo` and `{out}` forms."""
+    if not argv:
+        return []
+    return ["tylertoo", *(f"{{out}}/{a.rsplit('/', 1)[1]}" if a.startswith("/") and a.endswith(".pmtiles")
+                          else a for a in argv[1:])]
+
+
 def tool_row(label: str, runs: list[dict], note: str | None = None, archive: dict | None = None) -> dict:
     """One streaming result row, plus its recorded command and environment."""
     # The higher of the sampler's peak and GNU time's exact high-water mark:
@@ -222,7 +231,7 @@ def tool_row(label: str, runs: list[dict], note: str | None = None, archive: dic
     # A kept archive describes this row only if the timed runs produced it.
     if archive and archive["sha256"] not in shas:
         archive = None
-    return {"argv": runs[0].get("argv", []) if runs else [],
+    return {"argv": recorded_argv(runs[0].get("argv", [])) if runs else [],
             "env": runs[0].get("env", runs[0].get("binary_env", {})) if runs else {},
             "label": label, "runs_wall_s": [r["wall_s"] for r in runs],
             "peak_rss_bytes": int(max(peak)) if peak else None,

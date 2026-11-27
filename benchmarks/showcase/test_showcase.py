@@ -98,8 +98,8 @@ def run():
 
 
 def test_stream_row_retains_argv_env_and_exact_peak():
-    row = sc.tool_row('default', [run()])
-    assert row['argv'] == run()['argv']
+    row = sc.tool_row('default', [{**run(), 'argv': ['/host/target/release/tylertoo', *run()['argv'][1:]]}])
+    assert row['argv'] == ['tylertoo', 'tiles', 's3://bucket/input', '{out}/out.pmtiles']
     assert row['env'] == run()['env']
     assert row['peak_rss_bytes'] == 2048 * 1024
     assert sc.tool_row('default', [run()], archive={'sha256': 'other'})['archive'] is None
@@ -147,7 +147,7 @@ def test_collect_stream_history(tmp_path, monkeypatch, describe):
     assert entry['release'] == sc.RELEASE
     assert entry['wall_s'] == 30
     assert calls[0][-1] == 'afb6b15'
-    assert doc['rows'][0]['argv'] == run()['argv']
+    assert doc['rows'][0]['argv'] == sc.recorded_argv(run()['argv'])
     assert doc['provenance']['host_class'] == 'box'
     assert old.read_text() == json.dumps(previous)
 
