@@ -50,7 +50,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "benchmarks/results"
 DOC_FILES = ["README.md", "crates/core/README.md", "crates/cli/README.md",
-             "crates/python/README.md", "docs/benchmarks.md"]
+             "crates/python/README.md", "docs/benchmarks.md",
+             "docs/guides/tippecanoe.md"]
 PROSE_LINE_CAP = 40
 PROVENANCE_KEYS = ["commit", "tylertoo_version", "host", "nproc", "kernel",
                    "allocator", "tool_versions", "inputs", "date"]

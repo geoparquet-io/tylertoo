@@ -46,6 +46,7 @@ def site() -> Path:
         ("changelog/index.html", "Changelog"),
         ("guides/attribution/index.html", "01-credit.sh"),
         ("guides/tippecanoe/index.html", "01-preset.sh"),
+        ("guides/tippecanoe/index.html", "compare-dataset"),
         ("reference/cli/index.html", "export-pmtiles"),
         ("reference/python/index.html", "export_pmtiles"),
         ("reference/tuning/index.html", "memory"),
