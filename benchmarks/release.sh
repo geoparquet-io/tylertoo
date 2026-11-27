@@ -3,16 +3,17 @@
 # corpus ~40 min; cells ~20 min; Africa ~54 min; upload ~5 min; docs ~1 min.
 # Corpus: one warm-up + three alternating rounds per tool (median of three).
 # Cells: manifest defaults. Africa: one default-profile run, no warm-up.
+# All scratch I/O lives under --data (default: ${TYLERTOO_BENCH_DATA:-$HOME/bench-data}).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-STAGES=(build tippecanoe corpus cells africa upload docs)
+STAGES=(build tippecanoe corpus cells africa tutorial-map upload docs)
 # The committed Africa default peaked at 146 GB (results/overture-buildings-africa.json peak_disk_bytes); retain headroom.
 AFRICA_DISK_GB=200
-DATA="${HOME}/bench-data"
+DATA="${TYLERTOO_BENCH_DATA:-$HOME/bench-data}"
 FORCE=0 DRY=0
 skip="${SKIP:-}" only="${ONLY:-}"
-usage() { echo 'benchmarks/release.sh [--data DIR] [--force] [--dry-run] [--skip "S ..."] [--only "S ..."] [STAGE ...]'; }
+usage() { echo 'benchmarks/release.sh [--data DIR (all scratch; default ${TYLERTOO_BENCH_DATA:-$HOME/bench-data})] [--force] [--dry-run] [--skip "S ..."] [--only "S ..."] [STAGE ...]'; }
 invalid() { echo "Unknown stage or option: $1. Stages: ${STAGES[*]}" >&2; exit 2; }
 while (($#)); do
   case "$1" in
@@ -60,7 +61,7 @@ echo "Output: $OUT"
 echo 'Preflight: benchmarks/run_manifest.py release-version'
 if (( ! RC )); then
   echo 'Not a release candidate: source changes, an existing release tag at another commit, or unavailable git metadata; outputs stay local.'
-  for stage in upload docs; do has "$stage" && echo "$stage: refuse (not a release candidate)"; done
+  for stage in tutorial-map upload docs; do has "$stage" && echo "$stage: refuse (not a release candidate)"; done
 fi
 # Preview every command through this function; quoting also documents paths with spaces.
 run() { printf '  '; printf '%q ' "$@"; echo; if (( ! DRY )); then "$@"; fi; }
@@ -83,8 +84,8 @@ if (( ! DRY )); then
   mkdir -p "$DATA"
   exec 9>"$DATA/release.lock"
   flock -n 9 || { echo "Release lock held: $DATA/release.lock" >&2; exit 1; }
-  if (( ! RC )) && { has upload || has docs; }; then
-    echo 'upload and docs refuse: not a release candidate (source changes, an existing release tag at another commit, or unavailable git metadata).' >&2
+  if (( ! RC )) && { has tutorial-map || has upload || has docs; }; then
+    echo 'tutorial-map, upload, and docs refuse: not a release candidate (source changes, an existing release tag at another commit, or unavailable git metadata).' >&2
     exit 1
   fi
   if ! has tippecanoe; then check_tip; fi
@@ -97,7 +98,8 @@ if (( ! DRY )); then
   if has upload; then
     aws s3 ls s3://nlebovits/tylertoo-benchmarks/ --profile source-coop || { echo 'run `source-coop login`' >&2; exit 1; }
   fi
-  mkdir -p "$OUT/bin"
+  mkdir -p "$OUT/bin" "$OUT/tmp"
+  export TMPDIR="$OUT/tmp"
   printf '#!/usr/bin/env bash\nexec uvx --from %q gpio "$@"\n' "$GPIO_PACKAGE" > "$OUT/bin/gpio"
   chmod +x "$OUT/bin/gpio"
   export PATH="$OUT/bin:$PATH"
@@ -135,6 +137,10 @@ for stage in "${selected[@]}"; do
       run uv run --no-project --python 3.12 --with pyarrow==26.0.0 python -I \
         benchmarks/showcase/showcase.py collect-stream africa --data "$OUT" \
         --history-from benchmarks/results/overture-buildings-africa.json --out "$OUT/overture-buildings-africa.json" ;;
+    tutorial-map)
+      run "${PY[@]}" benchmarks/comparison.py tutorial-map --work "$OUT/tutorial-map" \
+        --out "$OUT/tutorial-map.json" --tylertoo target/release/tylertoo \
+        --target "${MAP_TARGET:-s3://nlebovits/tylertoo-brazil-demo/brazil.pmtiles}" ;;
     upload)
       run "${PY[@]}" benchmarks/comparison.py build --corpus "$OUT/e2e-corpus.json" \
         --work "$OUT/corpus" --out "$OUT/comparison-pmtiles.json"

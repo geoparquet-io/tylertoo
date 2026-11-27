@@ -108,7 +108,7 @@ BASELINE_WALL_MAX = 1.40
 BASELINE_RSS_MAX = 1.20
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PROVENANCE_KEYS = ("commit", "tylertoo_version", "host", "nproc", "kernel", "allocator",
-                   "tool_versions", "inputs", "date", "git_describe", "host_class", "release_version")
+                   "tool_versions", "inputs", "date", "git_describe", "host_class", "release_version", "mem_gib")
 
 
 # --- manifest ---------------------------------------------------------------
@@ -122,6 +122,7 @@ CELL_KEYS = {
     "label", "tickets", "input", "inputs", "command", "args", "zoom", "flags",
     "output", "setup", "pairs", "allocator", "wall_s", "rss_gib", "memory_max",
     "serve", "env", "heavy", "notes", "scratch_gib", "watch", "warmup", "keep_output",
+    "rss_frac", "scratch_frac",
 }
 INPUT_KEYS = {"file", "path", "url", "sha256", "bytes", "rows", "geometry", "notes"}
 
@@ -133,6 +134,10 @@ def load_manifest(path: Path = MANIFEST) -> dict:
     defaults = m.get("defaults", {})
     inputs = m.get("inputs", {})
     cells = m.get("cells", {})
+    for name, spec in [("defaults", defaults), *cells.items()]:
+        for key in ("rss_frac", "scratch_frac"):
+            if key in spec and (type(spec[key]) not in (int, float) or not 0 < spec[key] <= 1):
+                raise ManifestError(f"{name}: {key} must be a fraction greater than zero and at most one")
     for name, inp in inputs.items():
         extra = set(inp) - INPUT_KEYS
         if extra:
@@ -154,7 +159,8 @@ def load_manifest(path: Path = MANIFEST) -> dict:
         for i in names:
             if i not in inputs:
                 raise ManifestError(f"cell {name}: unknown input {i}")
-        for key in ("pairs", "allocator", "wall_s", "rss_gib", "scratch_gib", "warmup"):
+        for key in ("pairs", "allocator", "wall_s", "rss_gib", "scratch_gib", "warmup",
+                    "rss_frac", "scratch_frac"):
             cell.setdefault(key, defaults.get(key))
         cell.setdefault("flags", [])
         cell.setdefault("env", {})
@@ -518,6 +524,7 @@ def provenance(bins: list[dict], inputs: dict) -> dict:
         "git_describe": git_describe(),
         "host_class": host_class_key(h),
         "release_version": release_version(ROOT),
+        "mem_gib": int(host_mem_bytes() / (1 << 30)),
     }
 
 
@@ -811,6 +818,8 @@ def run_capped(argv: list[str], caps: dict, env: dict | None, log: Path, scratch
     foreign = max(0.0, busy_s - (gt["cpu_s"] or 0.0)) / max(wall_poll, 1e-6)
     res = {
         "status": status,
+        "caps": {key: caps[key] for key in DEFAULT_CAPS},
+        "mem_gib": int(host_mem_bytes() / (1 << 30)),
         "returncode": proc.returncode,
         "wall_s": round(wall, 3),
         "cpu_s": gt["cpu_s"],
@@ -831,6 +840,25 @@ def run_capped(argv: list[str], caps: dict, env: dict | None, log: Path, scratch
 DEFAULT_CAPS = {"wall_s": 1800, "rss_gib": 32, "scratch_gib": 30}
 
 
+def host_mem_bytes(path: Path = Path('/proc/meminfo')) -> int:
+    """Physical host memory, independent of process affinity or cgroups."""
+    match = re.search(r'^MemTotal:\s+(\d+)\s+kB$', path.read_text(), re.M)
+    if not match:
+        raise ValueError(f'MemTotal missing from {path}')
+    return int(match[1]) * 1024
+
+
+def resolve_caps(spec: dict, bench_out: Path) -> dict:
+    """Resolve fractional caps once, against resources at cell start."""
+    caps = {key: spec.get(key) if spec.get(key) is not None else value
+            for key, value in DEFAULT_CAPS.items()}
+    if spec.get('rss_frac') is not None:
+        caps['rss_gib'] = spec['rss_frac'] * host_mem_bytes() / (1 << 30)
+    if spec.get('scratch_frac') is not None:
+        caps['scratch_gib'] = spec['scratch_frac'] * shutil.disk_usage(bench_out).free / (1 << 30)
+    return caps
+
+
 def timed(argv: list[str], log: Path, env: dict | None = None, scratch: Path | None = None,
           caps: dict | None = None) -> dict:
     """One run of argv under GNU time, for the scripts that keep their own
@@ -841,7 +869,8 @@ def timed(argv: list[str], log: Path, env: dict | None = None, scratch: Path | N
     prof = log.with_name(log.name + ".profile.jsonl")
     prof.unlink(missing_ok=True)
     env = {**(os.environ if env is None else env), "TYLERTOO_PROFILE_JSON": str(prof)}
-    res = run_capped(["/usr/bin/time", "-v", *argv], {**DEFAULT_CAPS, **(caps or {})}, env,
+    resolved = resolve_caps(caps or {}, scratch or log.parent)
+    res = run_capped(["/usr/bin/time", "-v", *argv], {**(caps or {}), **resolved}, env,
                      log, scratch)
     res["profile"] = read_profile(prof)
     return res
@@ -997,6 +1026,7 @@ class Runner:
         cdir.mkdir(parents=True, exist_ok=True)
         local = [resolve_input(i, self.m["inputs"][i], self.data, self.input_dirs)
                  for i in cell_input_names(cell)]
+        cell = {**cell, 'caps': resolve_caps(cell, self.bench_out)}
         scratch = self.bench_out / self.args.name / name
         server = None
         if "serve" in cell:
@@ -1098,8 +1128,9 @@ class Runner:
             server.get("/__reset")
         print(f"{'warm' if warmup else 'run '}  {name} {tag}: {' '.join(argv[1:])}", flush=True)
         w0 = sectors_written(self.disk)
+        caps = cell.get('caps') or resolve_caps(cell, self.bench_out)
         try:
-            res = run_capped([*prefix, "/usr/bin/time", "-v", *argv], cell, env,
+            res = run_capped([*prefix, "/usr/bin/time", "-v", *argv], {**cell, **caps}, env,
                              cdir / f"{tag}.log", out, self.cpus)
             # Everything written to the device during the run, ours and others'
             # (our part still in the page cache at exit is not counted).
@@ -1125,6 +1156,8 @@ class Runner:
             "profile": read_profile(prof),
             "served": server.get("/__stats") if server else None,
             "memory_max": cell.get("memory_max"),
+            "caps": caps,
+            "mem_gib": int(host_mem_bytes() / (1 << 30)),
         }
         subprocess.run(["sync"], check=False)
         rec_path.write_text(json.dumps(rec, indent=2))
@@ -1211,6 +1244,8 @@ def summarize(runs: list[dict], bins: list[dict]) -> dict:
         ok = [r for r in mine if run_status(r) == "ok"]
         out[b["label"]] = {
             "allocator": b["allocator"],
+            "caps": mine[-1].get('caps') if mine else None,
+            "mem_gib": mine[-1].get('mem_gib') if mine else None,
             "statuses": sorted({run_status(r) for r in mine}),
             "wall_s": spread([r["wall_s"] for r in ok]),
             "cpu_s": spread([r["cpu_s"] for r in ok if r["cpu_s"] is not None]),

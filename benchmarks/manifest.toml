@@ -466,7 +466,8 @@ args = ["{input}", "{out}/out.pmtiles"]
 output = "out.pmtiles"
 zoom = [0, 14]
 wall_s = 2700
-rss_gib = 96
+# Auto memory scales with the host; retain headroom on each box.
+rss_frac = 0.8
 
 [cells.coverage-fill]
 label = "Coverage fill: FTW Moldova z0-14, --coverage-fill (track F's claim)"
@@ -845,7 +846,8 @@ args = ["{input}", "{out}/out.pmtiles"]
 output = "out.pmtiles"
 zoom = [0, 14]
 wall_s = 2700
-rss_gib = 96
+# Match the auto cell's host-scaled safety cap for comparison.
+rss_frac = 0.8
 flags = ["--profile", "bounded"]
 
 [sets]

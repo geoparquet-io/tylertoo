@@ -116,7 +116,8 @@ def test_saved_provenance_has_no_collector_host_fallback(tmp_path):
 
 @pytest.mark.parametrize('describe', ['v0.8.0-2-gafb6b15', None])
 def test_collect_stream_history(tmp_path, monkeypatch, describe):
-    previous = {'provenance': {'commit': 'afb6b15', 'date': 'then', 'tylertoo_version': 'old'},
+    previous = {'provenance': {'commit': 'afb6b15', 'date': 'then', 'tylertoo_version': 'old',
+                               'host_class': 'old-box', 'mem_gib': 247},
                 'dataset': f'Overture buildings {sc.RELEASE}', 'rows': [{'runs_wall_s': [30, 20, 40]}],
                 'history': [{'provenance': {'commit': 'older'}, 'wall_s': 50, 'release': 'older-release'}]}
     old = tmp_path / 'old.json'
@@ -139,6 +140,8 @@ def test_collect_stream_history(tmp_path, monkeypatch, describe):
     entry = doc['history'][-1]
     assert entry['provenance']['commit'] == 'afb6b15'
     assert entry['provenance']['date'] == 'then'
+    assert entry['provenance']['host_class'] == 'old-box'
+    assert entry['provenance']['mem_gib'] == 247
     assert entry['provenance']['git_describe'] == describe
     assert entry['provenance']['release_version'] is None
     assert entry['release'] == sc.RELEASE

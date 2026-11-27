@@ -1,6 +1,7 @@
 """Comparison manifests and local publication, without real archives or AWS."""
 import hashlib
 import json
+from types import SimpleNamespace
 import sys
 from pathlib import Path
 
@@ -148,3 +149,73 @@ def test_isolated_cli_upload(corpus, tmp_path):
                                '--target', str(tmp_path / 'cli')], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert 'Verified' in result.stdout
+
+
+@pytest.mark.parametrize('s3', [False, True])
+def test_tutorial_map_record_and_publication(tmp_path, monkeypatch, s3):
+    binary = tmp_path / 'bin/tylertoo'
+    work, out = tmp_path / 'work', tmp_path / 'tutorial-map.json'
+    prov = {key: f'fact-{key}' for key in rm.PROVENANCE_KEYS}
+    monkeypatch.setattr(rm, 'parse_bin', lambda spec: {'path': str(binary)})
+    monkeypatch.setattr(rm, 'provenance', lambda bins, inputs: prov)
+    calls, heads = [], []
+    def run(argv, **kw):
+        calls.append(argv)
+        if argv[0] == 'bash':
+            assert Path(argv[1]) == rm.ROOT / 'examples/brazil-fields/01-tiles.sh'
+            assert kw['cwd'] == work
+            assert kw['env']['PATH'].split(':')[0] == str(binary.parent)
+            assert Path(kw['env']['TMPDIR']).is_relative_to(work)
+            (work / 'brazil.pmtiles').write_bytes(b'tiny synthetic archive')
+        elif argv[0] == str(binary):
+            assert argv[1:] == ['stats', '--json', str(work / 'brazil.pmtiles')]
+            return cp.subprocess.CompletedProcess(argv, 0, json.dumps(
+                {'per_zoom': [{'tile_count': 2}, {'tile_count': 5}]}), '')
+        return cp.subprocess.CompletedProcess(argv, 0, '', '')
+    monkeypatch.setattr(cp.subprocess, 'run', run)
+    monkeypatch.setattr(cp, 'verify_url', lambda *args: heads.append(args))
+    monkeypatch.setattr(cp, 'gen_bench_docs', lambda: SimpleNamespace(tutorial_tile_count=lambda root: 7))
+    target = cp.MAP_TARGET if s3 else str(tmp_path / 'published')
+    cp.tutorial_map(work, out, binary, target)
+    doc = json.loads(out.read_text())
+    assert doc['provenance'] == prov
+    assert doc['archive'] == {'url': cp.MAP_URL, 'bytes': len(b'tiny synthetic archive'),
+        'sha256': hashlib.sha256(b'tiny synthetic archive').hexdigest(), 'tiles': 7}
+    if s3:
+        assert calls[-1] == ['aws', 's3', 'cp', str(work / 'brazil.pmtiles'), cp.MAP_TARGET,
+                             '--profile', 'source-coop']
+        assert heads == [(cp.MAP_URL, doc['archive']['bytes'])]
+    else:
+        assert (Path(target) / 'brazil.pmtiles').read_bytes() == b'tiny synthetic archive'
+        assert not heads
+        # The tutorial object is intentionally replaceable.
+        cp.tutorial_map(work, out, binary, target)
+
+
+def test_tutorial_map_refuses_count_that_disagrees_with_tutorial(tmp_path, monkeypatch):
+    def run(argv, **kw):
+        if argv[0] == 'bash':
+            (tmp_path / 'work/brazil.pmtiles').write_bytes(b'tiny')
+        return cp.subprocess.CompletedProcess(argv, 0, '{"per_zoom": [{"tile_count": 3}]}', '')
+    monkeypatch.setattr(cp.subprocess, 'run', run)
+    calls = []
+    monkeypatch.setattr(cp.shutil, 'copyfile', lambda *a: calls.append(a))
+    with pytest.raises(ValueError, match='disagrees|expects'):
+        cp.tutorial_map(tmp_path / 'work', tmp_path / 'out.json', tmp_path / 'tylertoo', str(tmp_path / 'pub'))
+    assert not calls and not (tmp_path / 'out.json').exists()
+
+
+def test_tutorial_map_failed_verification_leaves_no_record(tmp_path, monkeypatch):
+    monkeypatch.setattr(cp, 'gen_bench_docs', lambda: SimpleNamespace(tutorial_tile_count=lambda root: 0))
+    monkeypatch.setattr(rm, 'parse_bin', lambda spec: {'path': 'tylertoo'})
+    monkeypatch.setattr(rm, 'provenance', lambda *args: {})
+    def run(argv, **kw):
+        if argv[0] == 'bash':
+            (tmp_path / 'work/brazil.pmtiles').write_bytes(b'tiny')
+        return cp.subprocess.CompletedProcess(argv, 0, '{"per_zoom": []}', '')
+    monkeypatch.setattr(cp.subprocess, 'run', run)
+    monkeypatch.setattr(cp, 'verify_url', lambda *args: (_ for _ in ()).throw(ValueError('size')))
+    out = tmp_path / 'tutorial-map.json'
+    with pytest.raises(ValueError, match='size'):
+        cp.tutorial_map(tmp_path / 'work', out, Path('tylertoo'), 's3://test/map.pmtiles')
+    assert not out.exists()

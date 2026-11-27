@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -17,6 +19,8 @@ import run_manifest as rm
 TOOLS = ('tylertoo', 'tippecanoe')
 BASE_URL = 'https://data.source.coop/nlebovits/tylertoo-benchmarks/'
 S3_TARGET = 's3://nlebovits/tylertoo-benchmarks'
+MAP_TARGET = 's3://nlebovits/tylertoo-brazil-demo/brazil.pmtiles'
+MAP_URL = 'https://data.source.coop/nlebovits/tylertoo-brazil-demo/brazil.pmtiles'
 
 
 def component(value: str) -> str:
@@ -111,6 +115,48 @@ def upload(manifest: Path, work: Path, target: str, force: bool = False) -> None
     print(f'Verified {len(copies)} files at {destination}')
 
 
+def gen_bench_docs():
+    """scripts/gen_bench_docs.py owns the tutorial's expected tile count."""
+    spec = importlib.util.spec_from_file_location('gen_bench_docs', rm.ROOT / 'scripts/gen_bench_docs.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def tutorial_map(work: Path, out: Path, binary: Path, target: str) -> None:
+    """Run tutorial step one, replace its map, and record verified facts."""
+    work = work.expanduser().resolve()
+    binary = binary.expanduser().resolve()
+    tmp = work / 'tmp'
+    tmp.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, 'PATH': f'{binary.parent}:{os.environ["PATH"]}', 'TMPDIR': str(tmp)}
+    subprocess.run(['bash', str(rm.ROOT / 'examples/brazil-fields/01-tiles.sh')],
+                   cwd=work, env=env, check=True)
+    archive = work / 'brazil.pmtiles'
+    stats = json.loads(subprocess.run([str(binary), 'stats', '--json', str(archive)],
+                                     capture_output=True, text=True, check=True).stdout)
+    facts = {'url': MAP_URL, 'bytes': archive.stat().st_size,
+             'sha256': rm.sha256_file(archive),
+             'tiles': sum(z['tile_count'] for z in stats['per_zoom'])}
+    # Never publish a map that disagrees with the tutorial's stated output.
+    expected = gen_bench_docs().tutorial_tile_count(rm.ROOT)
+    if facts['tiles'] != expected:
+        raise ValueError(f"brazil.pmtiles has {facts['tiles']} tiles; examples/brazil-fields/README.md "
+                         f"expects {expected:,}; fix the tutorial or the build before uploading")
+    prov = rm.provenance([rm.parse_bin(f'head={binary}')], {})
+    if target.startswith('s3://'):
+        subprocess.run(['aws', 's3', 'cp', str(archive), target, '--profile', 'source-coop'], check=True)
+        verify_url(MAP_URL, facts['bytes'])
+    else:
+        dest = Path(target).expanduser() / archive.name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(archive, dest)
+        if dest.stat().st_size != facts['bytes']:
+            raise ValueError(f'copied size mismatch: {dest}: expected {facts["bytes"]} bytes')
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({'provenance': prov, 'archive': facts}, indent=2) + '\n')
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -123,13 +169,20 @@ def main(argv: list[str] | None = None) -> int:
     u.add_argument('--work', required=True, type=Path)
     u.add_argument('--target', required=True)
     u.add_argument('--force', action='store_true', help='replace an existing version directory')
+    m = sub.add_parser('tutorial-map')
+    m.add_argument('--work', required=True, type=Path)
+    m.add_argument('--out', required=True, type=Path)
+    m.add_argument('--tylertoo', required=True, type=Path)
+    m.add_argument('--target', default=os.environ.get('MAP_TARGET', MAP_TARGET))
     args = parser.parse_args(argv)
     try:
         if args.command == 'build':
             build(args.corpus, args.work, args.out)
             print(f'Wrote {args.out}')
-        else:
+        elif args.command == 'upload':
             upload(args.manifest, args.work, args.target, args.force)
+        else:
+            tutorial_map(args.work, args.out, args.tylertoo, args.target)
     except (ValueError, OSError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f'{exc}\n')
     return 0

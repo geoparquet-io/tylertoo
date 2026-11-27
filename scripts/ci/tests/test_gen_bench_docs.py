@@ -138,6 +138,8 @@ def test_gpio_version_in_stamp_and_footer(results, raw, version):
 
 def test_history_line_and_release_change(results):
     r = results["overture-buildings-africa"]
+    for entry in [r, *r['history']]:
+        entry['provenance'].update(host_class='same', mem_gib=247)
     out = g.history(r)
     assert "54 min at commit old1234 → 27 min at commit abc1234, 2.0× faster" in out
     assert "different Overture release" in out
@@ -310,6 +312,7 @@ def test_diff_ranks_whole_wall_and_skips_unknown_hosts(results, monkeypatch, cap
     old = copy.deepcopy(results)
     for r in [*results.values(), *old.values()]:
         r["provenance"]["host_class"] = "same"
+        r["provenance"]["mem_gib"] = 247
     old["e2e-corpus"]["datasets"]["a"]["tylertoo"]["wall_median_s"] = 100
     results["e2e-corpus"]["datasets"]["b"]["tylertoo"]["wall_median_s"] = 100
     old["release-cells"]["provenance"].pop("host_class")
@@ -324,6 +327,121 @@ def test_diff_ranks_whole_wall_and_skips_unknown_hosts(results, monkeypatch, cap
     assert "100.0 s → 1.0 s" in out
     assert "unknown host_class" in out and "different host_class" in out
     assert "CPU" not in out and "phase" not in out
+
+
+@pytest.mark.parametrize('change', ['host', 'memory', 'unknown-memory', 'unknown-host'])
+def test_history_separates_incomparable_hosts(results, change):
+    r = results['overture-buildings-africa']
+    r['provenance'].update(host_class='same', mem_gib=247, host='Current host')
+    old = r['history'][0]['provenance']
+    old.update(host_class='same', mem_gib=247, host='Previous host')
+    if change == 'host':
+        old['host_class'] = 'other'
+    elif change == 'memory':
+        old['mem_gib'] = 123
+    elif change == 'unknown-memory':
+        old.pop('mem_gib')
+    else:
+        old.pop('host_class')
+    out = g.history(r)
+    assert out.count('<figure') == 2
+    assert '→' not in out and '× faster' not in out
+    captions = re.findall(r'<figcaption>(.*?)</figcaption>', out)
+    assert 'Current host' in captions[0] and 'Previous host' in captions[1]
+
+
+def test_history_derives_legacy_host_class(results):
+    r = results['overture-buildings-africa']
+    r['provenance'].update(host_class='aarch64/0xd40/64', mem_gib=247)
+    old = r['history'][0]['provenance']
+    old.update(host='aarch64, CPU 0xd40, 64 CPUs', mem_gib=247)
+    old.pop('host_class', None)
+    out = g.history(r)
+    assert out.count('<figure') == 1 and '→' in out
+
+
+def test_committed_history_still_has_one_chart():
+    out = g.history(g.load_results()['overture-buildings-africa'])
+    assert out.count('<figure') == 1 and '→' not in out
+
+
+def test_diff_skips_memory_change(results, monkeypatch, capsys):
+    r = results['e2e-corpus']
+    r['provenance'].update(host_class='same', mem_gib=247)
+    old = copy.deepcopy(r)
+    old['provenance']['mem_gib'] = 123
+    monkeypatch.setattr(g.subprocess, 'run', lambda *a, **kw:
+                        subprocess.CompletedProcess([], 0, json.dumps(old), ''))
+    g.diff_results('base', results, {'e2e-corpus': {'speedup-bars'}})
+    out = capsys.readouterr().out
+    assert 'mem_gib' in out and 'skipped' in out and 'a/tylertoo' not in out
+
+
+@pytest.mark.parametrize('actual', [857315, 42, None])
+def test_tutorial_tile_count_check(tmp_path, results, capsys, actual):
+    doc, d = setup_page(tmp_path, results)
+    readme = tmp_path / 'examples/brazil-fields/README.md'
+    readme.parent.mkdir(parents=True)
+    readme.write_text('''Other output: 12 tiles across z0..z14
+```text
+999 tiles across z0..z14
+```
+File: `01-tiles.sh`
+
+```bash
+tylertoo tiles input brazil.pmtiles
+```
+```text
+✓ Converted input → brazil.pmtiles
+  857,315 tiles across z0..z14 in 174.16s
+```
+```text
+321 tiles across z0..z14
+```
+''')
+    if actual is not None:
+        (d / 'tutorial-map.json').write_text(json.dumps(
+            {'provenance': results['e2e-corpus']['provenance'], 'archive': {'tiles': actual}}))
+    if actual == 42:
+        with pytest.raises(SystemExit) as exc:
+            g.run(root=tmp_path, results_dir=d, check=True, files=['docs/benchmarks.md'])
+        message = str(exc.value)
+        assert '42' in message and '857,315' in message
+        assert 're-run benchmarks/release.sh tutorial-map docs' in message
+        assert 'update the tutorial' in message
+        # Stage names in the advice must exist.
+        stages = re.search(r'^STAGES=\((.*?)\)', (REPO / 'benchmarks/release.sh').read_text(), re.M)[1].split()
+        assert all(s in stages for s in ['tutorial-map', 'docs'])
+    else:
+        assert g.run(root=tmp_path, results_dir=d, check=True, files=['docs/benchmarks.md']) == []
+        if actual is None:
+            assert '::warning::' in capsys.readouterr().out
+
+
+def test_tutorial_parser_does_not_borrow_another_steps_output(tmp_path, results):
+    _, d = setup_page(tmp_path, results)
+    path = tmp_path / 'examples/brazil-fields/README.md'
+    path.parent.mkdir(parents=True)
+    path.write_text('''File: `01-tiles.sh`
+
+```bash
+tylertoo tiles input brazil.pmtiles
+```
+The expected output is missing.
+
+File: `02-shard.sh`
+
+```bash
+tylertoo merge parts output.pmtiles
+```
+```text
+42 tiles across z0..z14
+```
+''')
+    (d / 'tutorial-map.json').write_text(json.dumps(
+        {'provenance': results['e2e-corpus']['provenance'], 'archive': {'tiles': 42}}))
+    with pytest.raises(SystemExit, match='step-one expected tile count missing'):
+        g.run(root=tmp_path, results_dir=d, check=True, files=['docs/benchmarks.md'])
 
 
 def test_unknown_region_is_an_error():

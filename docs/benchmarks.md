@@ -75,7 +75,7 @@ _Run: commit afb6b15, allocator: mimalloc, aarch64, CPU 0xd40, 64 CPUs, 2026-11-
 <!-- bench:overture-buildings-africa/history -->
 54 min at commit afb6b15.
 
-<figure class="tt-chart"><figcaption>Africa wall time, shorter is faster</figcaption>
+<figure class="tt-chart"><figcaption>Africa wall time on aarch64, CPU 0xd40, 64 CPUs, shorter is faster</figcaption>
 <p class="tt-legend"><span class="tt-key tt-a">tylertoo</span></p>
 <div class="tt-row"><span class="tt-label">commit afb6b15</span>
 <span class="tt-bar tt-a" style="--w:100.0%" aria-hidden="true"></span><span class="tt-val">54.1 min</span>

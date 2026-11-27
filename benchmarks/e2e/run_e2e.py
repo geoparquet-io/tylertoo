@@ -759,6 +759,17 @@ def run_invariants(args, datasets: dict) -> int:
     return 0
 
 
+def run_provenance(tylertoo: str, tip_version: str, tip_sha: str | None) -> dict:
+    """Use the harness's host, memory, and release identity for corpus runs."""
+    prov = rm.provenance([rm.parse_bin(f'head={tylertoo}')], {})
+    prov['tool_versions'].update({
+        'tippecanoe': tip_version.removeprefix('tippecanoe ').strip(),
+        'tippecanoe_commit': tip_sha,
+        **{tool: rm._out([tool, '--version']) for tool in ('ogr2ogr', 'gpio') if shutil.which(tool)},
+    })
+    return prov
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -893,26 +904,7 @@ def main() -> int:
         machine = machine_info()
         results = {
             # The results-file contract of scripts/gen_bench_docs.py (#810).
-            "provenance": {
-                "git_describe": rm.git_describe(),
-                "host_class": rm.host_class_key(),
-                "release_version": rm.release_version(REPO),
-                "commit": git_sha(),
-                "tylertoo_version": tyler_version,
-                "host": f"{machine.get('cpu')}, {machine.get('ram_gb')} GB RAM, "
-                        f"{machine.get('platform')}",
-                "nproc": os.cpu_count(),
-                "kernel": platform.release(),
-                "allocator": rm.detect_allocator(Path(tylertoo)),
-                "tool_versions": {
-                    "tippecanoe": tip_version.removeprefix("tippecanoe ").strip(),
-                    "tippecanoe_commit": tip_sha,
-                    **{t: rm._out([t, "--version"]) for t in ("ogr2ogr", "gpio")
-                       if shutil.which(t)},
-                },
-                "inputs": [],  # filled per dataset as it runs
-                "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            },
+            "provenance": run_provenance(tylertoo, tip_version, tip_sha),
             "schema_version": 1,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "machine": machine,

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-STAGES = 'build tippecanoe corpus cells africa upload docs'.split()
+STAGES = 'build tippecanoe corpus cells africa tutorial-map upload docs'.split()
 
 
 @pytest.fixture
@@ -79,6 +79,55 @@ def test_non_candidate_refuses_publication(preview):
     assert 'upload: refuse' in result.stdout and 'docs: refuse' in result.stdout
     assert 'not a release candidate' in result.stdout
     assert 'v-old-1-gabc123' in result.stdout
+    assert 'tutorial-map: refuse' in result.stdout
+
+
+def test_tutorial_map_preview_and_resume(preview):
+    run, data = preview
+    result = run('--only', 'tutorial-map', MAP_TARGET='/tmp/local-map')
+    assert selected(result) == ['tutorial-map']
+    assert 'comparison.py tutorial-map' in result.stdout
+    assert '--target /tmp/local-map' in result.stdout
+    assert 'tutorial-map.json' in result.stdout
+    assert 'scratch' not in result.stdout
+    out = data / 'release/v-old-1-gabc123'
+    out.mkdir(parents=True)
+    (out / 'tutorial-map.done').touch()
+    assert 'tutorial-map: skip (done)' in run('tutorial-map').stdout
+    assert 'comparison.py tutorial-map' in run('--force', 'tutorial-map').stdout
+
+
+def test_tutorial_map_refuses_non_candidate_before_any_tools(preview):
+    _, data = preview
+    tools = data.parent / 'bin'
+    result = subprocess.run(['bash', str(ROOT / 'benchmarks/release.sh'), '--data', str(data),
+                             '--only', 'tutorial-map'], cwd=ROOT, text=True, capture_output=True,
+                            env={**os.environ, 'TEST_RC': '0', 'SKIP': '', 'ONLY': '',
+                                 'PATH': f'{tools}:{os.environ["PATH"]}'})
+    assert result.returncode == 1
+    assert 'tutorial-map, upload, and docs refuse' in result.stderr
+    assert not list(data.rglob('*.done'))
+    assert not list(data.rglob('*.pmtiles'))
+
+
+def test_data_env_default_and_explicit_override(preview, tmp_path):
+    run, explicit = preview
+    tools = explicit.parent / 'bin'
+    env = {**os.environ, 'SKIP': '', 'ONLY': '', 'PATH': f'{tools}:{os.environ["PATH"]}',
+           'TYLERTOO_BENCH_DATA': str(tmp_path / 'env-data')}
+    result = subprocess.run(['bash', str(ROOT / 'benchmarks/release.sh'), '--dry-run'],
+                            cwd=ROOT, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    out = tmp_path / 'env-data/release/v-old-1-gabc123'
+    assert f'Output: {out}' in result.stdout
+    assert f'--bench-out {out}/scratch' in result.stdout
+    assert f'--work {out}/corpus' in result.stdout
+    assert f'--work {out}/tutorial-map' in result.stdout
+    assert f'free under {tmp_path}/env-data' in result.stdout
+    assert not (tmp_path / 'env-data').exists()
+    assert f'Output: {explicit}/release/' in run(TYLERTOO_BENCH_DATA='/unused').stdout
+    help_text = run('--help').stdout
+    assert 'TYLERTOO_BENCH_DATA' in help_text and '$HOME/bench-data' in help_text
 
 
 def test_preflights_and_commands(preview):

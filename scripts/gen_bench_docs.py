@@ -320,27 +320,55 @@ def overture_release(r):
     return r.get('release') or (match[0] if match else None)
 
 
+def history_host(provenance):
+    """Recover legacy host classes only from the harness's exact host shape."""
+    host_class = provenance.get('host_class')
+    if not host_class:
+        match = re.fullmatch(r'([^,]+), CPU (.+), (\d+) CPUs', provenance.get('host') or '')
+        if match:
+            host_class = '/'.join(match.groups())
+    mem = provenance.get('mem_gib')
+    return (host_class, mem) if host_class and mem is not None else None
+
+
 def history(r):
     row, _ = stream_rows(r)
     if not row:
         return NOT_MEASURED
     entries = [*r.get('history', []), {"provenance": r['provenance'], "release": overture_release(r),
                                      "wall_s": statistics.median(row['runs_wall_s'])}]
-    rows = []
-    for entry in entries:
-        label = run_label(entry['provenance'])
-        if overture_release(entry) != overture_release(r):
-            label += f" (different Overture release: {overture_release(entry) or 'unknown'})"
-        wall = entry.get('wall_s')
-        if wall is None:
-            wall = statistics.median(stream_rows(entry)[0]['runs_wall_s'])
-        rows.append((label, [wall / 60]))
-    first, last = entries[0], entries[-1]
-    lead = f"{minutes(rows[0][1][0] * 60)} at {run_label(first['provenance'])}"
-    if len(entries) > 1:
-        lead += (f" → {minutes(last['wall_s'])} at {run_label(last['provenance'])}, "
-                 f"{factor(rows[0][1][0] * 60 / last['wall_s'])}× faster")
-    return lead + '.\n\n' + bars("Africa wall time, shorter is faster", ["tylertoo"], rows, "min")
+    groups = {}
+    for i, entry in enumerate(entries):
+        # Unknown memory or host never matches, including another unknown.
+        key = history_host(entry['provenance']) or ('unknown', i)
+        groups.setdefault(key, []).append(entry)
+    current_key = history_host(r['provenance']) or ('unknown', len(entries) - 1)
+    current = groups.pop(current_key)
+
+    def wall(entry):
+        return (entry['wall_s'] if entry.get('wall_s') is not None
+                else statistics.median(stream_rows(entry)[0]['runs_wall_s']))
+
+    first, last = current[0], current[-1]
+    lead = f"{minutes(wall(first))} at {run_label(first['provenance'])}"
+    if len(current) > 1:
+        lead += (f" → {minutes(wall(last))} at {run_label(last['provenance'])}, "
+                 f"{factor(wall(first) / wall(last))}× faster")
+    charts = []
+    for group in [current, *groups.values()]:
+        rows = []
+        for entry in group:
+            label = run_label(entry['provenance'])
+            if overture_release(entry) != overture_release(r):
+                label += f" (different Overture release: {overture_release(entry) or 'unknown'})"
+            rows.append((label, [wall(entry) / 60]))
+        prov = group[-1]['provenance']
+        host = prov.get('host') or prov.get('host_class') or 'unknown host'
+        mem = prov.get('mem_gib')
+        if mem is not None:
+            host += f', {mem} GiB memory'
+        charts.append(bars(f"Africa wall time on {host}, shorter is faster", ["tylertoo"], rows, "min"))
+    return lead + '.\n\n' + '\n\n'.join(charts)
 
 
 def recipe(r):
@@ -519,6 +547,29 @@ def page_regions(root, files):
     return regions
 
 
+def tutorial_tile_count(root=ROOT):
+    """The tile count in the Brazil tutorial's step-one expected output."""
+    path = Path(root) / 'examples/brazil-fields/README.md'
+    block = re.search(r'^File: `01-tiles\.sh`\s*\n```bash\n(?:(?!^```).)*^```[ \t]*\n[ \t]*```text\n(.*?)^```',
+                      path.read_text(), re.M | re.S)
+    count = re.search(r'^\s*([\d,]+) tiles across z\d+\.\.z\d+\b', block[1], re.M) if block else None
+    if not count:
+        raise SystemExit(f'{path}: step-one expected tile count missing')
+    return int(count[1].replace(',', ''))
+
+
+def check_tutorial_map(root, results):
+    record = results.get('tutorial-map')
+    if record is None:
+        print('::warning::tutorial-map.json absent; re-run benchmarks/release.sh tutorial-map docs to verify the tutorial.')
+        return
+    expected = tutorial_tile_count(root)
+    actual = record.get('archive', {}).get('tiles')
+    if actual != expected:
+        raise SystemExit(f'tutorial-map.json has {actual} tiles; examples/brazil-fields/README.md expects {expected:,} tiles; '
+                         're-run benchmarks/release.sh tutorial-map docs or update the tutorial.')
+
+
 def run(root=ROOT, results_dir=RESULTS_DIR, check=False, files=DOC_FILES):
     results = load_results(results_dir)
     stale, used = [], set()
@@ -553,9 +604,10 @@ def run(root=ROOT, results_dir=RESULTS_DIR, check=False, files=DOC_FILES):
             if not check:
                 path.write_text(new)
     if check:
-        orphans = set(results) - used - {'comparison-pmtiles'}
+        orphans = set(results) - used - {'comparison-pmtiles', 'tutorial-map'}
         if orphans:
             raise SystemExit(f'orphan results JSON without a rendered region: {sorted(orphans)}')
+        check_tutorial_map(root, results)
     return stale
 
 
@@ -596,6 +648,10 @@ def diff_results(ref, results, regions, root=ROOT):
         a, b = old['provenance'].get('host_class'), new['provenance'].get('host_class')
         if not a or not b or a != b:
             print(f"Note: {stem}: {'unknown' if not a or not b else 'different'} host_class; skipped.")
+            continue
+        a, b = old['provenance'].get('mem_gib'), new['provenance'].get('mem_gib')
+        if a is None or b is None or a != b:
+            print(f"Note: {stem}: {'unknown' if a is None or b is None else 'different'} mem_gib; skipped.")
             continue
         before = charted_walls(old, sections)
         for row, after in charted_walls(new, sections).items():

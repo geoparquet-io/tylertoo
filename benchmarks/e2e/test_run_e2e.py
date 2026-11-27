@@ -164,3 +164,20 @@ def test_kept_archive_paths(tmp_path):
     assert run_e2e.archive_paths(tmp_path, 'tiny') == {
         'tylertoo': tmp_path / 'tiny/tylertoo.pmtiles',
         'tippecanoe': tmp_path / 'tiny/tippecanoe.pmtiles'}
+
+
+def test_provenance_uses_shared_host_and_memory_facts(monkeypatch):
+    shared = {'host': 'shared host', 'host_class': 'shared class', 'mem_gib': 247,
+              'tylertoo_version': 'tylertoo test', 'tool_versions': {'head': 'tylertoo test'}}
+    binary = {'label': 'head', 'path': '/bin/tylertoo'}
+    monkeypatch.setattr(run_e2e.rm, 'parse_bin', lambda spec: binary)
+    def provenance(bins, inputs):
+        assert bins == [binary] and inputs == {}
+        return shared
+    monkeypatch.setattr(run_e2e.rm, 'provenance', provenance)
+    monkeypatch.setattr(run_e2e.shutil, 'which', lambda tool: None)
+    p = run_e2e.run_provenance('/bin/tylertoo', 'tippecanoe vtest', 'tip-sha')
+    assert p is shared
+    assert p['mem_gib'] == 247 and p['host_class'] == 'shared class'
+    assert p['tool_versions']['tippecanoe'] == 'vtest'
+    assert p['tool_versions']['tippecanoe_commit'] == 'tip-sha'

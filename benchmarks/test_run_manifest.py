@@ -76,6 +76,97 @@ def _write(tmp_path: Path, text: str) -> Path:
 SHA = "0" * 64
 
 
+@pytest.mark.parametrize('key', ['rss_frac', 'scratch_frac'])
+@pytest.mark.parametrize('section', ['defaults', 'cells.c'])
+@pytest.mark.parametrize('value', ['0', '-0.1', '1.01', 'nan', 'true', '"bad"'])
+def test_fraction_caps_are_validated(tmp_path, key, section, value):
+    defaults = f'{key} = {value}' if section == 'defaults' else ''
+    cell = f'{key} = {value}' if section == 'cells.c' else ''
+    path = _write(tmp_path, f'''[defaults]
+{defaults}
+[inputs.a]
+file = "a.parquet"
+sha256 = "{SHA}"
+[cells.c]
+input = "a"
+command = "tiles"
+args = ["{{input}}"]
+output = "o"
+{cell}
+''')
+    with pytest.raises(rm.ManifestError, match=key):
+        rm.load_manifest(path)
+
+
+def test_caps_resolve_host_memory_and_current_scratch_free(tmp_path, monkeypatch):
+    monkeypatch.setattr(rm, 'host_mem_bytes', lambda: 247 * (1 << 30))
+    calls = []
+    def disk(path):
+        calls.append(path)
+        return SimpleNamespace(free=500 * (1 << 30))
+    monkeypatch.setattr(rm.shutil, 'disk_usage', disk)
+    assert rm.resolve_caps({'rss_gib': 110, 'scratch_gib': 240, 'wall_s': 600,
+                            'rss_frac': .85, 'scratch_frac': .8}, tmp_path) == {
+        'rss_gib': 247 * .85, 'scratch_gib': 400, 'wall_s': 600}
+    assert calls == [tmp_path]
+    assert rm.resolve_caps({}, tmp_path) == rm.DEFAULT_CAPS
+    assert rm.resolve_caps({'rss_frac': 1, 'scratch_frac': 1}, tmp_path)['rss_gib'] == 247
+
+
+def test_fraction_manifest_defaults_and_heavy_cells(manifest):
+    africa = rm.load_manifest(HERE / 'showcase/manifest-africa.toml')
+    cell = africa['cells']['ovt-s3']
+    assert cell['rss_frac'] == .85 and cell['scratch_frac'] == .8
+    assert 'rss_gib' not in africa['defaults'] and 'scratch_gib' not in africa['defaults']
+    for name in ['tiles-nz', 'tiles-nz-bounded']:
+        assert manifest['cells'][name]['rss_frac'] == .8
+    assert not manifest['cells']['tiles-madagascar'].get('rss_frac')
+
+
+def test_host_memory_uses_memtotal(tmp_path):
+    path = tmp_path / 'meminfo'
+    path.write_text(f'MemTotal: {247 * (1 << 20) + 42} kB\nMemFree: 123 kB\n')
+    assert rm.host_mem_bytes(path) == (247 * (1 << 20) + 42) * 1024
+
+
+def test_report_preserves_resolved_caps_and_memory(tmp_path):
+    bins = [{'label': 'a', 'allocator': 'any'}]
+    (tmp_path / 'binaries.json').write_text(json.dumps(bins))
+    cell = tmp_path / 'c'
+    cell.mkdir()
+    rec = {**_ok('a', 2, 4), 'caps': {'rss_gib': 197.6, 'scratch_gib': 400, 'wall_s': 600},
+           'mem_gib': 247}
+    (cell / 'a-r0.json').write_text(json.dumps(rec))
+    out = tmp_path / 'report.json'
+    rm.write_results_json(tmp_path, out)
+    summary = json.loads(out.read_text())['cells']['c']['a']
+    assert summary['caps'] == rec['caps'] and summary['mem_gib'] == 247
+
+
+def test_scratch_fraction_is_measured_once_before_setup_and_rounds(tmp_path, monkeypatch):
+    cell = {'input': 'a', 'rss_frac': .8, 'scratch_frac': .8, 'setup': {}, 'warmup': 1}
+    free, measurements, seen = [500 * (1 << 30)], [], []
+    def disk(path):
+        measurements.append(path)
+        return SimpleNamespace(free=free[0])
+    def setup(*args):
+        free[0] //= 2  # Setup consumes disk; later rounds must retain the initial cap.
+        return tmp_path
+    monkeypatch.setattr(rm.shutil, 'disk_usage', disk)
+    monkeypatch.setattr(rm, 'host_mem_bytes', lambda: 247 * (1 << 30))
+    monkeypatch.setattr(rm, 'resolve_input', lambda *args: tmp_path / 'input')
+    monkeypatch.setattr(rm, 'write_report', lambda *args: None)
+    runner = SimpleNamespace(results=tmp_path, bench_out=tmp_path, data=tmp_path, input_dirs=[],
+        args=SimpleNamespace(force=False, name='suite', warmup=None),
+        m={'cells': {'c': cell}, 'inputs': {'a': {}}}, bins=[{'label': 'head', 'allocator': 'any'}],
+        pairs=lambda cell: 2, substitutions=lambda *a: {}, setup=setup,
+        run_one=lambda name, spec, *a, **kw: seen.append(spec['caps']))
+    rm.Runner.run_cell(runner, 'c')
+    assert measurements == [tmp_path]
+    assert len(seen) == 3  # Warm-up and both rounds use the same resolved caps.
+    assert all(caps == {'rss_gib': 247 * .8, 'scratch_gib': 400, 'wall_s': 1800} for caps in seen)
+
+
 def test_unknown_input_is_rejected(tmp_path):
     p = _write(tmp_path, f"""
 [inputs.a]
@@ -376,7 +467,7 @@ def test_summary_carries_per_phase_effective_cores(tmp_path):
 _spec = importlib.util.spec_from_file_location("gen_bench_docs", HERE.parent / "scripts/gen_bench_docs.py")
 _docs = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_docs)
-PROVENANCE_KEYS = _docs.PROVENANCE_KEYS + ["git_describe", "host_class", "release_version"]
+PROVENANCE_KEYS = _docs.PROVENANCE_KEYS + ["git_describe", "host_class", "release_version", "mem_gib"]
 
 
 def test_provenance_has_every_contract_key(tmp_path, monkeypatch):
@@ -400,6 +491,7 @@ def test_provenance_has_every_contract_key(tmp_path, monkeypatch):
     assert p["git_describe"] == "checkout"
     assert p["host_class"] == rm.host_class_key()
     assert p["release_version"] == "9.9.9"
+    assert p['mem_gib'] == int(rm.host_mem_bytes() / (1 << 30))
 
 
 def test_report_json_out_writes_a_results_file(tmp_path):
@@ -423,6 +515,13 @@ def test_timed_records_cpu_and_effective_cores(tmp_path):
     assert res["status"] == "ok"
     assert res["cpu_s"] is not None and res["effective_cores"] is not None
     assert res["profile"] == {}  # no TYLERTOO_PROFILE_JSON written by sh
+
+
+def test_direct_capped_runs_also_record_caps_and_host_memory(tmp_path):
+    caps = {'rss_gib': 1, 'scratch_gib': 2, 'wall_s': 3}
+    result = rm.run_capped(['/usr/bin/time', '-v', 'true'], caps, None, tmp_path / 'log', None)
+    assert result['caps'] == caps
+    assert result['mem_gib'] == int(rm.host_mem_bytes() / (1 << 30))
 
 
 def test_profile_keeps_per_zoom_wave_width_and_spill(tmp_path):
@@ -762,6 +861,8 @@ def test_failed_round_is_retried_without_repeating_successes(tmp_path, monkeypat
     with pytest.raises(rm.ManifestError, match='failed'):
         rm.Runner.run_one(runner, 'c', cell, 0, 'head', {}, [], None)
     saved = json.loads((cdir / 'head-r0.json').read_text())
+    assert saved['caps'] == rm.DEFAULT_CAPS
+    assert saved['mem_gib'] == int(rm.host_mem_bytes() / (1 << 30))
     assert saved['env'] == {'AWS_SKIP_SIGNATURE': 'true', 'COUNT': '4', 'EXPLICIT': 'yes'}
     status.update(status='ok', returncode=0)
     rm.Runner.run_one(runner, 'c', cell, 0, 'head', {}, [], None)

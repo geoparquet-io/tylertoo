@@ -8,8 +8,10 @@ pairs = 3
 warmup = 1
 allocator = "any"
 wall_s = 21600
-rss_gib = 110
-scratch_gib = 240
+# Auto uses more memory on larger hosts; retain host headroom.
+rss_frac = 0.85
+# Leave free space for other work on the scratch filesystem.
+scratch_frac = 0.8
 min_free_gb = 5
 load_max = 3.0
 load_wait_s = 1800
