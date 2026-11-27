@@ -5,6 +5,19 @@ Notable changes to this project are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.9.1 (2026-11-27)
+
+The v0.9.0 Linux wheels failed to build, so v0.9.0 is on crates.io but not
+on PyPI. v0.9.1 is the first release of the 0.9 line on PyPI. The changes
+since v0.8.0 are under v0.9.0.
+
+### Fixed
+
+- The manylinux wheels build again. The per-tile trace called
+  `libc::gettid()`, a wrapper that glibc added in 2.30, and the manylinux2014
+  wheels link against glibc 2.17. It now uses the raw `gettid` syscall, and
+  clippy refuses `libc::gettid` (#936).
+
 ## v0.9.0 (2026-11-27)
 
 MapLibre Tile output, cell bands, a local viewer, reprojection of projected

@@ -236,8 +236,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(target_os = "linux")]
 fn os_tid() -> u64 {
-    // SAFETY: gettid has no preconditions and cannot fail.
-    u64::try_from(unsafe { libc::gettid() }).unwrap_or(0)
+    // The raw syscall, not libc::gettid(): glibc added that wrapper in 2.30,
+    // and the manylinux2014 wheels link against glibc 2.17.
+    // SAFETY: the gettid syscall takes no arguments and cannot fail.
+    u64::try_from(unsafe { libc::syscall(libc::SYS_gettid) }).unwrap_or(0)
 }
 
 /// `CLOCK_MONOTONIC` now, for lining the trace up with `perf record -k
