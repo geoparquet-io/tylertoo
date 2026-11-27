@@ -12,6 +12,7 @@ SCRIPT = ROOT / "scripts" / "ci" / "verify_fixtures.sh"
 PINS = ROOT / "benchmarks" / "fixtures.sha256"
 RELEASE_ASSETS = {
     "fieldmaps-boundaries.parquet", "fieldmaps-madagascar-adm4.parquet",
+    "fieldmaps-madagascar-adm4-hilbert.parquet",
     "ftw-moldova-z10.parquet", "open-buildings.parquet", "road-detections.parquet",
     "wkt-encoded.parquet",
 }
