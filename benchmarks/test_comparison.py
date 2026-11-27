@@ -221,6 +221,14 @@ def test_tutorial_map_failed_verification_leaves_no_record(tmp_path, monkeypatch
     assert not out.exists()
 
 
+def test_build_falls_back_to_the_measured_describe_label(corpus, tmp_path):
+    source = json.loads((tmp_path / 'e2e.json').read_text())
+    source['provenance'].update(release_version=None, git_describe='v9.9.9-52-gabcdef0')
+    (tmp_path / 'e2e.json').write_text(json.dumps(source))
+    doc = cp.build(tmp_path / 'e2e.json', corpus[0], tmp_path / 'm.json')
+    assert doc['version'] == 'v9.9.9-52-gabcdef0'
+
+
 def test_build_takes_prerelease_label(corpus, tmp_path):
     work = corpus[0]
     doc = cp.build(tmp_path / 'e2e.json', work, tmp_path / 'm.json', 'v9.9.9-52-gabcdef0')

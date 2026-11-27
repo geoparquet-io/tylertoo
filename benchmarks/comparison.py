@@ -35,11 +35,12 @@ def archive_path(work: Path, did: str, tool: str) -> Path:
 
 
 def build(corpus: Path, work: Path, out: Path, version: str | None = None) -> dict:
-    """`version` names the upload prefix; it defaults to the run's release
-    version, and release.sh passes the git describe label for --prerelease."""
+    """`version` names the upload prefix. It defaults to the measured run's
+    release version, or its git describe label for an unreleased commit, so
+    the prefix names the code that built the archives wherever they are published."""
     source = json.loads(corpus.read_text())
     prov = {k: source['provenance'].get(k) for k in rm.PROVENANCE_KEYS}
-    version = component(version or prov['release_version'])
+    version = component(version or prov['release_version'] or prov['git_describe'])
     base = BASE_URL + version + '/'
     datasets = []
     for did, ds in source['datasets'].items():

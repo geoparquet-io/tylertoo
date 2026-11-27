@@ -137,7 +137,8 @@ for stage in "${selected[@]}"; do
       run "${PY[@]}" benchmarks/run_manifest.py --manifest benchmarks/showcase/manifest-africa.toml \
         run --cells ovt-s3 --name africa-s3 --data "$DATA" --results "$OUT/results/africa-s3" \
         --bench-out "$OUT/scratch" --bin head=target/release/tylertoo "${extra[@]}"
-      run uv run --no-project --python 3.12 --with pyarrow==26.0.0 python -I \
+      # Pin numpy: pyarrow imports any numpy it can see, including a system 1.x it cannot use.
+      run uv run --no-project --python 3.12 --with pyarrow==26.0.0 --with numpy==2.2.6 python -I \
         benchmarks/showcase/showcase.py collect-stream africa --data "$OUT" \
         --history-from benchmarks/results/overture-buildings-africa.json --out "$OUT/overture-buildings-africa.json" ;;
     tutorial-map)
@@ -147,7 +148,7 @@ for stage in "${selected[@]}"; do
         --target "${MAP_TARGET:-s3://nlebovits/tylertoo-brazil-demo/brazil.pmtiles}" ;;
     upload)
       run "${PY[@]}" benchmarks/comparison.py build --corpus "$OUT/e2e-corpus.json" \
-        --work "$OUT/corpus" --out "$OUT/comparison-pmtiles.json" --version "$VERSION"
+        --work "$OUT/corpus" --out "$OUT/comparison-pmtiles.json"
       run "${PY[@]}" benchmarks/comparison.py upload --manifest "$OUT/comparison-pmtiles.json" \
         --work "$OUT/corpus" --target "${UPLOAD_TARGET:-s3://nlebovits/tylertoo-benchmarks}" "${extra[@]}" ;;
     docs)

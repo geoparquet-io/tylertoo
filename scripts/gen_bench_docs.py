@@ -110,6 +110,12 @@ def tool_version(name, value):
     return value
 
 
+def host_text(p):
+    """The host string plus its memory, which newer host strings leave out."""
+    host, mem = p.get("host") or "unknown host", p.get("mem_gib")
+    return host if mem is None or "RAM" in host else f"{host}, {mem} GiB RAM"
+
+
 def footer(r):
     p = r["provenance"]
     label = run_label(p)
@@ -117,7 +123,7 @@ def footer(r):
     tools = [f"{k} {tool_version(k, v)}" for k, v in p["tool_versions"].items()
              if k in ("tippecanoe", "gpio") and v is not None]
     fields = [label] + ([] if label == commit else [commit]) + tools
-    fields += [f"allocator: {p['allocator']}", p["host"], (p["date"] or "undated")[:10]]
+    fields += [f"allocator: {p['allocator']}", host_text(p), (p["date"] or "undated")[:10]]
     return "_Run: " + ", ".join(str(v) for v in fields) + "._"
 
 
@@ -204,10 +210,12 @@ def speedup(r):
             f"the geometric mean over {len(included)} datasets.\n\n"
             f"Included: {', '.join(DISPLAY.get(d, d) for d in included)}. "
             f"Excluded: {'; '.join(f'{DISPLAY.get(d, d)}: {why}' for d, why in excluded.items()) or 'none'}.\n\n"
-            + (f"GeoParquet to FlatGeobuf conversion as a share of tippecanoe's total wall time: {', '.join(conversion)}. " if conversion else "")
+            + (f"tippecanoe's end-to-end time includes converting the GeoParquet input to FlatGeobuf with gpio; "
+               f"that conversion is this share of it: {', '.join(conversion)}. " if conversion else "")
             + f"For tiling alone, the geometric mean is {factor(tile)}×. "
             + (f"With thinning off, the geometric mean is {factor(statistics.geometric_mean(qm))}× "
-               f"over {len(qm)} datasets." if qm else "Thinning off was not measured."))
+               f"over {len(qm)} datasets." if qm else "Thinning off was not measured.")
+            + " Each tool's flags per dataset are under Exact commands in [Measurement method](#measurement-method).")
 
 
 def speedup_bars(r):
@@ -243,7 +251,7 @@ def method(r):
     p, settings = r["provenance"], r.get("settings", {})
     out = []
     if p.get("host"):
-        out.append(f"- Host: {p['host']}.")
+        out.append(f"- Host: {host_text(p)}.")
     for key, label in [("warmup", "Discarded warm-ups"), ("repeat", "Rounds"),
                        ("alternation", "Run order")]:
         if key in settings:
@@ -449,7 +457,7 @@ def compare_maps(r):
             f'data-{key}="{html.escape(value, quote=True)}"' for key, value in attrs.items()) + '>'
             + html.escape(label) + '</option>')
         rows.append([label, *[f"[{tool}]({d[tool]['url']})" for tool in ['tylertoo', 'tippecanoe']]])
-    return '\n'.join([*out, '</select>', '', table(['Dataset', 'tylertoo archive', 'tippecanoe archive'], rows)])
+    return '\n'.join([*out, '</select>', '', table(['Dataset', 'tylertoo archive', 'Tippecanoe archive'], rows)])
 
 
 RENDERERS = {
@@ -611,6 +619,9 @@ def run(root=ROOT, results_dir=RESULTS_DIR, check=False, files=DOC_FILES):
             if not check:
                 path.write_text(new)
     if check:
+        # The comparison maps' page may not be listed yet; validate its manifest anyway.
+        if 'comparison-pmtiles' in results and 'comparison-pmtiles' not in used:
+            render_region('comparison-pmtiles/compare-maps', results)
         orphans = set(results) - used - {'comparison-pmtiles', 'tutorial-map'}
         if orphans:
             raise SystemExit(f'orphan results JSON without a rendered region: {sorted(orphans)}')

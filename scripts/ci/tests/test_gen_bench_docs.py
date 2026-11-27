@@ -89,7 +89,7 @@ def test_memory_caption(results):
 
 def test_speedup_uses_plain_metric_labels(results):
     r = results["e2e-corpus"]
-    assert "GeoParquet to FlatGeobuf conversion as a share of tippecanoe's total wall time:" in g.speedup(r)
+    assert "tippecanoe's end-to-end time includes converting the GeoParquet input to FlatGeobuf" in g.speedup(r)
     assert "For tiling alone, the geometric mean is" in g.speedup(r)
     out = g.speedup_bars(r)
     assert "<figcaption>End-to-end wall time, shorter is faster</figcaption>" in out
@@ -113,6 +113,9 @@ def test_label_and_footer(results):
     out = g.footer(results["e2e-corpus"])
     for value in [p["commit"], p["allocator"], p["host"], p["date"][:10], *p["tool_versions"].values()]:
         assert value in out
+    # A host string without memory gets it from mem_gib, once.
+    assert g.host_text({"host": "aarch64, CPU 0xd40, 64 CPUs", "mem_gib": 246}) == "aarch64, CPU 0xd40, 64 CPUs, 246 GiB RAM"
+    assert g.host_text({"host": "Neoverse-V1, 124 GB RAM", "mem_gib": 123}) == "Neoverse-V1, 124 GB RAM"
 
 
 def test_stamp_lists_page_files(results):
@@ -223,7 +226,7 @@ def test_compare_maps(results):
     r = comparison(results)
     results["comparison-pmtiles"] = r
     out = g.render_region("comparison-pmtiles/compare-maps", results)
-    for needle in ['<label', '<select id="compare-dataset"', 'data-tylertoo=', 'data-tippecanoe=', 'data-layer="places"', 'data-geometry="point"', '| Dataset | tylertoo archive | tippecanoe archive |']:
+    for needle in ['<label', '<select id="compare-dataset"', 'data-tylertoo=', 'data-tippecanoe=', 'data-layer="places"', 'data-geometry="point"', '| Dataset | tylertoo archive | Tippecanoe archive |']:
         assert needle in out
     r["datasets"][0]["tylertoo"]["url"] += "?bad"
     with pytest.raises(ValueError, match="URL"):
@@ -258,6 +261,15 @@ def test_check_catches_hand_edit(tmp_path, results):
     doc, d = setup_page(tmp_path, results)
     doc.write_text(doc.read_text().replace("abc1234", "abc1235", 1))
     assert g.run(root=tmp_path, results_dir=d, check=True, files=["docs/benchmarks.md"]) == ["docs/benchmarks.md"]
+
+
+def test_check_validates_unlisted_comparison_manifest(tmp_path, results):
+    """The compare-maps page may be absent; --check still validates its manifest."""
+    bad = comparison(results)
+    bad["datasets"][0]["tippecanoe"]["url"] += "?bad"
+    _, d = setup_page(tmp_path, {**results, "comparison-pmtiles": bad})
+    with pytest.raises(ValueError, match="URL"):
+        g.run(root=tmp_path, results_dir=d, check=True, files=["docs/benchmarks.md"])
 
 
 @pytest.mark.parametrize("problem", ["digit", "orphan", "lines", "coverage", "missing", "marker"])

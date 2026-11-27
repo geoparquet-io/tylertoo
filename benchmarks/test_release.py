@@ -217,4 +217,3 @@ def test_prerelease_opt_in(preview, args, clean, publishes):
     assert ('refuse' not in result.stdout) == publishes
     if publishes:
         assert re.search(r'^Output: .*/release/v-old-1-gabc123$', result.stdout, re.M)
-        assert '--version v-old-1-gabc123' in result.stdout
