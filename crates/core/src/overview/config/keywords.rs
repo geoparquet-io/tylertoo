@@ -617,9 +617,9 @@ pub struct ConvertSyntax {
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Generalization"))]
     pub no_collapse: bool,
     /// Polygon representation by zoom band: comma-separated
-    /// `LO-HI:KIND`, where `KIND` is `geom`, `point`, or `square`, such as
-    /// `0-7:point,8-14:geom`. Band rules:
-    /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
+    /// `LO-HI:KIND`, where `KIND` is `geom`, `point`, or `square`.
+    /// Ranges are inclusive. Band rules:
+    /// <https://geoparquet-io.github.io/tylertoo/reference/tuning/#collapse-and-representation>.
     #[cfg_attr(
         feature = "cli",
         arg(long, value_name = "SPEC", help_heading = "Generalization")

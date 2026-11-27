@@ -150,7 +150,7 @@ fn export_warns_when_a_tile_exceeds_the_override() {
         "overview level 0 (z0) cannot fit in memory",
         "z0/0/0",
         "--verbatim",
-        "--point-thinning 4",
+        "--point-thinning",
         "TYLERTOO_SKIP_MEMORY_PREFLIGHT",
     ] {
         assert!(

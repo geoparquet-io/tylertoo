@@ -231,7 +231,7 @@ for step in ../tylertoo/examples/brazil-fields/0*.sh; do bash "$step"; done
 - To tile a smaller area, add `--bbox`, as the
   [Madagascar tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/madagascar/)
   shows.
-- The [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
+- The [tuning reference](https://geoparquet-io.github.io/tylertoo/reference/tuning/)
   explains every generalization setting, including `--band`.
 - Use `tylertoo pyramid` to combine bands from separate inputs or archives,
   such as cells from another dataset. See the same tuning reference.

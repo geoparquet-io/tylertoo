@@ -481,7 +481,7 @@ pub struct PyramidArgs {
     /// `LO-HI=[SYSTEM=]INPUT[=LAYER]` (repeatable; layer defaults to file stem).
     /// Omit SYSTEM to tile GeoParquet or reuse PMTiles; grid/h3/s2/a5 aggregate
     /// GeoParquet centroids into cells:
-    /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
+    /// <https://geoparquet-io.github.io/tylertoo/reference/tuning/#several-layers>.
     #[arg(
         long = "band",
         required = true,
@@ -701,7 +701,7 @@ pub struct TilesArgs {
     /// h3, s2 or a5 for cells in the same layer. Requires contiguous
     /// feature bands. No overlaps. Excludes `--min-zoom`, `--max-zoom`,
     /// `--gsd` and `--representation`. See
-    /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
+    /// <https://geoparquet-io.github.io/tylertoo/reference/tuning/#several-layers>.
     // Exclusive with the zoom flags: clap's rule here, core's
     // (`ConfigError::BandWithZoomOption`) for Python's keywords.
     #[arg(
@@ -735,6 +735,9 @@ pub struct TilesArgs {
     pub shard: Option<String>,
 
     /// The shard plan from `tylertoo shard-plan` that every job shares.
+    /// Give every job the same inputs and settings. If a saved convert plan
+    /// no longer matches the inputs or selection settings, rebuild it with
+    /// `--plan-only` and `--save-plan` before restarting the data jobs.
     #[arg(long, value_name = "PATH", help_heading = "Sharded builds")]
     pub shard_plan: Option<PathBuf>,
 
@@ -746,7 +749,9 @@ pub struct TilesArgs {
     pub tile_range: Option<String>,
 
     /// Write the convert plan (`--save-plan`) and stop, with no export and
-    /// no OUTPUT. Use it for a coarse job whose tiles the fleet discards.
+    /// no OUTPUT. Requires `--save-plan`. Use it when only the data jobs need
+    /// tiles. The plan still covers the whole input and its selection settings;
+    /// it does not create the separate `--shard-plan`.
     // Needs --save-plan: core's rule (`ConfigError::PlanOnlyWithoutSavePlan`).
     #[arg(long, help_heading = "Sharded builds")]
     pub plan_only: bool,

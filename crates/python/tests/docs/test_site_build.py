@@ -48,6 +48,7 @@ def site() -> Path:
         ("guides/tippecanoe/index.html", "01-preset.sh"),
         ("reference/cli/index.html", "export-pmtiles"),
         ("reference/python/index.html", "export_pmtiles"),
+        ("reference/tuning/index.html", "memory"),
         ("spec/overviews/index.html", "canonical_level"),
     ],
 )

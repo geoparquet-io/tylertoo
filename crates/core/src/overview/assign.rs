@@ -789,8 +789,8 @@ impl From<Vec<AssignFeature>> for FeatureTable {
 /// the old 4×GSD eligibility gate was strictly stricter than what
 /// survives writing and starved coarse zooms for no benefit — 4→2
 /// gives 3–5× more coarse-level polygons on the Moldova corpus at
-/// +0.1% file size, while values below 2 only admit candidates that
-/// RDP kills anyway (wasted density-budget slots).
+/// +0.1% file size in that sweep. Collapsed polygons now contribute
+/// placeholder squares, so that sweep does not establish a lower useful gate.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 #[serde(default, deny_unknown_fields)]
@@ -820,7 +820,7 @@ pub struct AssignConfig {
     /// `diag >= polygon_visibility·gsd(z)`.
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().polygon_visibility))]
-    #[cfg_attr(feature = "cli", arg(help = "Drop polygons whose bbox diagonal is shorter than this many GSDs at a level", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Gate polygons whose bbox diagonal is shorter than this many GSDs at a level. In duplicating mode, rejected polygons contribute area to collapse squares unless a point or drop disposition applies; lowering this gate keeps more source geometry, not necessarily more visible area", long_help = None))]
     pub polygon_visibility: f64,
     /// Whether larger or smaller `sort_key` wins.
     #[serde(
@@ -2043,7 +2043,7 @@ pub struct DensityBudgetConfig {
         default_value_t = Self::default().drop_rate,
         help_heading = "Density budget"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Density budget decay: each coarser level keeps 1/rate of the next finer level's feature budget. Larger values thin mid zooms more", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Density budget decay: each coarser level keeps the next finer level's budget divided by this rate. Larger values thin mid zooms more. A rate at or below one silently disables the budget", long_help = None))]
     pub drop_rate: f64,
     /// Spatial-fairness strength (`>= 1`; smaller is rejected by validation). `1.0` = proportional cut; larger =
     /// sublinear, protecting sparse neighborhoods (dense areas kept to the

@@ -3,9 +3,9 @@
 Single home for the corpus sweeps that set the engine's default knob
 values. Each section states the decision, the evidence, and where the
 renders/artifacts live. The knobs themselves are documented in
-`docs/OVERVIEW_TUNING.md`; the code constants live in
-`crates/core/src/overview/assign.rs` and the CLI arg defaults in
-`crates/cli/src/main.rs`.
+`docs/reference/tuning.md`; the code constants live in
+the core option structs in `crates/core/src/overview`; the CLI reads their
+defaults.
 
 Generated artifacts referenced here are **not committed**: rebuild the
 corpus with `corpus/fetch.sh` + `corpus/optimize.sh`, goldens with
@@ -48,7 +48,7 @@ tile-budget driven); from z8 our counts cross tippecanoe's and peak
 
 Full tables: `context/archive/corpus/SWEEP_NOTES.md`.
 
-## Decision 2: `--drop-rate 1.65` (Q2 density budget)
+## Decision 2 (superseded by 11): `--drop-rate 1.65` (Q2 density budget)
 
 Superseded by [Decision 11](#decision-11---drop-rate-25-for-the-points-only-budget).
 
@@ -106,7 +106,7 @@ smears attributes across crossings. Line coalescing itself remains
 **ON by default** (same review: defaults should look right); opt out
 with `--no-coalesce-lines`.
 
-## Decision 5: `--row-group-size-policy zoom-scaled` (issue #202)
+## Decision 5: opt-in `zoom-scaled`; `constant` remains the default
 
 **Sweep:** `--row-group-size` ∈ {10k, 25k, 50k, 100k} and the new
 `--row-group-size-policy zoom-scaled` on all four benchmark datasets
@@ -152,7 +152,7 @@ File size: negligible (2–6% variation). Footer: linear in RG count but
 small either way (<250 KB on the 294 MB Moldova file).
 
 **Decision (2026-07-04, #202):** ship `zoom-scaled` as **opt-in**; keep
-`constant 10k` as the default for now. `zoom-scaled` doubles the
+`constant` as the default. `zoom-scaled` doubles the
 row-group cap per zoom step below the finest level, so coarse bands —
 read mostly whole by wide viewports anyway — become fewer, larger row
 groups, while the finest level keeps tight bbox pruning:
@@ -180,7 +180,7 @@ Raw data: `corpus/data/bench/sweep202/{rg10k,rg25k,rg50k,rg100k,zoom-scaled}/`
 (local), `s3://tylertoo-bench/sweep202/` (remote, can be deleted after
 this decision is final).
 
-## Decision 6: `--polygon-visibility 2.0` (retuned from 4.0) + the coarse-zoom dot-fill recipe (issue #259)
+## Decision 6 (dot-fill recipe superseded by 8): `--polygon-visibility 2.0` (retuned from 4.0) + the coarse-zoom dot-fill recipe (issue #259)
 
 **Sweep (2026-07-15):** `--polygon-visibility` ∈ {4 (old default), 2, 1,
 0+`--collapse`} on `polygons-ftw-moldova-large` (631,910 field polygons)
@@ -230,8 +230,7 @@ it starved z8–z12 for zero benefit. 2.0 aligns the eligibility gate with
 the write-time survival bar (and with the line gate).
 
 **The country view needs the recipe, not a gate.** No gate value can put
-a 20 m building on a z4 map as a polygon. The documented recipe
-(`docs/OVERVIEW_TUNING.md` → "Country-scale dot fill") is
+a 20 m building on a z4 map as a polygon. At the time of this sweep, the dot-fill recipe was
 `--polygon-visibility 0 --collapse` (+ `--max-tile-size 500K` on export,
 + a circle layer in the style): every Germany level populates (z0 = 581
 dots, z4 = 128,886, z6 = 1.07M), z6–z13 land exactly on the budget
@@ -252,7 +251,7 @@ Raw artifacts: `corpus/data/bigbench/sweep_scratch/` (not committed).
 
 ---
 
-## Decision 7: auto `--in-flight-batches` stays clamped to 4–16 (issue #648)
+## Decision 7 (premise superseded): auto `--in-flight-batches` stays clamped to 4–16 (issue #648)
 
 `IN_FLIGHT_BATCHES_MAX = 16` was justified by "the single-threaded parquet
 writer caps the achievable speedup". The writer has encoded row groups and
@@ -382,8 +381,7 @@ The measurements showed the following:
   0.03–0.05% at the default and 0.01–0.02% at factor 0, so residual
   missing coverage with the fill on adm4 is 0.01–0.05%. Without the fill
   the loss includes placeholder-square gaps (#750). Archive 26.9 MB default,
-  29.3 MB at factor 0.25, 33.5 MB at factor 0. Table:
-  `docs/OVERVIEW_TUNING.md` § Coverage and simplification; commands in
+  29.3 MB at factor 0.25, 33.5 MB at factor 0. The old tuning-page table is no longer maintained; commands are in
   `benchmarks/coalesce/RESULTS.md`.
 - `--polygon-visibility 0` once kept placeholder squares alive at every
   coarse cascade level (#749), drawing small features as very large
@@ -413,10 +411,9 @@ an entry-zoom ladder); `--size-valve merge` merges oversized tiles, with
 `--size-valve drop` to preserve each retained feature's attributes. The default simplification
 tolerance (Decision 1) is unchanged: slivers at the default are mostly
 narrower than a pixel. The tolerance applies to every geometry class, so
-reducing it increases memory use and file size across the dataset. The curve is documented
-instead (`docs/OVERVIEW_TUNING.md` § Coverage and simplification), with
-`0.25` (about tippecanoe's coverage) and `0` (no slivers, a larger overview
-file) as recipes, alongside the pre-#745 settings for smaller, faster builds.
+reducing it increases memory use and file size across the dataset. The
+values `0.25` and `0` were recipes from this sweep. For current choices,
+see `docs/reference/tuning.md#geometry-detail`.
 Issue #450 tracks simplifying shared borders identically.
 
 ## Decision 9: cap the compressed tile at 500K, with a 2M raw backstop (issue #761)

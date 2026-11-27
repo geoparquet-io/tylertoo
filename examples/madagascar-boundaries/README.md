@@ -125,7 +125,7 @@ one pixel in meters. At z0–z2, pixels span 10–40 km, wider than any of these
 polygons. A polygon below the visibility gate is drawn as a small
 placeholder square, so even the coarsest levels show where the polygons
 are. Use `--no-collapse` to drop them or `--collapse` to draw dots. The
-[tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
+[tuning reference](https://geoparquet-io.github.io/tylertoo/reference/tuning/)
 explains the available settings.
 
 ## 3. Build and validate the overview

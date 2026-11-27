@@ -1,7 +1,7 @@
 """Hypothesis over the option surface (#677; replaces mutation testing).
 
 Core owns option validation. The oracle below is the documented range of
-each option (docs/OVERVIEW_TUNING.md, the CLI help, core's own tests), not
+each option (docs/reference/tuning.md, the CLI help, core's own tests), not
 core's code, so a loosened bound fails: a refused value raises
 ``tylertoo.ConfigError`` (a ``ValueError``) naming the argument before the
 input is read; an accepted value fails later, on the missing input.

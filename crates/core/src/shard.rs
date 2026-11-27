@@ -115,7 +115,7 @@ pub(crate) const MAX_SHARD_PIVOT_ZOOM: u8 = 10;
 ///
 /// The cost: a shard reads the row groups up to nine pivot tiles past its
 /// range, on an input whose row groups are Hilbert-compact. The wider
-/// margin's cost is measured in `docs/OVERVIEW_TUNING.md`. A `tiles` data
+/// margin fetches more input. A `tiles` data
 /// shard whose export predicts no floors (`--valve-scope tile`, or no size
 /// cap) reads only [`SHARD_BUFFER_MARGIN_TILES`]; a convert a Rust caller
 /// shards on its own cannot see the export that follows, so it reads this.
@@ -124,8 +124,7 @@ pub(crate) const SHARD_READ_MARGIN_TILES: f64 =
 
 /// The margin a data shard reads when no valve floor reaches past the tile
 /// buffer: two pivot tiles, every `--tile-buffer` up to **512** tile pixels,
-/// two full tile widths, against a default of 8 and a tippecanoe default of
-/// 5. Since #433 every export, sharded or not, is capped at
+/// two full tile widths. Every export, sharded or not, is capped at
 /// [`MAX_TILE_BUFFER_PX`](crate::overview::export::MAX_TILE_BUFFER_PX) (one
 /// tile width) by
 /// [`ExportError::TileBufferTooWide`](crate::overview::export::ExportError::TileBufferTooWide),

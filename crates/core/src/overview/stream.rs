@@ -5625,7 +5625,7 @@ const MIN_PASS1_CHUNK_ROWS: usize = 256;
 /// A fixed [`PASS1_CHUNK_ROWS`] fans a default 8192-row batch into only 8
 /// chunks — fewer than the cores on a typical machine — and silently
 /// disables chunking entirely for `--read-batch-size` below 1024, which is
-/// exactly what `docs/OVERVIEW_TUNING.md` tells users to do to cut memory.
+/// exactly what `docs/reference/tuning.md` tells users to do to cut memory.
 /// Clamped to [`MIN_PASS1_CHUNK_ROWS`]..=[`PASS1_CHUNK_ROWS`] so neither end
 /// degenerates.
 ///

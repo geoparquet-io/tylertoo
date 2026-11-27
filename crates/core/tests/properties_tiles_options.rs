@@ -2,9 +2,8 @@
 //! each option, and a refusal names the option (#677; replaces mutation
 //! testing for the options owner).
 //!
-//! The oracle is the documented range (`docs/OVERVIEW_TUNING.md`, the CLI
-//! help, `core_owns_read_bounds`), not core's code, so loosening a bound
-//! fails. `None` means the range is undocumented and only the name is checked.
+//! The bounds below pin the contract enforced by `TilesOptions::validate()`,
+//! including `ConvertOptions::validate()`. `None` checks only the option name.
 use proptest::prelude::*;
 use tylertoo_core::internal::overview::tiles::TilesOptions;
 
@@ -34,7 +33,7 @@ fn documented(knob: usize, v: f64) -> Option<bool> {
         0 => Some((1.0..=1_048_576.0).contains(&v.trunc()) && v >= 0.0),
         1 => non_finite.then_some(false),
         2 => Some(!non_finite && v >= 0.0),
-        // "exponent (>=1)" in OVERVIEW_TUNING.md.
+        // The lower bound enforced by `ConvertOptions::validate()`.
         3 => Some(v.is_finite() && v >= 1.0),
         _ => (v >= 0.0).then_some(v.trunc() >= 1.0),
     }

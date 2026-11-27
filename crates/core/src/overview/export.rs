@@ -1519,15 +1519,16 @@ pub enum ExportError {
         "overview level {level} (z{zoom}) cannot fit in memory: its densest tile, \
          z{zoom}/{x}/{y}, holds {members} features, an estimated {}, more than the {} of \
          {limit_source}. Export holds a whole tile in memory at once and never splits one, so \
-         no --partition-wave value fits it. Rebuild the overview (`tiles` or `overview`) to \
+         changing export concurrency cannot make it fit. Rebuild the overview (`tiles` or `overview`) to \
          keep fewer features at this zoom: with --verbatim, turn thinning back on for the \
-         dense geometry type alone (--point-thinning 4, --line-thinning 1 or \
-         --polygon-thinning 1, the defaults) and the rest stays verbatim; or drop --verbatim; \
+         dense geometry type alone (--point-thinning, --line-thinning, or \
+         --polygon-thinning) and the rest stays verbatim; or drop --verbatim; \
          or raise --min-zoom above z{zoom} so the dense coarse zooms are not built. If the \
-         machine does have the memory, set {SKIP_MEMORY_PREFLIGHT_ENV}=1 to downgrade this to \
-         a warning and attempt the export (#665)",
+         machine does have the memory, set {SKIP_MEMORY_PREFLIGHT_ENV}=true to downgrade this to \
+         a warning and attempt the export. See {}",
         human_bytes(*.estimate_bytes),
-        human_bytes(*.available_bytes)
+        human_bytes(*.available_bytes),
+        super::convert::MEMORY_SIZING_DOC
     )]
     #[non_exhaustive]
     TileExceedsMemory {
@@ -1556,6 +1557,22 @@ pub enum ExportError {
         /// mlt-core's message.
         message: String,
     },
+}
+
+/// Representative rendered memory error for frontend advice checks.
+#[doc(hidden)]
+pub fn tile_memory_message_for_docs() -> String {
+    ExportError::TileExceedsMemory {
+        level: 0,
+        zoom: 6,
+        x: 0,
+        y: 0,
+        members: 1000,
+        estimate_bytes: 8 << 30,
+        available_bytes: 4 << 30,
+        limit_source: "test limit",
+    }
+    .to_string()
 }
 
 #[doc(hidden)]

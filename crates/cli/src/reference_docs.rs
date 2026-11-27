@@ -174,11 +174,24 @@ fn write_table(output: &mut String, heading: &str, entries: &[Entry]) {
     )
     .unwrap();
     for (syntax, description) in entries {
+        // Give the first row for each long option a stable cross-reference.
+        // Repeated command surfaces share that spelling and its anchor.
+        let anchor = syntax
+            .split_once("--")
+            .map(|(_, rest)| {
+                let flag = rest
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                    .next()
+                    .unwrap();
+                format!("<a id=\"option-{flag}\"></a>")
+            })
+            .filter(|anchor| !output.contains(anchor));
         // Pipes inside code spans still delimit Markdown table cells.
         let punctuation = if description.ends_with('.') { "" } else { "." };
         writeln!(
             output,
-            "| {} | {}{punctuation} |",
+            "| {}{} | {}{punctuation} |",
+            anchor.unwrap_or_default(),
             syntax.replace('|', "\\|"),
             description.replace('|', "\\|")
         )

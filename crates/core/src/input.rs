@@ -38,7 +38,7 @@
 //! - **L3**, one network range request, taken only on the first touch of a
 //!   chunk.
 //!
-//! See `docs/reference/tuning.md` (Memory and speed) for the fetch-count implications.
+//! See the `ENVIRONMENT` const in `environment.rs` for the staging controls.
 //!
 //! Remote support is compiled behind the `remote` cargo feature; the CLI and
 //! Python bindings enable it by default. Without the feature, URL inputs
@@ -2262,7 +2262,7 @@ pub(crate) mod remote {
     /// e.g. `TYLERTOO_HTTP_HTTP2_ONLY=true`, `TYLERTOO_HTTP_TIMEOUT=60s`) on
     /// every remote store, whatever the scheme, so one sweep knob works on
     /// both https and s3 hosts. Experimental, like the `TYLERTOO_STAGING_*`
-    /// knobs: see `docs/OVERVIEW_TUNING.md` ("Remote staging (env)").
+    /// knobs: see the `ENVIRONMENT` const in `environment.rs`.
     const CLIENT_VAR_PREFIX: &str = "TYLERTOO_HTTP_";
 
     /// Parse `TYLERTOO_HTTP_*` variables out of `vars` into client options,
@@ -2459,7 +2459,7 @@ pub(crate) mod remote {
     /// overridable through a `TYLERTOO_STAGING_*` environment variable so the
     /// #290 parameter sweep can vary them per run without rebuilding.
     /// Experimental sweep knobs, not stable API — see
-    /// `docs/OVERVIEW_TUNING.md` ("Remote staging (env)").
+    /// the `ENVIRONMENT` const in `environment.rs`.
     ///
     /// The knobs change I/O *scheduling* only (how many range requests are in
     /// flight at once, and where one request ends and the next begins): the

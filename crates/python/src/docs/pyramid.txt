@@ -10,7 +10,7 @@ Args:
         such as `"0-7:countries.parquet:admin"`. `INPUT` is a
         GeoParquet source or a PMTiles archive for zooms `LO` to
         `HI`; `LAYER` defaults to the input's file stem. See the
-        [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
+        [pyramid command](https://geoparquet-io.github.io/tylertoo/reference/cli/#tylertoo-pyramid)
         for the `LO-HI=[SYSTEM=]INPUT[=LAYER]` form. Omit `SYSTEM`
         to tile the input; `grid`, `h3`, `s2`, or `a5` aggregates
         GeoParquet features into cells per zoom, counting each feature

@@ -70,7 +70,7 @@ For public docstrings, CLI help, and `///` docs:
   and benchmark numbers on the
   [benchmarks page](https://geoparquet-io.github.io/tylertoo/benchmarks/).
 - Keep one short runnable example per function. Move removed material
-  users still need to `docs/OVERVIEW_TUNING.md`, a guide, or
+  users still need to the [tuning reference](https://geoparquet-io.github.io/tylertoo/reference/tuning/), a guide, or
   `CHANGELOG.md`.
 
 ## Releasing (maintainers)

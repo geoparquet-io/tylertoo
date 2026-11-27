@@ -589,7 +589,7 @@ pub struct ConvertOptions {
         default_value_t = ConvertOptions::default().read_batch_size,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Rows per Arrow read batch, in the range {READ_BATCH_SIZE_MIN}..={READ_BATCH_SIZE_MAX}. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>"), long_help = None))]
     pub read_batch_size: usize,
     /// Memory/throughput profile for the streaming pass-2 engine (#213/#212).
     /// Default [`MemoryProfile::Auto`], resolved per mode + estimated output
@@ -672,7 +672,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::parse_read_workers,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = format!("Reader threads for both passes, or `auto` for half the cores in the first pass and a quarter in the second, up to {READ_WORKERS_MAX}. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>"), long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = format!("Reader threads for both passes, or `auto` to size each pass to the core count, up to {READ_WORKERS_MAX}. See <https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory>"), long_help = None))]
     pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
@@ -681,7 +681,7 @@ pub struct ConvertOptions {
     /// its own geometry and attributes (see [`super::cluster`]). Lines and
     /// polygons are unaffected. Default `false`.
     #[cfg_attr(feature = "cli", arg(long, help_heading = "Clustering"))]
-    #[cfg_attr(feature = "cli", arg(help = "Merge each thinning cell's points into its surviving point, which gains a `point_count` column. Duplicating mode only", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Merge each thinning cell's points into its surviving point, which gains a `point_count` column. Duplicating mode only. Reserves `level`, `input_row`, and `point_count`; input columns with these names are renamed by appending underscores until unique", long_help = None))]
     pub cluster: bool,
     /// Numeric per-cluster attribute aggregation (Q6): for each spec, the
     /// winner's value of the column becomes the aggregate over itself + the
@@ -720,7 +720,7 @@ pub struct ConvertOptions {
     /// output has no `coalesced_count` column and no coalescing provenance.
     /// (The CLI additionally rejects an *explicit* request.)
     #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().coalesce_lines, action = clap::ArgAction::SetFalse, long = "no-coalesce-lines", help_heading = "Line coalescing"))]
-    #[cfg_attr(feature = "cli", arg(help = "Turn off line coalescing, which joins touching same-class line segments into longer strokes at coarse levels", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Turn off line coalescing, which joins touching same-class line segments into longer strokes at coarse levels. Coalescing reserves `coalesced_count`, in addition to `level` and `input_row`; input columns with reserved names are renamed by appending underscores until unique", long_help = None))]
     pub coalesce_lines: bool,
     /// Endpoint snap tolerance for coalescing, in GSD multiples (default
     /// [`DEFAULT_SNAP_GSD_FACTOR`] = 1.0): after exact-endpoint chaining,
@@ -826,7 +826,7 @@ pub struct ConvertOptions {
             help_heading = "Filtering"
         )
     )]
-    #[cfg_attr(feature = "cli", arg(help = "Filter property columns with a SQL `WHERE` predicate, such as `confidence > 0.8`. Skips row groups that cannot match. Grammar: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Filter property columns with a SQL `WHERE` predicate, such as `class = 'primary'`. Skips row groups that cannot match. Grammar: <https://geoparquet-io.github.io/tylertoo/reference/tuning/#expression-syntax>", long_help = None))]
     pub filter: Option<String>,
     /// Which property columns the output carries (#386): tippecanoe's
     /// `-x` / `-y` / `-X`. Resolved once against the input schema and applied
@@ -1054,6 +1054,11 @@ with_setters!(ConvertOptions {
 
 /// Default rows per read batch for the streaming pipeline (H3).
 pub const DEFAULT_READ_BATCH_SIZE: usize = 8192;
+
+/// Accepted read-batch row bounds, shared by validation and CLI help.
+pub const READ_BATCH_SIZE_MIN: usize = 1;
+/// Maximum accepted rows in a read batch.
+pub const READ_BATCH_SIZE_MAX: usize = 1_048_576;
 
 /// Sentinel value for [`ConvertOptions::in_flight_batches`] requesting automatic sizing.
 ///
@@ -1897,13 +1902,13 @@ pub(super) fn record_level_outcome(
             diagnostics.warn(format!(
                 "level planned at GSD {:.2} m{} became empty after simplification \
                  (all {} candidate feature(s) collapsed); omitted from the output pyramid. \
-                 Pass --collapse to keep sub-GSD polygons as representative points at \
-                 coarse levels (see docs/OVERVIEW_TUNING.md)",
+                 {}",
                 planned.gsd,
                 planned
                     .zoom
                     .map_or_else(String::new, |z| format!(" (zoom {z})")),
                 candidates,
+                crate::diagnostics::EMPTY_LEVEL_ADVICE,
             ));
             skipped.push(planned);
         }
@@ -2499,7 +2504,7 @@ pub enum InvalidOption {
         value: f64,
     },
     /// `read_batch_size` is outside `1..=1048576`.
-    #[error("read-batch-size must be in 1..=1048576 (a batch is fully resident)")]
+    #[error("read-batch-size must be in {READ_BATCH_SIZE_MIN}..={READ_BATCH_SIZE_MAX} (a batch is fully resident)")]
     ReadBatchSize,
     /// `read_workers` is past twice this machine's cores.
     #[error("read-workers must be auto or 1..={ceiling} (2× this machine's cores)")]
@@ -2826,7 +2831,7 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
         }
         Ok(())
     };
-    if !(1..=1_048_576).contains(&options.read_batch_size) {
+    if !(READ_BATCH_SIZE_MIN..=READ_BATCH_SIZE_MAX).contains(&options.read_batch_size) {
         return Err(InvalidOption::ReadBatchSize.into());
     }
     let ceiling = read_workers_ceiling();
@@ -5551,7 +5556,8 @@ fn env_flag_enabled(value: &str) -> bool {
 }
 
 /// Sizing-guidance doc named in both the warning and the hard error.
-const MEMORY_SIZING_DOC: &str = "https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory";
+pub(crate) const MEMORY_SIZING_DOC: &str =
+    "https://geoparquet-io.github.io/tylertoo/reference/tuning/#memory";
 
 /// What the #543 preflight concluded, for the `TYLERTOO_PROFILE_JSON` record
 /// (#626 item 4).

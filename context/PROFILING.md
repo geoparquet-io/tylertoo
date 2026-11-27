@@ -147,7 +147,7 @@ Its guard allows at most 2 million lines and `2M × 512` = 1.024 GB modeled
 geometry. The guard prices each line at `56 + 16 × vertices` bytes. The chain
 stage needs further workspace and keeps per-level results; the collection
 guard does not cap that peak. See
-[chain-stage memory](../docs/OVERVIEW_TUNING.md#chain-stage-memory).
+[chain-stage memory](../docs/reference/tuning.md#memory).
 `--no-coalesce-lines` removes that work but changes generalization.
 `--coalesce-max-level-rows` changes both guard limits and can change output.
 
@@ -551,7 +551,8 @@ before pass 1, so both passes read from disk. The record says what it did:
   group, so with no earlier staging `bytes_fetched` equals `bytes_to_stage`
   (a coalescing window can add the gap bytes between merged chunks).
 - `max_in_flight`: the most requests in flight at once, across all parts.
-  It is capped by `TYLERTOO_STAGING_CONCURRENCY` and by the memory budget.
+  It is capped by staging concurrency and the memory budget. See the
+  `ENVIRONMENT` const in `crates/core/src/environment.rs` for controls.
 - `failed_requests`, `unstaged_bytes`: a failed request is retried once,
   split into its row groups. These count the requests that failed twice and
   the chunk bytes they kept out of the spill. The passes read those chunks

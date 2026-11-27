@@ -4,6 +4,46 @@ use geo::{Geometry, LineString, Point};
 use geoarrow::{array::GeometryBuilder, datatypes::GeometryType};
 
 use super::*;
+
+#[test]
+fn tile_memory_message_reports_its_estimate_and_remedies() {
+    let (level, zoom, x, y, members) = (2, 9, 17, 21, 12345);
+    let (estimate_bytes, available_bytes) = (8 << 30, 4 << 30);
+    let text = ExportError::TileExceedsMemory {
+        level,
+        zoom,
+        x,
+        y,
+        members,
+        estimate_bytes,
+        available_bytes,
+        limit_source: "test memory limit",
+    }
+    .to_string();
+    let numbers: Vec<f64> = text
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .map(|s| s.trim_matches('.'))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<f64>().unwrap())
+        .collect();
+    assert_eq!(
+        numbers,
+        [
+            level as f64,
+            zoom as f64,
+            zoom as f64,
+            x as f64,
+            y as f64,
+            members as f64,
+            estimate_bytes as f64 / (1_u64 << 30) as f64,
+            available_bytes as f64 / (1_u64 << 30) as f64,
+            zoom as f64
+        ]
+    );
+    assert!(text.contains(&format!("{SKIP_MEMORY_PREFLIGHT_ENV}=true")));
+    assert!(text.contains(super::super::convert::MEMORY_SIZING_DOC));
+    assert!(!text.contains("the defaults"));
+}
 use crate::{
     mvt::{command_decode, zigzag_decode},
     overview::{
@@ -824,10 +864,9 @@ fn densest_tile_over_limit_refuses_only_what_no_wave_fits() {
         "z0/0/0",
         "GiB",
         "MemAvailable",
-        "--partition-wave",
         "Rebuild the overview",
         "--verbatim",
-        "--point-thinning 4",
+        "--point-thinning",
         "--min-zoom",
         SKIP_MEMORY_PREFLIGHT_ENV,
     ] {

@@ -30,7 +30,7 @@
 //! byte-compares the *PMTiles* output (a one-step-vs-two-step parity check,
 //! not a thread-count one) — that is an unrelated, narrower guarantee and is
 //! unaffected by this change. The PMTiles archive remains the primary
-//! byte-determinism promise in `ARCHITECTURE.md`, `OVERVIEW_TUNING.md`,
+//! byte-determinism promise in `ARCHITECTURE.md`, `docs/reference/tuning.md`,
 //! `cli.md`, and what #423 asks this test to cover; the
 //! overview-file comparison is additional coverage, not a replacement.
 
