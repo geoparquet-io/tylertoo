@@ -3,7 +3,8 @@
 
 The marker contract is <!-- bench:<file-stem>/<renderer>[/<arg>] --> followed
 by generated text and <!-- /bench -->. Inline claims stay on the marker line.
-Block regions end with provenance. Unknown values are never guessed.
+Charts carry no provenance of their own: the stamp states it once at the top,
+and the runs region lists each file's in full. Unknown values are never guessed.
 
 Every JSON has provenance: commit, tylertoo_version, host, nproc, kernel,
 allocator, tool_versions, inputs (name and sha256), and date. Optional fields
@@ -83,6 +84,10 @@ def minutes(value):
     return f"{value / 60:,.0f} min"
 
 
+def millions(value):
+    return f"{value / 1e6:,.0f} million" if value >= 1e6 else f"{value:,}"
+
+
 def gb(value):
     return "unknown" if value is None else f"{value / 1e9:,.1f} GB"
 
@@ -117,7 +122,7 @@ def host_text(p):
     return host if mem is None or "RAM" in host else f"{host}, {mem} GiB RAM"
 
 
-def footer(r):
+def run_text(r):
     p = r["provenance"]
     label = run_label(p)
     commit = f"commit {p.get('commit') or 'unknown'}"
@@ -126,7 +131,7 @@ def footer(r):
     # The unreleased-commit label already names the commit.
     fields = [label] + ([] if (p.get('commit') or 'unknown') in label else [commit]) + tools
     fields += [f"allocator: {p['allocator']}", host_text(p), (p["date"] or "undated")[:10]]
-    return "_Run: " + ", ".join(str(v) for v in fields) + "._"
+    return ", ".join(str(v) for v in fields)
 
 
 def table(headers, rows):
@@ -138,8 +143,13 @@ def details(headers, rows):
     return '<details markdown><summary>The figures as a table</summary>\n\n' + table(headers, rows) + '\n\n</details>'
 
 
-def bars(title, series, rows, unit):
-    """Rows are (label, values); a value may be (number, visible text)."""
+def bars(title, series, rows, unit, notes=None):
+    """Rows are (label, values); a value may be (number, visible text).
+
+    notes maps a label to a short text marker shown beside it; such rows are
+    also drawn hatched, so the marker never relies on color alone.
+    """
+    notes = notes or {}
     def number(value):
         return value[0] if isinstance(value, tuple) else value
 
@@ -147,16 +157,18 @@ def bars(title, series, rows, unit):
         return value[1] if isinstance(value, tuple) else f"{value:,.1f} {unit}"
 
     maximum = max((number(v) for _, values in rows for v in values), default=0)
-    out = [f'<figure class="tt-chart"><figcaption>{html.escape(title)}</figcaption>',
-           '<p class="tt-legend">' + ' '.join(
-               f'<span class="tt-key tt-{chr(97 + i)}">{html.escape(s)}</span>'
-               for i, s in enumerate(series)) + '</p>']
+    out = [f'<figure class="tt-chart"><figcaption>{html.escape(title)}</figcaption>']
+    if len(series) > 1:  # one series needs no key
+        out.append('<p class="tt-legend">' + ' '.join(
+            f'<span class="tt-key tt-{chr(97 + i)}">{html.escape(s)}</span>' for i, s in enumerate(series)) + '</p>')
     for name, values in rows:
-        out.append(f'<div class="tt-row"><span class="tt-label">{html.escape(name)}</span>')
+        note = notes.get(name)
+        out.append(f'<div class="tt-row{" tt-excluded" if note else ""}"><span class="tt-label">{html.escape(name)}'
+                   + (f' <span class="tt-note">{html.escape(note)}</span>' if note else '') + '</span>')
         for i, value in enumerate(values):
-            width = number(value) / maximum * 100 if maximum else 0
-            out.append(f'<span class="tt-bar tt-{chr(97 + i)}" style="--w:{width:.1f}%" aria-hidden="true"></span>'
-                       f'<span class="tt-val">{html.escape(label(value))}</span>')
+            share = number(value) / maximum if maximum else 0
+            out.append(f'<span class="tt-line"><span class="tt-bar tt-{chr(97 + i)}" style="--f:{share:.3f}" '
+                       f'aria-hidden="true"></span><span class="tt-val">{html.escape(label(value))}</span></span>')
         out.append('</div>')
     out.append('</figure>')
     out.append(details(["Dataset", *series], [[name, *map(label, values)] for name, values in rows]))
@@ -198,6 +210,15 @@ def readme_claim(r):
             f"{len(included)} datasets ({run_label(p)}, {p['date'][:10]})")
 
 
+def headline(r):
+    n, included, _ = speedup_geomean(r)
+    if n is None:
+        return NOT_MEASURED
+    return (f'<p class="tt-headline"><strong>{factor(n)}× faster</strong> than tippecanoe</p>\n'
+            f'<p class="tt-sub">Whole builds from GeoParquet to PMTiles, '
+            f'the geometric mean over {len(included)} datasets.</p>')
+
+
 def speedup(r):
     n, included, excluded = speedup_geomean(r)
     if n is None:
@@ -208,20 +229,19 @@ def speedup(r):
           for e in rows if e.get("tylertoo_quality_matched")]
     conversion = [f"{DISPLAY.get(did, did)}: {r['datasets'][did]['convert_fgb']['wall_median_s'] / r['datasets'][did]['tippecanoe_e2e']['wall_median_s']:.1%}"
                   for did in included if r['datasets'][did].get('convert_fgb')]
-    return (f"tylertoo is **{factor(n)}×** faster than tippecanoe end to end, "
-            f"the geometric mean over {len(included)} datasets.\n\n"
-            f"Included: {', '.join(DISPLAY.get(d, d) for d in included)}. "
-            f"Excluded: {'; '.join(f'{DISPLAY.get(d, d)}: {why}' for d, why in excluded.items()) or 'none'}.\n\n"
-            + (f"tippecanoe's end-to-end time includes converting the GeoParquet input to FlatGeobuf with gpio; "
-               f"that conversion is this share of it: {', '.join(conversion)}. " if conversion else "")
-            + f"For tiling alone, the geometric mean is {factor(tile)}×. "
-            + (f"With thinning off, the geometric mean is {factor(statistics.geometric_mean(qm))}× "
-               f"over {len(qm)} datasets." if qm else "Thinning off was not measured.")
-            + " Each tool's flags per dataset are under Exact commands in [Measurement method](#measurement-method).")
+    out = [f"- In the mean: {', '.join(DISPLAY.get(d, d) for d in included)}.",
+           f"- Not in the mean: {'; '.join(f'{DISPLAY.get(d, d)}: {why}' for d, why in excluded.items()) or 'none'}."]
+    if conversion:
+        out.append("- tippecanoe's end-to-end time includes converting the GeoParquet input to FlatGeobuf "
+                   f"with gpio. That conversion is this share of it: {', '.join(conversion)}.")
+    out.append(f"- For tiling alone, the geometric mean is {factor(tile)}×.")
+    out.append(f"- With thinning off, the geometric mean is {factor(statistics.geometric_mean(qm))}× "
+               f"over {len(qm)} datasets." if qm else "- Thinning off was not measured.")
+    return "\n".join(out)
 
 
 def speedup_bars(r):
-    rows, tab = [], []
+    rows, tab, notes = [], [], {}
     for did, e in r["datasets"].items():
         a, b = e["tylertoo"]["wall_median_s"], e["tippecanoe_e2e"]["wall_median_s"]
         reason = zoom_exclusion(e)
@@ -229,14 +249,16 @@ def speedup_bars(r):
                   else " (max zoom differs)" if reason else "")
         ratio = f"{factor(b / a)}× faster{caveat}"
         name = DISPLAY.get(did, did)
-        rows.append((name, [(a, f"{seconds(a)}, {ratio}"), b]))
+        if reason:
+            notes[name] = "not in the mean"
+        rows.append((name, [(a, f"{seconds(a)}, {factor(b / a)}× faster"), b]))
         qm = e.get("tylertoo_quality_matched")
         tab.append([name, f"{e['tylertoo']['phases']['input_features']:,}", seconds(a), seconds(b),
                     seconds(e["tippecanoe_fgb"]["wall_median_s"]), ratio,
                     f"{factor(b / qm['wall_median_s'])}×" if qm else "unknown",
                     archive_size(e['tylertoo'].get('output_bytes')),
                     archive_size(e['tippecanoe_fgb'].get('output_bytes'))])
-    chart = bars("End-to-end wall time, shorter is faster", ["tylertoo", "tippecanoe"], rows, "s")
+    chart = bars("End-to-end wall time, shorter is faster", ["tylertoo", "tippecanoe"], rows, "s", notes)
     return chart.split('<details markdown>')[0] + details(
         ["Dataset", "Features", "tylertoo", "tippecanoe end to end", "tippecanoe tiling only",
          "Speedup", "Speedup with thinning off", "tylertoo archive", "tippecanoe archive"], tab)
@@ -284,16 +306,31 @@ def method(r):
     return "\n".join(out) or NOT_MEASURED
 
 
+PAGE_FILES = {"e2e-corpus": "Corpus", "overture-buildings-africa": "Africa", "release-cells": "Release cells"}
+
+
 def stamp(results):
-    names = {"e2e-corpus": "Corpus", "overture-buildings-africa": "Africa", "release-cells": "Release cells"}
-    out = []
-    for stem, label in names.items():
+    """One provenance line: each distinct run once, naming files only when runs differ."""
+    groups = {}
+    for stem, label in PAGE_FILES.items():
         if stem in results:
             p = results[stem]["provenance"]
-            out.append(f"{label}: {run_label(p)}, {(p['date'] or 'undated')[:10]}.")
+            groups.setdefault((run_label(p), (p['date'] or 'undated')[:10]), []).append(label)
+    if not groups:
+        return NOT_MEASURED
+    runs = [f"{run} on {date}" + (f" ({', '.join(labels)})" if len(groups) > 1 else "")
+            for (run, date), labels in groups.items()]
     tools = results.get("e2e-corpus", {}).get("provenance", {}).get("tool_versions", {})
-    out += [f"{name} {tool_version(name, value)}." for name, value in tools.items() if name in ("tippecanoe", "gpio")]
-    return " ".join(out) or NOT_MEASURED
+    tools = [f"{name} {tool_version(name, value)}" for name, value in tools.items()
+             if name in ("tippecanoe", "gpio") and value is not None]
+    return ('<p class="tt-stamp" markdown>Measured at ' + "; ".join(runs)
+            + (f", against {' and '.join(tools)}" if tools else "")
+            + ". See the [measurement method](#measurement-method).</p>")
+
+
+def runs(results):
+    out = [f"- {label}: {run_text(results[stem])}." for stem, label in PAGE_FILES.items() if stem in results]
+    return "\n".join(out) or NOT_MEASURED
 
 
 def stream_rows(r):
@@ -319,16 +356,17 @@ def hero(r):
     row, bounded = stream_rows(r)
     if not row:
         return NOT_MEASURED
-    values = [f"{r['features']:,} features", f"{minutes(statistics.median(row['runs_wall_s']))} wall time",
-              f"{gb(row['peak_rss_bytes'])} peak memory", f"{gb(row.get('fetched_bytes'))} fetched"]
-    out = ['<div class="tt-hero" markdown>\n\n' + '. '.join(values) + '.\n\n</div>']
+    stats = [(minutes(statistics.median(row['runs_wall_s'])), "wall time"), (millions(r['features']), "features"),
+             (gb(row.get('fetched_bytes')), "fetched"), (gb(row['peak_rss_bytes']), "peak memory")]
+    out = ['<div class="tt-stats">\n' + '\n'.join(
+        f'<p class="tt-stat"><span class="tt-stat-value">{html.escape(v)}</span> '
+        f'<span class="tt-stat-label">{html.escape(k)}</span></p>' for v, k in stats) + '\n</div>']
+    release = overture_release(r)
+    out.append(f"\n{r['features']:,} features" + (f" from Overture release {release}." if release else "."))
     if bounded:
         same = row.get('archive_sha256') and row['archive_sha256'] == bounded.get('archive_sha256')
         out.append(f"\n`--profile bounded`: {minutes(statistics.median(bounded['runs_wall_s']))} wall time, "
                    f"{gb(bounded['peak_rss_bytes'])} peak memory" + (", same archive." if same else "."))
-    release = overture_release(r)
-    if release:
-        out.append(f"\nOverture release: {release}.")
     return '\n'.join(out)
 
 
@@ -366,26 +404,31 @@ def history(r):
         return (entry['wall_s'] if entry.get('wall_s') is not None
                 else statistics.median(stream_rows(entry)[0]['runs_wall_s']))
 
-    first, last = current[0], current[-1]
-    lead = f"{minutes(wall(first))} at {run_label(first['provenance'])}"
+    def label(entry):
+        text = run_label(entry['provenance'])
+        if overture_release(entry) != overture_release(r):
+            text += f" (different Overture release: {overture_release(entry) or 'unknown'})"
+        return text
+
+    def host(prov):
+        text = host_text({**prov, 'host': prov.get('host') or prov.get('host_class')})
+        return text if 'RAM' in text else text + ', memory not recorded'
+
+    out = []
+    # The hero states the current run; chart it only against comparable runs.
     if len(current) > 1:
-        lead += (f" → {minutes(wall(last))} at {run_label(last['provenance'])}, "
-                 f"{factor(wall(first) / wall(last))}× faster")
-    charts = []
-    for group in [current, *groups.values()]:
-        rows = []
-        for entry in group:
-            label = run_label(entry['provenance'])
-            if overture_release(entry) != overture_release(r):
-                label += f" (different Overture release: {overture_release(entry) or 'unknown'})"
-            rows.append((label, [wall(entry) / 60]))
-        prov = group[-1]['provenance']
-        host = prov.get('host') or prov.get('host_class') or 'unknown host'
-        mem = prov.get('mem_gib')
-        if mem is not None:
-            host += f', {mem} GiB memory'
-        charts.append(bars(f"Africa wall time on {host}, shorter is faster", ["tylertoo"], rows, "min"))
-    return lead + '.\n\n' + '\n\n'.join(charts)
+        first, last = current[0], current[-1]
+        out.append(f"{minutes(wall(first))} at {run_label(first['provenance'])} → {minutes(wall(last))} "
+                   f"at {run_label(last['provenance'])}, {factor(wall(first) / wall(last))}× faster.")
+        out.append(bars(f"Africa wall time on {host(last['provenance'])}, shorter is faster", ["tylertoo"],
+                        [(label(e), [wall(e) / 60]) for e in current], "min"))
+    earlier = [e for group in groups.values() for e in group]
+    if earlier:
+        out.append('<details markdown><summary>Earlier runs on hardware that differs or was not recorded</summary>\n\n'
+                   + table(["Run", "Host", "Overture release", "Wall time"],
+                           [[run_label(e['provenance']), host(e['provenance']), overture_release(e) or 'unknown', minutes(wall(e))]
+                            for e in earlier]) + '\n\n</details>')
+    return '\n\n'.join(out)
 
 
 def recipe(r):
@@ -459,18 +502,21 @@ def compare_maps(r):
             f'data-{key}="{html.escape(value, quote=True)}"' for key, value in attrs.items()) + '>'
             + html.escape(label) + '</option>')
         rows.append([label, *[f"[{tool}]({d[tool]['url']})" for tool in ['tylertoo', 'tippecanoe']]])
-    return '\n'.join([*out, '</select>', '', table(['Dataset', 'tylertoo archive', 'Tippecanoe archive'], rows)])
+    return '\n'.join([*out, '</select>', '', table(['Dataset', 'tylertoo archive', 'Tippecanoe archive'], rows),
+                      '', f'_Run: {run_text(r)}._'])
 
 
 RENDERERS = {
-    **{name: (lambda r, a, fn=fn: fn(r), False, True) for name, fn in {
-        'speedup': speedup, 'speedup-bars': speedup_bars, 'memory-bars': memory_bars,
+    **{name: (lambda r, a, fn=fn: fn(r), False) for name, fn in {
+        'headline': headline, 'speedup': speedup, 'speedup-bars': speedup_bars, 'memory-bars': memory_bars,
         'method': method, 'hero': hero, 'history': history, 'recipe': recipe,
         'encodings': encodings, 'sources': sources, 'profiles': profiles, 'compare-maps': compare_maps}.items()},
-    'stamp': (lambda r, a: stamp(r), False, False),
-    'readme-claim': (lambda r, a: readme_claim(r), True, False),
-    'stream-claim': (lambda r, a: stream_claim(r), True, False),
+    'stamp': (lambda r, a: stamp(r), False),
+    'runs': (lambda r, a: runs(r), False),
+    'readme-claim': (lambda r, a: readme_claim(r), True),
+    'stream-claim': (lambda r, a: stream_claim(r), True),
 }
+PAGE_WIDE = {'stamp', 'runs'}  # renderers that receive every results file
 
 
 def check_provenance(name, r):
@@ -494,7 +540,7 @@ def render_region(name, results):
     section, _, arg = rest.partition('/')
     if section not in RENDERERS:
         raise SystemExit(f'unknown bench region: {name}')
-    fn, inline, foot = RENDERERS[section]
+    fn, inline = RENDERERS[section]
     r = results.get(stem)
     if r is None:
         body = NOT_MEASURED
@@ -505,10 +551,8 @@ def render_region(name, results):
                 raise ValueError('comparison tylertoo_version differs from e2e-corpus')
             if not {d['id'] for d in r['datasets']} <= set(corpus.get('datasets', {})):
                 raise ValueError('comparison ids are not a subset of e2e-corpus datasets')
-        body = fn(results if section == 'stamp' else r, arg or None)
-    if inline:
-        return body
-    return '\n' + body + ('\n\n' + footer(r) if foot and body != NOT_MEASURED else '') + '\n'
+        body = fn(results if section in PAGE_WIDE else r, arg or None)
+    return body if inline else '\n' + body + '\n'
 
 
 def rewrite(text, results):
@@ -612,8 +656,8 @@ def run(root=ROOT, results_dir=RESULTS_DIR, check=False, files=DOC_FILES):
                 if errors:
                     raise SystemExit(f'{rel}: ' + '; '.join(errors))
             # Stamp receives every file used on the benchmark page.
-            page_stems = stems | ({'e2e-corpus', 'release-cells', 'overture-buildings-africa'} & results.keys()
-                                  if any(m[1].endswith('/stamp') for m in matches) else set())
+            page_stems = stems | (PAGE_FILES.keys() & results.keys()
+                                  if any(m[1].split('/')[1] in PAGE_WIDE for m in matches) else set())
             page_warnings(root, rel, page_stems, results)
         new = rewrite(old, results)
         if new != old:

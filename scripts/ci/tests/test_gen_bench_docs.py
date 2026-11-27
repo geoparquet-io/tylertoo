@@ -34,10 +34,25 @@ def test_every_results_file_has_full_provenance():
 
 def test_bars_scale_and_accessible_table():
     out = g.bars("Wall time", ["tylertoo", "tippecanoe"], [("A", [2, 8]), ("B", [4, 0])], "s")
-    assert re.findall(r'--w:([\d.]+)%', out) == ["25.0", "100.0", "50.0", "0.0"]
+    assert re.findall(r'--f:([\d.]+)', out) == ["0.250", "1.000", "0.500", "0.000"]
     assert out.index("tylertoo") < out.index("tippecanoe")
     assert out.count('aria-hidden="true"') == 4
     assert '<details markdown>' in out and '| A | 2.0 s | 8.0 s |' in out
+    # The value sits at the bar's tip, on the bar's own line.
+    assert '--f:0.250" aria-hidden="true"></span><span class="tt-val">2.0 s</span></span>' in out
+    noted = g.bars("Wall time", ["tylertoo"], [("A", [2]), ("B", [4])], "s", notes={"A": "not in the mean"})
+    assert noted.count("tt-excluded") == 1
+    assert '<span class="tt-label">A <span class="tt-note">not in the mean</span></span>' in noted
+
+
+def test_headline_leads_with_the_mean(results):
+    r = results["e2e-corpus"]
+    out = g.headline(r)
+    assert '<strong>20× faster</strong> than tippecanoe' in out
+    assert f"the geometric mean over {len(g.speedup_geomean(r)[1])} datasets" in out
+    for e in r["datasets"].values():
+        e["tylertoo"].pop("per_zoom", None)
+    assert g.headline(r) == g.NOT_MEASURED
 
 
 def test_speedup_geomean_uses_medians_and_equal_max_zoom(results):
@@ -48,8 +63,8 @@ def test_speedup_geomean_uses_medians_and_equal_max_zoom(results):
     assert "zoom" in excluded["different-zoom"]
     r["datasets"]["different-zoom"]["tylertoo"]["per_zoom"]["by_zoom"] = {"9": {"tiles": 1}}
     assert "different-zoom" in g.speedup_geomean(r)[2]  # lower tippecanoe zoom also differs
-    assert "20×" in g.readme_claim(r) and "**20×**" in g.speedup(r)
-    for phrase in ["Included", "Excluded", "conversion", "tiling alone", "thinning off"]:
+    assert "20×" in g.readme_claim(r) and "20×" in g.headline(r)
+    for phrase in ["In the mean:", "Not in the mean:", "conversion", "tiling alone", "thinning off"]:
         assert phrase.lower() in g.speedup(r).lower()
 
 
@@ -78,7 +93,9 @@ def test_speedup_labels_put_faster_before_the_caveat(results):
     ratio = e["tippecanoe_e2e"]["wall_median_s"] / e["tylertoo"]["wall_median_s"]
     out = g.speedup_bars(r)
     expected = f"{g.factor(ratio)}× faster (max zoom differs)"
-    assert f'{g.seconds(e["tylertoo"]["wall_median_s"])}, {expected}</span>' in out
+    # The bar says only the speedup; the row is marked as outside the mean in text.
+    assert f'{g.seconds(e["tylertoo"]["wall_median_s"])}, {g.factor(ratio)}× faster</span>' in out
+    assert out.count('<span class="tt-note">not in the mean</span>') == len(g.speedup_geomean(r)[2])
     assert f"| {expected} |" in out
     assert float(re.search(r"([\d.]+)× faster \(max zoom differs\)", out)[1]) == ratio
 
@@ -110,7 +127,7 @@ def test_label_and_footer(results):
         "an unreleased commit abcdef0 after v0.8.0, with local changes"
     assert g.run_label({**p, "git_describe": "v0.8.0"}) == "v0.8.0"
     assert g.run_label({**p, "git_describe": "other", "release_version": "0.9.0"}) == "0.9.0"
-    out = g.footer(results["e2e-corpus"])
+    out = g.run_text(results["e2e-corpus"])
     for value in [p["commit"], p["allocator"], p["host"], p["date"][:10], *p["tool_versions"].values()]:
         assert value in out
     # A host string without memory gets it from mem_gib, once.
@@ -118,12 +135,24 @@ def test_label_and_footer(results):
     assert g.host_text({"host": "Neoverse-V1, 124 GB RAM", "mem_gib": 123}) == "Neoverse-V1, 124 GB RAM"
 
 
-def test_stamp_lists_page_files(results):
+def test_stamp_states_a_shared_run_once(results):
     out = g.stamp(results)
-    for r in results.values():
-        if "comparison" not in r.get("_source_file", ""):
-            assert g.run_label(r["provenance"]) in out
-    assert "Corpus:" in out and "Africa:" in out and "Release cells:" in out
+    label = g.run_label(results["e2e-corpus"]["provenance"])
+    assert out.count(label) == 1 and "Corpus" not in out
+    assert out.startswith('<p class="tt-stamp" markdown>') and "(#measurement-method)" in out
+    results["release-cells"]["provenance"]["commit"] = "def5678"
+    out = g.stamp(results)
+    date = results["e2e-corpus"]["provenance"]["date"][:10]
+    assert f"{label} on {date} (Corpus, Africa)" in out and f"commit def5678 on {date} (Release cells)" in out
+
+
+def test_runs_lists_each_file_and_charts_carry_no_footer(results):
+    out = g.render_region("e2e-corpus/runs", results)
+    for stem, name in [("e2e-corpus", "Corpus"), ("overture-buildings-africa", "Africa"),
+                       ("release-cells", "Release cells")]:
+        assert f"- {name}: {g.run_text(results[stem])}." in out
+    for region in ["e2e-corpus/speedup-bars", "overture-buildings-africa/hero", "release-cells/profiles"]:
+        assert "Run:" not in g.render_region(region, results)
 
 
 @pytest.mark.parametrize("raw, version", [
@@ -136,7 +165,7 @@ def test_stamp_lists_page_files(results):
 def test_gpio_version_in_stamp_and_footer(results, raw, version):
     r = results["e2e-corpus"]
     r["provenance"]["tool_versions"]["gpio"] = raw
-    for out in [g.footer(r), g.stamp(results)]:
+    for out in [g.run_text(r), g.stamp(results)]:
         assert f"gpio {version}," in out or f"gpio {version}." in out
         if version != raw:
             assert raw not in out
@@ -165,7 +194,7 @@ def test_recipe_uses_recorded_command(results):
 
 def test_hero_same_archive_only_when_recorded(results):
     r = results["overture-buildings-africa"]
-    assert 'class="tt-hero"' in g.hero(r)
+    assert 'class="tt-stats"' in g.hero(r)
     assert "--profile bounded" in g.hero(r) and "same archive" in g.hero(r)
     r["rows"][1]["archive_sha256"] = ["different"]
     assert "same archive" not in g.hero(r)
@@ -173,18 +202,17 @@ def test_hero_same_archive_only_when_recorded(results):
     assert "--profile bounded" not in g.hero(r)
 
 
-def test_hero_is_one_markdown_block(results):
+def test_hero_is_one_stat_block(results):
     r = results["overture-buildings-africa"]
     out = g.hero(r)
-    block = re.search(r'^<div class="tt-hero" markdown>\n\n(.*?)\n\n</div>', out, re.S)
-    assert block
-    values = [f"{r['features']:,} features",
-              f"{g.minutes(g.statistics.median(r['rows'][0]['runs_wall_s']))} wall time",
-              f"{g.gb(r['rows'][0]['peak_rss_bytes'])} peak memory",
-              f"{g.gb(r['rows'][0]['fetched_bytes'])} fetched"]
-    for value in values:
-        assert value in block[1]
-    assert out.count(". ".join(values) + ".") == 1
+    block = re.search(r'^<div class="tt-stats">\n(.*?)\n</div>', out, re.S)
+    stats = re.findall(r'<span class="tt-stat-value">(.*?)</span> <span class="tt-stat-label">(.*?)</span>', block[1])
+    assert stats == [(g.minutes(g.statistics.median(r['rows'][0]['runs_wall_s'])), "wall time"),
+                     (g.millions(r['features']), "features"),
+                     (g.gb(r['rows'][0]['fetched_bytes']), "fetched"),
+                     (g.gb(r['rows'][0]['peak_rss_bytes']), "peak memory")]
+    # The exact count stays on record under the stats.
+    assert f"{r['features']:,} features" in out
 
 
 def test_profiles_both_shapes(results):
@@ -360,10 +388,14 @@ def test_history_separates_incomparable_hosts(results, change):
     else:
         old.pop('host_class')
     out = g.history(r)
-    assert out.count('<figure') == 2
+    # A lone current run needs no chart; the other host's run is a table row.
+    assert '<figure' not in out
     assert '→' not in out and '× faster' not in out
-    captions = re.findall(r'<figcaption>(.*?)</figcaption>', out)
-    assert 'Current host' in captions[0] and 'Previous host' in captions[1]
+    assert 'Current host' not in out and 'Previous host' in out
+    row = re.search(r'^\| commit old1234 \| (.*?) \| (.*?) \| (.*?) \|$', out, re.M)
+    assert row and 'Previous host' in row[1] and row[3] == g.minutes(r['history'][0]['wall_s'])
+    if change == 'unknown-memory':
+        assert 'memory not recorded' in row[1]
 
 
 def test_history_derives_legacy_host_class(results):
@@ -376,11 +408,15 @@ def test_history_derives_legacy_host_class(results):
     assert out.count('<figure') == 1 and '→' in out
 
 
-def test_committed_history_has_one_chart_per_host():
+def test_committed_history_charts_only_comparable_runs():
     r = g.load_results()['overture-buildings-africa']
-    entries = [*r.get('history', []), r]
-    hosts = {g.history_host(e['provenance']) or ('unknown', i) for i, e in enumerate(entries)}
-    assert g.history(r).count('<figure') == len(hosts)
+    current = g.history_host(r['provenance'])
+    same = [e for e in r.get('history', []) if current and g.history_host(e['provenance']) == current]
+    out = g.history(r)
+    assert out.count('<figure') == (1 if same else 0)
+    for e in r.get('history', []):
+        if e not in same:
+            assert f"| {g.run_label(e['provenance'])} |" in out
 
 
 def test_diff_skips_memory_change(results, monkeypatch, capsys):
@@ -464,7 +500,7 @@ tylertoo merge parts output.pmtiles
 
 def test_unknown_region_is_an_error():
     with pytest.raises(SystemExit):
-        g.rewrite("<!-- bench:nope/headline --><!-- /bench -->", {})
+        g.rewrite("<!-- bench:nope/no-such-renderer --><!-- /bench -->", {})
 
 
 def test_method_only_claims_recorded_settings(results):
@@ -503,13 +539,14 @@ def test_method_omits_disclosure_without_recorded_commands(results):
 def test_rendered_values_match_measurements(results):
     r = results['overture-buildings-africa']
     out = g.hero(r)
-    values = re.search(r'([\d,]+) features\. ([\d,]+) min wall time\. '
-                       r'([\d,.]+) GB peak memory\. ([\d,.]+) GB fetched\.', out)
-    assert int(values[1].replace(',', '')) == r['features']
-    assert float(values[2].replace(',', '')) == pytest.approx(
+    stat = dict((label, value) for value, label in re.findall(
+        r'<span class="tt-stat-value">(.*?)</span> <span class="tt-stat-label">(.*?)</span>', out))
+    assert int(re.search(r'([\d,]+) features', out)[1].replace(',', '')) == r['features']
+    assert g.millions(526_532_679) == "527 million" and g.millions(200) == "200"
+    assert float(stat['wall time'].split()[0].replace(',', '')) == pytest.approx(
         g.statistics.median(r['rows'][0]['runs_wall_s']) / 60, abs=0.5)
-    for observed, key in zip(values.group(3, 4), ['peak_rss_bytes', 'fetched_bytes']):
-        assert float(observed.replace(',', '')) == pytest.approx(r['rows'][0][key] / 1e9, abs=0.05)
+    for label, key in [('peak memory', 'peak_rss_bytes'), ('fetched', 'fetched_bytes')]:
+        assert float(stat[label].split()[0].replace(',', '')) == pytest.approx(r['rows'][0][key] / 1e9, abs=0.05)
     corpus = results['e2e-corpus']
     assert re.search(r'(\d+) datasets', g.readme_claim(corpus))[1] == str(len(g.speedup_geomean(corpus)[1]))
 

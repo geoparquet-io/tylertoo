@@ -1,34 +1,91 @@
-.tt-chart { margin: 1.5rem 0; }
-.tt-chart figcaption { font-weight: bold; }
-.tt-legend { display: flex; gap: 1rem; }
+/* Benchmark page, drawn by scripts/gen_bench_docs.py: bars share one linear
+   scale from zero, each value sits at its bar's tip, and every figure is also
+   in the table under its chart. */
+.md-typeset .tt-headline {
+  margin: 0 0 .2em;
+  font-size: 2rem;
+  line-height: 1.2;
+}
+.md-typeset .tt-headline strong { color: var(--md-accent-fg-color); }
+.md-typeset .tt-sub { margin: 0 0 .4em; }
+.md-typeset .tt-stamp { margin-top: 0; font-size: .7rem; color: var(--md-default-fg-color--light); }
+
+.md-typeset figure.tt-chart {
+  display: block;
+  width: 100%;
+  max-width: none;
+  margin: 1.5em 0 .5em;
+  text-align: left;
+}
+.md-typeset .tt-chart figcaption {
+  max-width: none;
+  margin: 0;
+  font-style: normal;
+  font-weight: 700;
+  text-align: left;
+}
+.md-typeset .tt-legend {
+  display: flex;
+  gap: 1rem;
+  margin: .2em 0 .6em;
+  font-size: .7rem;
+}
 .tt-key::before {
   content: "";
   display: inline-block;
-  width: .8rem;
-  height: .8rem;
+  width: .7rem;
+  height: .7rem;
   margin-right: .3rem;
+  border-radius: 2px;
   background: var(--tt-color);
+  vertical-align: -.05rem;
 }
-.tt-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 12rem;
-  gap: .25rem .5rem;
-  margin: 1rem 0;
+.tt-row { margin: 1.1em 0; font-size: .75rem; line-height: 1.4; }
+.tt-label { display: block; margin-bottom: .15em; }
+.tt-note {
+  margin-left: .4em;
+  padding: 0 .4em;
+  border: 1px solid var(--md-default-fg-color--lighter);
+  border-radius: .2rem;
+  font-size: .65rem;
+  white-space: nowrap;
+  color: var(--md-default-fg-color--light);
 }
-.tt-label { grid-column: 1 / -1; }
+.tt-line { display: flex; align-items: center; gap: .4em; margin: .1em 0; }
 .tt-bar {
-  display: block;
-  /* The grid reserves the value column; percentages scale the remaining track. */
-  width: var(--w);
-  min-height: .8rem;
-  align-self: center;
+  flex: none;
+  /* Leave room for the value at the tip of the longest bar. */
+  width: calc((100% - 10em) * var(--f));
+  min-width: 2px;
+  height: .9rem;
+  border-radius: 0 3px 3px 0;
   background: var(--tt-color);
+}
+.tt-excluded .tt-bar {
+  background: repeating-linear-gradient(135deg, var(--tt-color) 0 3px, transparent 3px 6px);
+  box-shadow: inset 0 0 0 1px var(--tt-color);
 }
 .tt-a { --tt-color: var(--md-accent-fg-color); }
 .tt-b { --tt-color: var(--md-default-fg-color--lighter); }
-.tt-val { font-variant-numeric: tabular-nums; }
-.tt-hero { padding: 1rem; font-size: 1.3rem; background: var(--md-code-bg-color); }
+.tt-val { white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+.tt-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: .6rem;
+  margin: 1em 0;
+}
+.md-typeset .tt-stat {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: .6rem .8rem;
+  border-radius: .2rem;
+  background: var(--md-code-bg-color);
+}
+.tt-stat-value { font-size: 1.15rem; font-weight: 700; line-height: 1.3; font-variant-numeric: tabular-nums; }
+.tt-stat-label { font-size: .7rem; color: var(--md-default-fg-color--light); }
 @media (max-width: 600px) {
-  .tt-row { grid-template-columns: minmax(0, 1fr); }
-  .tt-label { grid-column: 1; }
+  .md-typeset .tt-headline { font-size: 1.5rem; }
+  .tt-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
