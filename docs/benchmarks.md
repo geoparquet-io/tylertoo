@@ -1,175 +1,67 @@
 # Benchmarks
 
 <!-- bench:e2e-corpus/headline -->
-<p class="tt-headline"><strong>43× faster</strong> than tippecanoe</p>
-<p class="tt-sub">Whole builds from GeoParquet to PMTiles, the geometric mean over 3 datasets.</p>
+tylertoo was **43× faster than tippecanoe** across three GeoParquet-to-PMTiles builds. tippecanoe used less peak memory on each dataset.
 <!-- /bench -->
 
-<!-- bench:e2e-corpus/stamp -->
-<p class="tt-stamp" markdown>Measured at an unreleased commit f0e7d29e after v0.8.0 on 2026-11-27, against tippecanoe v2.82.0 and gpio 1.7.0. See the [measurement method](#measurement-method).</p>
-<!-- /bench -->
+## tylertoo vs. tippecanoe
+
+The timings cover the full build from GeoParquet to PMTiles. For tippecanoe, that includes converting the input to FlatGeobuf with `gpio`.
 
 <!-- bench:e2e-corpus/speedup-bars -->
-<figure class="tt-chart"><figcaption>End-to-end wall time, shorter is faster</figcaption>
+<figure class="tt-chart"><figcaption>Build time</figcaption>
 <p class="tt-legend"><span class="tt-key tt-a">tylertoo</span> <span class="tt-key tt-b">tippecanoe</span></p>
-<div class="tt-row tt-excluded"><span class="tt-label">New York City places (point) <span class="tt-note">not in the mean</span></span>
-<span class="tt-line"><span class="tt-bar tt-a" style="--f:0.005" aria-hidden="true"></span><span class="tt-val">0.9 s, 45× faster</span></span>
-<span class="tt-line"><span class="tt-bar tt-b" style="--f:0.238" aria-hidden="true"></span><span class="tt-val">42.2 s</span></span>
-</div>
-<div class="tt-row"><span class="tt-label">Portland buildings (polygon)</span>
+<div class="tt-row"><span class="tt-label">Portland buildings</span>
 <span class="tt-line"><span class="tt-bar tt-a" style="--f:0.011" aria-hidden="true"></span><span class="tt-val">2.0 s, 42× faster</span></span>
 <span class="tt-line"><span class="tt-bar tt-b" style="--f:0.476" aria-hidden="true"></span><span class="tt-val">84.4 s</span></span>
 </div>
-<div class="tt-row"><span class="tt-label">Oregon roads (line)</span>
+<div class="tt-row"><span class="tt-label">Oregon roads</span>
 <span class="tt-line"><span class="tt-bar tt-a" style="--f:0.023" aria-hidden="true"></span><span class="tt-val">4.1 s, 43× faster</span></span>
 <span class="tt-line"><span class="tt-bar tt-b" style="--f:1.000" aria-hidden="true"></span><span class="tt-val">177.2 s</span></span>
 </div>
-<div class="tt-row"><span class="tt-label">Moldova parcels (polygon, dense)</span>
+<div class="tt-row"><span class="tt-label">Moldova parcels</span>
 <span class="tt-line"><span class="tt-bar tt-a" style="--f:0.022" aria-hidden="true"></span><span class="tt-val">3.9 s, 43× faster</span></span>
 <span class="tt-line"><span class="tt-bar tt-b" style="--f:0.942" aria-hidden="true"></span><span class="tt-val">167.0 s</span></span>
 </div>
-</figure>
-<details markdown><summary>The figures as a table</summary>
-
-| Dataset | Features | tylertoo | tippecanoe end to end | tippecanoe tiling only | Speedup | Speedup with thinning off | tylertoo archive | tippecanoe archive |
-|---|---|---|---|---|---|---|---|---|
-| New York City places (point) | 630,065 | 0.9 s | 42.2 s | 40.4 s | 45× faster (max zoom differs) | 13× | 50.0 MB | 95.0 MB |
-| Portland buildings (polygon) | 813,456 | 2.0 s | 84.4 s | 82.0 s | 42× faster | 43× | 99.4 MB | 73.7 MB |
-| Oregon roads (line) | 1,203,997 | 4.1 s | 177.2 s | 173.5 s | 43× faster | 45× | 306.4 MB | 292.2 MB |
-| Moldova parcels (polygon, dense) | 631,910 | 3.9 s | 167.0 s | 163.2 s | 43× faster | 43× | 177.5 MB | 166.4 MB |
-
-</details>
-<!-- /bench -->
-
-See [Coming from tippecanoe](guides/tippecanoe.md) for the map comparison.
-
-<!-- vale Tylertoo-Mechanics.Headings = NO -->
-## Streaming Overture from S3
-<!-- vale Tylertoo-Mechanics.Headings = YES -->
-
-<!-- bench:overture-buildings-africa/hero -->
-<div class="tt-stats">
-<p class="tt-stat"><span class="tt-stat-value">20 min</span> <span class="tt-stat-label">wall time</span></p>
-<p class="tt-stat"><span class="tt-stat-value">527 million</span> <span class="tt-stat-label">features</span></p>
-<p class="tt-stat"><span class="tt-stat-value">35.6 GB</span> <span class="tt-stat-label">fetched</span></p>
-<p class="tt-stat"><span class="tt-stat-value">152.0 GB</span> <span class="tt-stat-label">peak memory</span></p>
-</div>
-
-526,532,679 features from Overture release 2026-10-21.0.
-<!-- /bench -->
-
-<!-- bench:overture-buildings-africa/recipe -->
-```bash
-AWS_REGION=us-west-2 AWS_SKIP_SIGNATURE=true tylertoo tiles s3://overturemaps-us-west-2/release/2026-10-21.0/theme=buildings/type=building/ africa.pmtiles --min-zoom 0 --max-zoom 14 --layer-name buildings --tile-buffer 8 --max-compressed-tile-size 500000 --max-tile-size 0 --include-property class --include-property subtype --include-property height --bbox=-18,-35,52,37.5
-```
-<!-- /bench -->
-
-The box is a rectangle, so it also covers parts of the Middle East and southern Europe.
-
-<!-- bench:overture-buildings-africa/history -->
-<details markdown><summary>Earlier runs on hardware that differs or was not recorded</summary>
-
-| Run | Host | Overture release | Wall time |
-|---|---|---|---|
-| an unreleased commit afb6b150 after v0.8.0 | aarch64, CPU 0xd40, 64 CPUs, memory not recorded | 2026-10-21.0 | 54 min |
-
-</details>
-<!-- /bench -->
-
-## Input types
-
-<!-- bench:release-cells/encodings -->
-<figure class="tt-chart"><figcaption>Input encodings, wall time</figcaption>
-<div class="tt-row"><span class="tt-label">GeoParquet WKB</span>
-<span class="tt-line"><span class="tt-bar tt-a" style="--f:0.557" aria-hidden="true"></span><span class="tt-val">2.6 s</span></span>
-</div>
-<div class="tt-row"><span class="tt-label">native GeoArrow</span>
-<span class="tt-line"><span class="tt-bar tt-a" style="--f:1.000" aria-hidden="true"></span><span class="tt-val">4.7 s</span></span>
-</div>
-<div class="tt-row"><span class="tt-label">GeoParquet GEOMETRY</span>
-<span class="tt-line"><span class="tt-bar tt-a" style="--f:0.555" aria-hidden="true"></span><span class="tt-val">2.6 s</span></span>
-</div>
-<div class="tt-row"><span class="tt-label">GEOMETRY without GeoParquet metadata</span>
-<span class="tt-line"><span class="tt-bar tt-a" style="--f:0.546" aria-hidden="true"></span><span class="tt-val">2.5 s</span></span>
+<div class="tt-row tt-excluded"><span class="tt-label">New York City places <span class="tt-note">not in the mean</span></span>
+<span class="tt-line"><span class="tt-bar tt-a" style="--f:0.005" aria-hidden="true"></span><span class="tt-val">0.9 s, 45× faster</span></span>
+<span class="tt-line"><span class="tt-bar tt-b" style="--f:0.238" aria-hidden="true"></span><span class="tt-val">42.2 s</span></span>
 </div>
 </figure>
-<details markdown><summary>The figures as a table</summary>
-
-| Dataset | tylertoo |
-|---|---|
-| GeoParquet WKB | 2.6 s |
-| native GeoArrow | 4.7 s |
-| GeoParquet GEOMETRY | 2.6 s |
-| GEOMETRY without GeoParquet metadata | 2.5 s |
-
-</details>
 <!-- /bench -->
-
-<!-- bench:release-cells/sources -->
-<figure class="tt-chart"><figcaption>Input sources, wall time</figcaption>
-<div class="tt-row"><span class="tt-label">Local file</span>
-<span class="tt-line"><span class="tt-bar tt-a" style="--f:0.749" aria-hidden="true"></span><span class="tt-val">2.6 s</span></span>
-</div>
-<div class="tt-row"><span class="tt-label">Multi-file list</span>
-<span class="tt-line"><span class="tt-bar tt-a" style="--f:0.749" aria-hidden="true"></span><span class="tt-val">2.6 s</span></span>
-</div>
-<div class="tt-row"><span class="tt-label">Partitioned directory</span>
-<span class="tt-line"><span class="tt-bar tt-a" style="--f:0.743" aria-hidden="true"></span><span class="tt-val">2.6 s</span></span>
-</div>
-<div class="tt-row"><span class="tt-label">HTTPS</span>
-<span class="tt-line"><span class="tt-bar tt-a" style="--f:1.000" aria-hidden="true"></span><span class="tt-val">3.5 s</span></span>
-</div>
-</figure>
-<details markdown><summary>The figures as a table</summary>
-
-| Dataset | tylertoo |
-|---|---|
-| Local file | 2.6 s |
-| Multi-file list | 2.6 s |
-| Partitioned directory | 2.6 s |
-| HTTPS | 3.5 s |
-
-</details>
-
-For `s3://`, see [Streaming Overture from S3](#streaming-overture-from-s3).
-<!-- /bench -->
-
-## Memory
 
 <!-- bench:e2e-corpus/memory-bars -->
-<figure class="tt-chart"><figcaption>Peak memory, shorter is less</figcaption>
+<figure class="tt-chart"><figcaption>Peak memory</figcaption>
 <p class="tt-legend"><span class="tt-key tt-a">tylertoo</span> <span class="tt-key tt-b">tippecanoe</span></p>
-<div class="tt-row"><span class="tt-label">New York City places (point)</span>
-<span class="tt-line"><span class="tt-bar tt-a" style="--f:0.474" aria-hidden="true"></span><span class="tt-val">2.0 GB</span></span>
-<span class="tt-line"><span class="tt-bar tt-b" style="--f:0.330" aria-hidden="true"></span><span class="tt-val">1.4 GB</span></span>
-</div>
-<div class="tt-row"><span class="tt-label">Portland buildings (polygon)</span>
+<div class="tt-row"><span class="tt-label">Portland buildings</span>
 <span class="tt-line"><span class="tt-bar tt-a" style="--f:0.656" aria-hidden="true"></span><span class="tt-val">2.8 GB</span></span>
 <span class="tt-line"><span class="tt-bar tt-b" style="--f:0.508" aria-hidden="true"></span><span class="tt-val">2.2 GB</span></span>
 </div>
-<div class="tt-row"><span class="tt-label">Oregon roads (line)</span>
+<div class="tt-row"><span class="tt-label">Oregon roads</span>
 <span class="tt-line"><span class="tt-bar tt-a" style="--f:1.000" aria-hidden="true"></span><span class="tt-val">4.2 GB</span></span>
 <span class="tt-line"><span class="tt-bar tt-b" style="--f:0.607" aria-hidden="true"></span><span class="tt-val">2.6 GB</span></span>
 </div>
-<div class="tt-row"><span class="tt-label">Moldova parcels (polygon, dense)</span>
+<div class="tt-row"><span class="tt-label">Moldova parcels</span>
 <span class="tt-line"><span class="tt-bar tt-a" style="--f:0.997" aria-hidden="true"></span><span class="tt-val">4.2 GB</span></span>
 <span class="tt-line"><span class="tt-bar tt-b" style="--f:0.575" aria-hidden="true"></span><span class="tt-val">2.4 GB</span></span>
 </div>
+<div class="tt-row"><span class="tt-label">New York City places</span>
+<span class="tt-line"><span class="tt-bar tt-a" style="--f:0.474" aria-hidden="true"></span><span class="tt-val">2.0 GB</span></span>
+<span class="tt-line"><span class="tt-bar tt-b" style="--f:0.330" aria-hidden="true"></span><span class="tt-val">1.4 GB</span></span>
+</div>
 </figure>
-<details markdown><summary>The figures as a table</summary>
-
-| Dataset | tylertoo | tippecanoe |
-|---|---|---|
-| New York City places (point) | 2.0 GB | 1.4 GB |
-| Portland buildings (polygon) | 2.8 GB | 2.2 GB |
-| Oregon roads (line) | 4.2 GB | 2.6 GB |
-| Moldova parcels (polygon, dense) | 4.2 GB | 2.4 GB |
-
-</details>
 <!-- /bench -->
 
+<!-- bench:e2e-corpus/speedup -->
+The 43× figure is the geometric mean across Portland, Oregon, and Moldova. The New York City runs are shown separately because the archives end at different zoom levels, z14 for tylertoo and z16 for tippecanoe.
+<!-- /bench -->
+
+## tylertoo memory profiles: `auto` vs. `bounded`
+
 <!-- bench:release-cells/profiles -->
-<figure class="tt-chart"><figcaption>Memory profiles, wall time</figcaption>
+The `bounded` profile uses less peak memory and takes longer to build. On New Zealand parcels, it reduced peak memory from 6.8 GiB to 2.2 GiB and increased build time from 22.9 s to 59.2 s.
+
+<figure class="tt-chart"><figcaption>Build time</figcaption>
 <p class="tt-legend"><span class="tt-key tt-a">auto</span> <span class="tt-key tt-b">bounded</span></p>
 <div class="tt-row"><span class="tt-label">Madagascar admin boundaries</span>
 <span class="tt-line"><span class="tt-bar tt-a" style="--f:0.012" aria-hidden="true"></span><span class="tt-val">0.7 s</span></span>
@@ -184,17 +76,8 @@ For `s3://`, see [Streaming Overture from S3](#streaming-overture-from-s3).
 <span class="tt-line"><span class="tt-bar tt-b" style="--f:1.000" aria-hidden="true"></span><span class="tt-val">59.2 s</span></span>
 </div>
 </figure>
-<details markdown><summary>The figures as a table</summary>
 
-| Dataset | auto | bounded |
-|---|---|---|
-| Madagascar admin boundaries | 0.7 s | 1.4 s |
-| Moldova parcels | 2.6 s | 6.3 s |
-| New Zealand parcels | 22.9 s | 59.2 s |
-
-</details>
-
-<figure class="tt-chart"><figcaption>Memory profiles, peak memory</figcaption>
+<figure class="tt-chart"><figcaption>Peak memory</figcaption>
 <p class="tt-legend"><span class="tt-key tt-a">auto</span> <span class="tt-key tt-b">bounded</span></p>
 <div class="tt-row"><span class="tt-label">Madagascar admin boundaries</span>
 <span class="tt-line"><span class="tt-bar tt-a" style="--f:0.140" aria-hidden="true"></span><span class="tt-val">1.0 GiB</span></span>
@@ -209,42 +92,69 @@ For `s3://`, see [Streaming Overture from S3](#streaming-overture-from-s3).
 <span class="tt-line"><span class="tt-bar tt-b" style="--f:0.320" aria-hidden="true"></span><span class="tt-val">2.2 GiB</span></span>
 </div>
 </figure>
-<details markdown><summary>The figures as a table</summary>
+<!-- /bench -->
 
-| Dataset | auto | bounded |
-|---|---|---|
-| Madagascar admin boundaries | 1.0 GiB | 0.5 GiB |
-| Moldova parcels | 3.2 GiB | 1.2 GiB |
-| New Zealand parcels | 6.8 GiB | 2.2 GiB |
+<!-- vale Tylertoo-Mechanics.Headings = NO -->
+## Streaming Overture buildings from S3 {#streaming-overture-from-s3}
+<!-- vale Tylertoo-Mechanics.Headings = YES -->
+
+<!-- bench:overture-buildings-africa/hero -->
+<div class="tt-stats">
+<p class="tt-stat"><span class="tt-stat-value">20 min</span> <span class="tt-stat-label">build time</span></p>
+<p class="tt-stat"><span class="tt-stat-value">527 million</span> <span class="tt-stat-label">buildings</span></p>
+<p class="tt-stat"><span class="tt-stat-value">35.6 GB</span> <span class="tt-stat-label">fetched from S3</span></p>
+<p class="tt-stat"><span class="tt-stat-value">152.0 GB</span> <span class="tt-stat-label">peak memory</span></p>
+</div>
+<!-- /bench -->
+
+<details markdown><summary>Command and input</summary>
+
+<!-- bench:overture-buildings-africa/recipe -->
+The run used Overture release `2026-10-21.0` and processed 526,532,679 features.
+
+```bash
+AWS_REGION=us-west-2 AWS_SKIP_SIGNATURE=true \
+tylertoo tiles \
+  s3://overturemaps-us-west-2/release/2026-10-21.0/theme=buildings/type=building/ \
+  africa.pmtiles \
+  --min-zoom 0 \
+  --max-zoom 14 \
+  --layer-name buildings \
+  --tile-buffer 8 \
+  --max-compressed-tile-size 500000 \
+  --max-tile-size 0 \
+  --include-property class \
+  --include-property subtype \
+  --include-property height \
+  --bbox=-18,-35,52,37.5
+```
+<!-- /bench -->
 
 </details>
+
+## Reproduce these numbers {#reproduce}
+
+`benchmarks/release.sh` rebuilds every number on this page. Numbers from another host are not comparable.
+
+<!-- bench:e2e-corpus/runs -->
+Every run used tylertoo v0.9.0, commit `f0e7d29e`, built with `mimalloc`, on aarch64, CPU 0xd40, 64 CPUs, 247 GiB RAM, on 2026-11-27.
+
+| Section | Compared with | Recorded results |
+|---|---|---|
+| tylertoo vs. tippecanoe | tippecanoe v2.82.0, gpio 1.7.0 | [`e2e-corpus.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/results/e2e-corpus.json) |
+| Overture buildings from S3 | none | [`overture-buildings-africa.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/results/overture-buildings-africa.json) |
+| Memory profiles | none | [`release-cells.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/results/release-cells.json) |
 <!-- /bench -->
-
-`bounded` trades wall time for a lower peak. Use it when the input is larger than memory.
-
-## Measurement method
-
-### The mean
-
-<!-- bench:e2e-corpus/speedup -->
-- In the mean: Portland buildings (polygon), Oregon roads (line), Moldova parcels (polygon, dense).
-- Not in the mean: New York City places (point): the archives reach different max zooms (tylertoo z14, tippecanoe z16).
-- tippecanoe's end-to-end time includes converting the GeoParquet input to FlatGeobuf with gpio. That conversion is this share of it: Portland buildings (polygon): 2.8%, Oregon roads (line): 2.1%, Moldova parcels (polygon, dense): 2.3%.
-- For tiling alone, the geometric mean is 42×.
-- With thinning off, the geometric mean is 44× over 3 datasets.
-<!-- /bench -->
-
-### Settings
 
 <!-- bench:e2e-corpus/method -->
-- Host: aarch64, CPU 0xd40, 64 CPUs, 247 GiB RAM.
-- Rounds: 3.
-- Wall time: median of recorded rounds.
-- Warm cache: yes.
-- Allocator: mimalloc.
-- Inputs: pinned by sha256 in `e2e-corpus.json`.
+- Each time is the median of three runs with a warm cache.
+- Input checksums are pinned in `e2e-corpus.json`.
+- tippecanoe's time includes converting GeoParquet to FlatGeobuf with `gpio`. That step is this share of it: Portland 2.8%, Oregon 2.1%, and Moldova 2.3%.
+- For tiling alone, without the conversion, the geometric mean is 42×.
+- With thinning off (`--verbatim --simplify-factor 1.0`), the geometric mean is 44×.
+- New York City is not in the mean: the archives end at different zoom levels, z14 for tylertoo and z16 for tippecanoe.
 
-<details markdown><summary>Exact commands</summary>
+<details markdown><summary>Exact commands for tylertoo vs. tippecanoe</summary>
 
 - New York City places (point):
     - tylertoo: `target/release/tylertoo tiles '<repo>/corpus/data/gpio/points-nyc-medium.parquet' '<work>/points-nyc-medium/tylertoo.pmtiles' --min-zoom 0 --max-zoom 14 --layer-name points-nyc-medium --tile-buffer 8 --max-compressed-tile-size 500000 --max-tile-size 0 --report '<work>/points-nyc-medium.tylertoo.report.json' --force`.
@@ -270,16 +180,27 @@ For `s3://`, see [Streaming Overture from S3](#streaming-overture-from-s3).
 </details>
 <!-- /bench -->
 
-### Runs
+<details markdown><summary>Every recorded figure for tylertoo vs. tippecanoe</summary>
 
-<!-- bench:e2e-corpus/runs -->
-- Corpus: an unreleased commit f0e7d29e after v0.8.0, tippecanoe v2.82.0, gpio 1.7.0, allocator: mimalloc, aarch64, CPU 0xd40, 64 CPUs, 247 GiB RAM, 2026-11-27.
-- Africa: an unreleased commit f0e7d29e after v0.8.0, allocator: mimalloc, aarch64, CPU 0xd40, 64 CPUs, 247 GiB RAM, 2026-11-27.
-- Release cells: an unreleased commit f0e7d29e after v0.8.0, allocator: mimalloc, aarch64, CPU 0xd40, 64 CPUs, 247 GiB RAM, 2026-11-27.
+<!-- bench:e2e-corpus/figures -->
+| Dataset | Features | tylertoo | tippecanoe end to end | tippecanoe tiling only | gpio conversion | Speedup | Speedup, thinning off | tylertoo archive | tippecanoe archive |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Portland buildings (polygon) | 813,456 | 2.0 s | 84.4 s | 82.0 s | 2.4 s | 42× | 43× | 99.4 MB | 73.7 MB |
+| Oregon roads (line) | 1,203,997 | 4.1 s | 177.2 s | 173.5 s | 3.7 s | 43× | 45× | 306.4 MB | 292.2 MB |
+| Moldova parcels (polygon, dense) | 631,910 | 3.9 s | 167.0 s | 163.2 s | 3.8 s | 43× | 43× | 177.5 MB | 166.4 MB |
+| New York City places (point), not in the mean | 630,065 | 0.9 s | 42.2 s | 40.4 s | 1.8 s | 45× | 13× | 50.0 MB | 95.0 MB |
 <!-- /bench -->
 
-See the [benchmark method](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/README.md) and [recorded results](https://github.com/geoparquet-io/tylertoo/tree/main/benchmarks/results).
+</details>
 
-Reproduce: `benchmarks/release.sh`
+<!-- bench:overture-buildings-africa/history -->
+<details markdown><summary>Earlier Overture runs on other or unrecorded hardware</summary>
 
-For sharded builds, follow the [Brazil tutorial's sharding step](tutorials/brazil.md#2-split-the-build-across-workers).
+| Run | Host | Overture release | Wall time |
+|---|---|---|---|
+| an unreleased commit afb6b150 after v0.8.0 | aarch64, CPU 0xd40, 64 CPUs, memory not recorded | 2026-10-21.0 | 54 min |
+
+</details>
+<!-- /bench -->
+
+The [benchmark method](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/README.md) describes the harness in full.

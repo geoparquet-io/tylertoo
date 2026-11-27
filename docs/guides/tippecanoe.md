@@ -39,7 +39,7 @@ The archives come from the release run.
 | Oregon roads (line) | [tylertoo](https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/lines-oregon-large/tylertoo.pmtiles) | [tippecanoe](https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/lines-oregon-large/tippecanoe.pmtiles) |
 | Moldova parcels (polygon, dense) | [tylertoo](https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/polygons-ftw-moldova-large/tylertoo.pmtiles) | [tippecanoe](https://data.source.coop/nlebovits/tylertoo-benchmarks/v0.8.0-1639-gf0e7d29e/polygons-ftw-moldova-large/tippecanoe.pmtiles) |
 
-_Run: an unreleased commit f0e7d29e after v0.8.0, tippecanoe v2.82.0, gpio 1.7.0, allocator: mimalloc, aarch64, CPU 0xd40, 64 CPUs, 247 GiB RAM, 2026-11-27._
+_Run: v0.9.0, commit f0e7d29e, tippecanoe v2.82.0, gpio 1.7.0, allocator: mimalloc, aarch64, CPU 0xd40, 64 CPUs, 247 GiB RAM, 2026-11-27._
 <!-- /bench -->
 
 <div class="compare-maps">

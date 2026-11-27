@@ -7,7 +7,7 @@
 [![Crates.io](https://img.shields.io/crates/v/tylertoo?color=blue)](https://crates.io/crates/tylertoo)
 [![PyPI](https://img.shields.io/pypi/v/tylertoo?color=blue)](https://pypi.org/project/tylertoo/)
 
-GeoParquet to PMTiles with a Rust engine, CLI, and Python API. [<!-- bench:e2e-corpus/readme-claim -->43× faster than tippecanoe end to end, the geometric mean over 3 datasets (an unreleased commit f0e7d29e after v0.8.0, 2026-11-27)<!-- /bench -->](https://geoparquet-io.github.io/tylertoo/benchmarks/). It [<!-- bench:overture-buildings-africa/stream-claim -->streams 527 million Overture buildings (58.7 GB of partitioned GeoParquet) from S3 into PMTiles in 20 min on one machine (an unreleased commit f0e7d29e after v0.8.0)<!-- /bench -->](https://geoparquet-io.github.io/tylertoo/benchmarks/#streaming-overture-from-s3), which tippecanoe cannot do. Supports streaming, bounded-memory processing, remote reads, and sharded builds across multiple machines. Named after [“Tippecanoe and Tyler Too.”](https://en.wikipedia.org/wiki/Tippecanoe_and_Tyler_Too)
+GeoParquet to PMTiles with a Rust engine, CLI, and Python API. [<!-- bench:e2e-corpus/readme-claim -->43× faster than tippecanoe<!-- /bench -->](https://geoparquet-io.github.io/tylertoo/benchmarks/). [<!-- bench:overture-buildings-africa/stream-claim -->Capable of streaming 527 million Overture buildings (58.7 GB) from S3 into PMTiles in 20 minutes<!-- /bench -->](https://geoparquet-io.github.io/tylertoo/benchmarks/#streaming-overture-from-s3). Supports streaming, bounded-memory processing, remote reads, and sharded builds across multiple machines. Named after [“Tippecanoe and Tyler Too.”](https://en.wikipedia.org/wiki/Tippecanoe_and_Tyler_Too)
 
 ## Install
 
@@ -37,13 +37,7 @@ tylertoo.overview("fieldmaps-madagascar-adm4-hilbert.parquet", "madagascar-ov.pa
 tylertoo.export_pmtiles("madagascar-ov.parquet", "madagascar.pmtiles")
 ```
 
-tylertoo expects its input sorted in Hilbert order, and never reorders rows
-itself. Sort other input first with
-[geoparquet-io](https://github.com/geoparquet-io/geoparquet-io):
-`gpio sort hilbert input.parquet sorted.parquet`. tylertoo warns when the
-input is not sorted by location.
-
-The intermediate `madagascar-ov.parquet` is a [`geo:overviews`](https://geoparquet-io.github.io/tylertoo/spec/overviews/) file (draft spec): a GeoParquet file that carries its own zoom pyramid and stays queryable as ordinary GeoParquet.
+tylertoo expects its input sorted in Hilbert order; we recommend optimizing your data with [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io) for the best performance with tylertoo.
 
 See the [docs site](https://geoparquet-io.github.io/tylertoo/) for end-to-end tutorials and the API reference.
 

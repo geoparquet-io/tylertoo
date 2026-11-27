@@ -588,13 +588,13 @@ CI only warns, so nothing blocks.
 
 `docs/benchmarks.md`, in order:
 
-1. `# Benchmarks`: one sentence of intro, then `bench:e2e-corpus/stamp`.
-2. `## Against tippecanoe`: `speedup`, then `speedup-bars`. One sentence links to [Coming from tippecanoe](guides/tippecanoe.md) for the map comparison.
-3. `## Streaming Overture from S3`: the Africa `hero`, `history` and `recipe`, displayed prominently right below the headline. One sentence: "The box is a rectangle, so it also covers parts of the Middle East and southern Europe."
-4. `## At scale: Brazil`: `overture-buildings-brazil/bars`.
-5. `## Input types`: `release-cells/encodings`, then `release-cells/sources`.
-6. `## Memory`: `memory-bars`, then `release-cells/profiles`. One sentence: "`bounded` trades wall time for a lower peak. Use it when the input is larger than memory."
-7. `## How these were measured`: `method`, links to `benchmarks/e2e/README.md` and the results JSONs, and the line "Reproduce: `benchmarks/release.sh`".
+1. `# Benchmarks`: `headline`, one sentence with the mean and the memory comparison.
+2. `## tylertoo vs. tippecanoe`: one hand-written sentence on what the timings cover, then `speedup-bars`, `memory-bars`, and `speedup` (the sentence on the mean and its exclusions).
+3. `## tylertoo memory profiles: auto vs. bounded`: `release-cells/profiles`.
+4. `## Streaming Overture buildings from S3` (anchor `#streaming-overture-from-s3`): the Africa `hero` stat tiles, then `recipe` in a disclosure.
+5. `## Reproduce these numbers`: `runs` (the shared build and host once, one row per results file), `method`, `figures` in a disclosure, `history`, and a link to `benchmarks/e2e/README.md`.
+
+Input-type cells (encodings and sources) stay in `release-cells.json` and are not on the page.
 
 ### Work list for the writer
 

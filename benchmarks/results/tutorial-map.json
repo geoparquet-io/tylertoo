@@ -13,7 +13,7 @@
     "date": "2026-11-27T15:50:42Z",
     "git_describe": "v0.8.0-1639-gf0e7d29e",
     "host_class": "aarch64/0xd40/64",
-    "release_version": null,
+    "release_version": "0.9.0",
     "mem_gib": 123,
     "notes": [
       "Recorded from an existing archive (brazil.pmtiles); not rebuilt by this run."
