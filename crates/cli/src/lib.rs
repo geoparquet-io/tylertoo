@@ -135,7 +135,16 @@ if it does not reopen, requests for it return HTTP 503 until it does."#, respons
     /// of the production binary.
     #[cfg(feature = "gen-docs")]
     #[command(hide = true)]
-    GenReferenceDocs,
+    GenReferenceDocs {
+        #[arg(value_enum)]
+        mode: Option<ReferenceDocsMode>,
+    },
+}
+
+#[cfg(feature = "gen-docs")]
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum ReferenceDocsMode {
+    Tippecanoe,
 }
 
 /// Print a composed archive's publication metadata (`merge`, `pyramid`).
@@ -462,8 +471,14 @@ where
         Command::Serve(args) => run_serve(&args),
         Command::Tiles(args) => run_tiles(*args),
         #[cfg(feature = "gen-docs")]
-        Command::GenReferenceDocs => {
-            print!("{}", gen_reference_markdown());
+        Command::GenReferenceDocs { mode } => {
+            print!(
+                "{}",
+                match mode {
+                    Some(ReferenceDocsMode::Tippecanoe) => tippecanoe_doc::render(),
+                    None => gen_reference_markdown(),
+                }
+            );
             Ok(())
         }
     };
@@ -523,6 +538,9 @@ where
 
 #[cfg(feature = "gen-docs")]
 mod reference_docs;
+
+#[cfg(feature = "gen-docs")]
+mod tippecanoe_doc;
 
 /// Render the CLI reference from the clap help strings and option definitions.
 #[cfg(feature = "gen-docs")]

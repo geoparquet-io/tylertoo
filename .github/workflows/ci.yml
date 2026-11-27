@@ -881,6 +881,8 @@ jobs:
         run: |
           cargo run --locked -p tylertoo --features gen-docs -- gen-reference-docs \
             > docs/reference/cli.md
+          cargo run --locked -p tylertoo --features gen-docs -- gen-reference-docs tippecanoe \
+            > crates/cli/docs/tippecanoe-tables.md
 
       - name: Build extension and regenerate Python reference
         working-directory: crates/python
@@ -891,9 +893,10 @@ jobs:
 
       - name: Fail if reference docs drifted
         run: |
-          if ! git diff --exit-code -- docs/reference/cli.md docs/reference/python.md; then
+          if ! git diff --exit-code -- docs/reference/cli.md docs/reference/python.md crates/cli/docs/tippecanoe-tables.md; then
             echo "::error::Reference docs are stale — regenerate and commit:"
             echo "  cargo run -p tylertoo --features gen-docs -- gen-reference-docs > docs/reference/cli.md"
+            echo "  cargo run -p tylertoo --features gen-docs -- gen-reference-docs tippecanoe > crates/cli/docs/tippecanoe-tables.md"
             echo "  cd crates/python && uv run --no-sync --with docstring-parser==0.18.0 python scripts/gen_reference.py > ../../docs/reference/python.md"
             exit 1
           fi

@@ -1393,7 +1393,7 @@ pub mod cli;
 pub mod keywords;
 mod preset;
 mod values;
-pub use preset::Preset;
+pub use preset::{Preset, TIPPECANOE_SOURCES, TIPPECANOE_VERSION};
 
 pub(super) fn finite_number(
     name: &'static str,
