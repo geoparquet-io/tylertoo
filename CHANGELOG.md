@@ -5,7 +5,12 @@ Notable changes to this project are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## v0.9.0 (2026-11-27)
+
+MapLibre Tile output, cell bands, a local viewer, reprojection of projected
+input, and defaults that follow tippecanoe's. Default tile output changes, the
+Rust API is frozen at the crate root, and Python 3.11 is the minimum. Read
+**Breaking** before upgrading.
 
 ### Breaking
 
@@ -15,6 +20,30 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tile-size valve drops fewer features: the Madagascar admin fixture keeps
   155 and 149 more features at z4 and z5 (+0.05% overall), with tile counts
   unchanged. Pass `--feature-id <column>` for stable ids.
+- **Default tile output follows tippecanoe.** Default archives differ from
+  v0.8.0 in five ways:
+  - Polygon coverages are complete by default (#751). The density budget
+    thins points only, like tippecanoe's `-r`, and `--drop-lines` and
+    `--drop-polygons` opt back in. `--polygon-thinning` defaults to 0.
+    Polygons too small for a level are drawn as placeholder squares, and
+    `--no-collapse` drops them. A tile over the size cap merges its densest
+    lines and polygons into the feature kept before them (`--size-valve
+    merge`). A merged feature keeps the attributes of the feature it merged
+    into; `--size-valve drop` keeps every attribute exact. On Madagascar
+    admin-4 at z8 the missing area falls from 48.6% to 0.23%.
+  - The default size caps are 500K compressed and 2M raw (#770). The old
+    default capped the raw tile at 500K, about twice as strict as
+    tippecanoe's `-M`.
+  - `--drop-rate` defaults to 2.5, tippecanoe's `-r` (was 1.65). Point
+    tilesets come out about a quarter smaller. `--drop-rate 1.65` restores
+    the old output (#882).
+  - `--tile-buffer` defaults to 5 px (was 8), and lines are simplified at the
+    max zoom at 0.25 × GSD. `--tile-buffer 8 --max-zoom-simplify-factor 0`
+    restores the old output byte for byte (#883).
+  - Line features at the max zoom no longer carry `coalesced_count: 1`.
+    Styles must read a missing key as 1, for example
+    `["coalesce", ["get", "coalesced_count"], 1]`.
+    `--include-property coalesced_count` keeps it at every level (#884).
 - **Rust API freeze (#437, #436).** The stable API is the crate root: the
   convert, export, check, tiles, pyramid and decode entry points, their
   options, reports and errors, `ErrorKind`/`Classify` and `Compression`.
@@ -59,11 +88,82 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `--drop-gamma` below 1 (it was silently treated as 1) and a negative
     `--simplify-factor` (it behaved like 0). `--drop-gamma` is not checked
     under `--no-density-drop`.
+  - `--include-property bbox`, which names the bbox covering and not a
+    property (#663). `--exclude-property bbox` warns. A `--filter` that reads
+    an excluded property fails before the run.
+  - A `--filter` column named `like` or `ilike` without double quotes. Both
+    are now keywords, as `in` and `is` are (#836).
 - **Python 3.11 or later.** Wheels are `cp311-abi3`; Python 3.9 and 3.10
   are no longer supported.
 
 ### Added
 
+- **MapLibre Tile output.** `--tile-format mlt` on `tiles`, `export-pmtiles`
+  and `pyramid` (Python `tile_format=`) writes MLT for MapLibre GL JS 5.12+
+  and MapLibre Native. Archives are 10–28% smaller than MVT on the benchmark
+  data (#860). `--mlt-profile` picks the encoder, and the size caps measure
+  MLT bytes. `merge` refuses to mix MVT and MLT shards. `decode` and
+  `stats --layers` read MLT archives. `pyramid` also takes `--profile`.
+- **Cell bands.** `tiles --band LO-HI:KIND` (Python `convert(bands=[...])`)
+  sets what each zoom range shows (#859). `KIND` is `geom`, `point` or
+  `square` for features, or `grid`, `h3`, `s2` or `a5` for aggregated cells:
+  `--band 0-7:a5 --band 8-14:geom`. Sharded builds take cell bands, and the
+  merged fleet matches an unsharded run byte for byte.
+  `pyramid --band LO-HI:SYSTEM:INPUT[:LAYER]` draws cells from another input.
+- **`tylertoo serve ARCHIVE...`** (Python `tylertoo.serve()`) serves
+  archives on a local HTTP server with a MapLibre viewer, TileJSON, metadata,
+  stats and Range reads (#865).
+- **Reprojection on read.** GeoParquet input in a projected CRS is
+  reprojected to EPSG:4326 as it is read, from the EPSG code its CRS declares
+  (#868). Parts in different CRSs convert as one dataset. Input in EPSG:4326
+  or EPSG:3857 gives byte-identical output.
+- `tylertoo stats --layers` reports feature counts, bytes and geometry types
+  per zoom and layer. Python `tylertoo.stats()` returns the same structure as
+  `stats --json` (#837).
+- `--mask PATH` on `overview` and `tiles` (Python `mask=`) keeps the features
+  that intersect a polygon from a GeoJSON or GeoParquet file, or from any
+  object with a `.wkb` attribute (#866). The mask's bbox prunes row groups
+  before any data is read.
+- `--filter` takes `LIKE`, `ILIKE`, `NOT LIKE` and `NOT ILIKE` with `%` and
+  `_` wildcards (#836). A `LIKE` with a literal prefix prunes row groups.
+- `--cluster-categories COL` (Python `cluster_categories=`) gives each
+  clustered point a count column per category of COL, for pie or
+  dominant-category styles (#846).
+- `--generate-variable-depth-tile-pyramid`, as in tippecanoe (#809). Export
+  stops a subtree at a tile that holds the finest rows within the caps. On
+  1.36M buildings the archive falls from 156 MB to 88.5 MB.
+- `--coverage-fill` closes coarse-zoom holes in polygon coverages (#763). It
+  is opt-in. On Madagascar admin-4 at z4 the missing area falls from 12.8% to
+  0.01%.
+- `--no-simplification-of-shared-nodes` (Python
+  `no_simplification_of_shared_nodes=True`), tippecanoe's `-pn`, simplifies
+  a border two polygons share the same way in both, so slivers close (#905).
+  Auckland parcels at z12 go from 97.6% to 99.97% of the source area drawn.
+  It is off by default.
+- `--max-zoom-simplify-factor` sets simplification at the max zoom (#847).
+  `--max-compressed-tile-size` is tippecanoe's `-M` (#751).
+- `--name`, `--description` and `--attribution` on `tiles`, `export-pmtiles`,
+  `pyramid` and `merge`, and on the Python functions, write PMTiles metadata
+  (#746, from jimmyrocks's #669).
+- `--workers N` (Python `workers=`) and `--memory-limit SIZE` (Python
+  `memory_limit=`) (#921).
+- `--temp-compression lz4|zstd` (Python `temp_compression=`) picks the codec
+  of the temporary overview that `tiles` writes (#878).
+- A global `-q/--quiet` flag. `tylertoo --help` and the CLI reference list
+  the exit codes (#726).
+- Python: property selection (`include_properties`, `exclude_properties`,
+  `exclude_all_properties`), `verbatim=` and `entry_zoom=` on `overview()`,
+  and `pyramid()` and `decode()` (#728).
+- The convert report gains `crs_assumed_wgs84`, set when an input declares no
+  CRS. An unknown `geo.version` major warns once (#704).
+- The `geo:overviews` footer records the entry-zoom ladder in
+  `generalization.entry_zoom` (#662).
+- The `tiles_over_limit` diagnostic counts the tiles left over the size cap,
+  lists the ten largest, counts the ones that hold merged features, and names
+  `--size-valve drop` (#847, #886).
+- Environment overrides for remote staging and HTTP clients:
+  `TYLERTOO_STAGING_CONCURRENCY`, `TYLERTOO_STAGING_MEM_BUDGET_BYTES`,
+  `TYLERTOO_STAGING_COALESCE_BYTES` and `TYLERTOO_HTTP_<KEY>` (#700, #729).
 - Pass 1 warns when the input rows are not sorted by location (#768) and
   names the `gpio sort hilbert` command for the input: on unsorted input,
   merged features join unrelated geometry and tile edges show more seams.
@@ -112,8 +212,100 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--size-valve drop` for an exact match). `--no-coalesce-lines` is no longer
   needed, and `InvalidOption::ShardWithCoalescedLines` is gone.
 
+### Changed
+
+- **Tile output: the size valve's threshold reaches past the tile it fits
+  (#768).** `--valve-scope` (Python `valve_scope=`) defaults to `smooth`.
+  The export scan predicts each dense tile's threshold, and every tile
+  around it, one that fits too, starts from that threshold faded by
+  `--valve-max-step` (Python `valve_max_step=`, default 2) a tile, out to
+  where it no longer thins anything (at most 8 tiles). Neighbouring tiles
+  then keep at most twice each other's share of points, or merge at most
+  twice less hard, so density steps down over several tiles instead of
+  jumping at a tile edge. Point tiles fade under either valve. On 1.8
+  million French points the 95th-percentile jump between neighbouring z3–z6
+  tiles falls from 3.5–39× to 2× under `--size-valve drop` (those zooms keep
+  44–81% of the points `tile` keeps), and from 4.3–41× to 2× under the
+  default `merge` (40–80%). The prediction and the
+  floors stay within the export's memory budget; if they cannot, the
+  export warns and runs as `--valve-scope tile`. `--valve-scope tile` thins
+  each tile on its own as before; `zoom` starts every tile from its zoom's
+  largest threshold (not with `--tile-range`). A `tiles` shard whose export
+  fades the valve now reads input up to nine pivot tiles past its range,
+  not two, so it predicts the same floors: on world-wide points cut into 8
+  shards at z6 the fleet reads 27% more rows; on a regional input nothing
+  changes. Under `--valve-scope tile`, or with no size cap, it reads two. The default costs at most
+  1.12× the wall time of `tile` on the benchmark inputs and is 2.8× faster
+  on dense points.
+- **Tile output: point tiles over a cap keep points by a fixed rank (#768).**
+  Under every `--valve-scope`, including `tile`, a point tile thinned by
+  the size valve keeps the points whose input row ranks best (the row
+  number bit-reversed), not an even stride from the tile's first point.
+  The points kept at one zoom are kept at the next wherever it keeps a
+  larger share: on French points 93–96% of the z3 points stay at z4,
+  against 5% before. Overviews record each row's input position in a new
+  `input_row` column; older overviews rank by overview row, and a column of
+  theirs named `input_row` stays a property.
+- The Python wheel uses mimalloc as its global allocator on every platform,
+  as the CLI does (#739, #792). On the 792 buildings input (median of 3),
+  export takes 10.0 s against 10.9 s and peak RSS is 3.36 GB against 2.84 GB
+  with the system allocator: about 8% faster for 18% more memory. Archives
+  are byte-identical. A non-musl source build opts out
+  with `maturin build --no-default-features`; musl always uses mimalloc.
+- Rust callers pass a `TileCoord` to
+  `StreamingPmtilesWriter::add_tile_precompressed` instead of separate
+  zoom, x and y arguments. `Compression::from_str` is now
+  `Compression::parse`; `str::parse::<Compression>()` is also available.
+- Remote staging reports each operation's live concurrency, including
+  later operations in the same process (#779).
+- `tiles` writes its temporary overview with LZ4: the file is 1.4–1.6×
+  larger and faster to write. `--temp-compression zstd` restores v0.8.0's
+  codec (#878).
+- `--profile auto` and `speed` use every core the process may use. `bounded`
+  keeps its cap of 40 workers (#921).
+- Tiles are 0.5–3% smaller (#889). A Float64 value that a float holds
+  exactly is written as an MVT float, a negative integer as `sint`, and gzip
+  runs on libdeflate at level 6. Decoded values do not change.
+- Errors name the file they concern: a missing input, a corrupt footer, or a
+  file with no geometry column (#726). A missing output directory fails
+  before any input is read.
+- Per-tile size-valve messages log at DEBUG. One warning counts the tiles
+  still over the limit (#847).
+
 ### Fixed
 
+- Export finds a geometry column with any name, such as Esri's `SHAPE`, from
+  the `geo` metadata. An input with a second geometry column tiles the
+  primary one (#676).
+- The merge valve meets the size cap on dense polygon tiles (#901). Before it
+  drops whole features, it re-encodes the tile at extent 2048, then 1024,
+  then 512. `--size-valve drop` keeps tippecanoe's 0.8 margin after its
+  first cut.
+- `--drop-polygons` no longer adds the polygons it drops back as placeholder
+  squares (#903).
+- Placeholder squares dither on the source area at every level, so a square
+  no longer survives to z0 by chance (#888). Default output changes a little.
+- `--bbox` matches features across the antimeridian, and the report counts
+  wrapped features (#721).
+- Export stops with an error after its scan when one tile cannot fit in
+  memory. It used to be OOM-killed minutes later (#713).
+- The PMTiles writers compare bytes on a dedup hash hit, so a hash collision
+  no longer stores the wrong tile body (#691).
+- Layer and field names with `"` or `\` write valid PMTiles metadata.
+  Integer covering columns no longer prune row groups the read needs (#757).
+- A signed input's query string no longer appears in the Referer header of a
+  redirect (#890).
+- A change to `TYLERTOO_STAGING_*`, `TYLERTOO_HTTP_*` or a cloud credential
+  variable takes effect on the next conversion in the same process (#864).
+- `validate` reads clustered overviews whose geometries pass about 2 MB a row
+  (#657).
+- Hostile input gives typed errors: polygon clipping refuses non-finite or
+  huge coordinates (#698), and a `--filter` statistic of `i64::MIN` or a
+  dictionary page that claims billions of values no longer crashes (#899).
+- `decode` prints each error cause once (#660).
+- The sdist carries `NOTICE` at its root, so PyPI accepts it (#646).
+- Dependency updates clear RustSec advisories in rustls, rustls-webpki,
+  webpki-root-certs, zstd-sys, url and parquet (#674, #753, #786, #914).
 - Pre-read disk warnings cover only staged input and staged layers; projected
   spill and intermediate sizes are info logs. Conversion rechecks space before
   pass 2 using kept per-level rows, including attribute filtering, the input's
@@ -192,57 +384,51 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The overviews format version is independent of the tool version; the spec
   stays 0.x and readers refuse a foreign MAJOR (#441).
 
-### Removed
+### Performance
 
-- Mutation testing (cargo-mutants) in CI, replaced by targeted proptest and
+Output is byte-identical unless the entry says otherwise.
+
+- On 64 cores, default `tiles` and `export-pmtiles` runs are 29% faster
+  (geometric mean), `decode` is 6× faster, and `--profile bounded` is 18%
+  faster with 20% less RSS (#818). Export and pass 2 use idle cores for
+  7–11% more on three datasets (#881). Nested Rayon waits no longer leave
+  the pool idle (#921).
+- Peak RSS falls about 25% under `auto` and 29% under `bounded`. Full
+  Overture segments under `auto` go from 10.9 GB to 5.1 GB (#871). Export
+  packs each feature's properties into one buffer (#897).
+- List-heavy row groups decode by their excess list values. Full Overture
+  segments go from 843 s to 24.6 s (#902).
+- The merge valve quantizes each member once per tile. FTW Moldova export at
+  `--simplify-factor 0` goes from 131 s to 16 s (#770). A dense merged group
+  is swept once, so the 48M-polygon UNOSAT input finishes instead of stalling
+  (#911). Export waves are sized by their own members, which is 24% faster
+  with half the peak RAM on that input (#917). The valve predictor clips a
+  sampled row once for all its tiles (#920).
+- The pre-export scan reads the bbox covering and leaves the geometry
+  unread: 8.98 s to 0.77 s on FTW Brazil MT (#737). `--max-zoom auto` reads
+  the covering too (#703).
+- Pass 1 reads row groups in parallel (#722) and scans geometry where it
+  lies (#712). Pass 2 processes several batches at once and runs 1.46×
+  faster on FTW Ukraine (#714).
+- Export runs small zoom levels concurrently (#652) and interns property
+  keys (#667).
+- `decode` reads tiles by offset, so an archive larger than memory decodes
+  (#736). The pyramid merge holds one tile per band, not an index of every
+  tile (#725).
+- Polygon validation pruning, a background archive writeback on Linux, and a
+  parallel pass-2 drain (#878). Profile-driven fixes for the #788
+  bottlenecks (#790) and a cheaper default size valve (#799).
+
+### Internal
+
+- One owner per shared concept, checked by clippy, cargo-deny, jscpd and
+  similarity-rs (#787, #805). Export split into stage submodules (#918) and
+  reads the overview file through one engine (#898). Hand-rolled code
+  replaced by existing crates (#757). Fuzz targets for every outside input
+  (#689). One benchmark harness with generated docs numbers (#694, #760,
+  #812). A docs overhaul (#933), CI fixes, and dependency bumps.
+- Mutation testing (cargo-mutants) is replaced by targeted proptest and
   Hypothesis property suites (#677).
-
-### Changed
-
-- **Tile output: the size valve's threshold reaches past the tile it fits
-  (#768).** `--valve-scope` (Python `valve_scope=`) defaults to `smooth`.
-  The export scan predicts each dense tile's threshold, and every tile
-  around it, one that fits too, starts from that threshold faded by
-  `--valve-max-step` (Python `valve_max_step=`, default 2) a tile, out to
-  where it no longer thins anything (at most 8 tiles). Neighbouring tiles
-  then keep at most twice each other's share of points, or merge at most
-  twice less hard, so density steps down over several tiles instead of
-  jumping at a tile edge. Point tiles fade under either valve. On 1.8
-  million French points the 95th-percentile jump between neighbouring z3–z6
-  tiles falls from 3.5–39× to 2× under `--size-valve drop` (those zooms keep
-  44–81% of the points `tile` keeps), and from 4.3–41× to 2× under the
-  default `merge` (40–80%). The prediction and the
-  floors stay within the export's memory budget; if they cannot, the
-  export warns and runs as `--valve-scope tile`. `--valve-scope tile` thins
-  each tile on its own as before; `zoom` starts every tile from its zoom's
-  largest threshold (not with `--tile-range`). A `tiles` shard whose export
-  fades the valve now reads input up to nine pivot tiles past its range,
-  not two, so it predicts the same floors: on world-wide points cut into 8
-  shards at z6 the fleet reads 27% more rows; on a regional input nothing
-  changes. Under `--valve-scope tile`, or with no size cap, it reads two. The default costs at most
-  1.12× the wall time of `tile` on the benchmark inputs and is 2.8× faster
-  on dense points.
-- **Tile output: point tiles over a cap keep points by a fixed rank (#768).**
-  Under every `--valve-scope`, including `tile`, a point tile thinned by
-  the size valve keeps the points whose input row ranks best (the row
-  number bit-reversed), not an even stride from the tile's first point.
-  The points kept at one zoom are kept at the next wherever it keeps a
-  larger share: on French points 93–96% of the z3 points stay at z4,
-  against 5% before. Overviews record each row's input position in a new
-  `input_row` column; older overviews rank by overview row, and a column of
-  theirs named `input_row` stays a property.
-- The Python wheel uses mimalloc as its global allocator on every platform,
-  as the CLI does (#739, #792). On the 792 buildings input (median of 3),
-  export takes 10.0 s against 10.9 s and peak RSS is 3.36 GB against 2.84 GB
-  with the system allocator: about 8% faster for 18% more memory. Archives
-  are byte-identical. A non-musl source build opts out
-  with `maturin build --no-default-features`; musl always uses mimalloc.
-- Rust callers pass a `TileCoord` to
-  `StreamingPmtilesWriter::add_tile_precompressed` instead of separate
-  zoom, x and y arguments. `Compression::from_str` is now
-  `Compression::parse`; `str::parse::<Compression>()` is also available.
-- Remote staging reports each operation's live concurrency, including
-  later operations in the same process (#779).
 
 ## v0.8.0 (2026-10-06)
 
