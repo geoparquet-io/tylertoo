@@ -278,8 +278,12 @@ def test_compare_maps(results):
     r = comparison(results)
     results["comparison-pmtiles"] = r
     out = g.render_region("comparison-pmtiles/compare-maps", results)
-    for needle in ['<label', '<select id="compare-dataset"', 'data-tylertoo=', 'data-tippecanoe=', 'data-layer="places"', 'data-geometry="point"', '| Dataset | tylertoo archive | Tippecanoe archive |']:
+    for needle in ['<label', '<select id="compare-dataset"', 'data-tylertoo=', 'data-tippecanoe=', 'data-layer="places"', 'data-geometry="point"', '| Dataset | tylertoo archive | tippecanoe archive |']:
         assert needle in out
+    # The picker sits right above the maps: tylertoo on top, each map named.
+    top, bottom = out.index('id="compare-tylertoo"'), out.index('id="compare-tippecanoe"')
+    assert out.index('</select>') < top < bottom < out.index('Download the archives')
+    assert '<span class="compare-badge">tylertoo</span>' in out and '<span class="compare-badge">tippecanoe</span>' in out
     r["datasets"][0]["tylertoo"]["url"] += "?bad"
     with pytest.raises(ValueError, match="URL"):
         g.render_region("comparison-pmtiles/compare-maps", results)

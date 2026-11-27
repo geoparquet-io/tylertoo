@@ -609,8 +609,18 @@ def compare_maps(r):
             f'data-{key}="{html.escape(value, quote=True)}"' for key, value in attrs.items()) + '>'
             + html.escape(label) + '</option>')
         rows.append([label, *[f"[{tool}]({d[tool]['url']})" for tool in ['tylertoo', 'tippecanoe']]])
-    return '\n'.join([*out, '</select>', '', table(['Dataset', 'tylertoo archive', 'Tippecanoe archive'], rows),
-                      '', f'_Run: {run_text(r)}._'])
+    # tylertoo on top, tippecanoe below: the maps are wider than tall, and
+    # each carries its tool's name so a screenshot stays readable.
+    maps = ['<div class="compare-maps">', *[
+        f'<div id="compare-{tool}" class="tutorial-map" role="region" aria-label="{tool} output">'
+        f'<span class="compare-badge">{tool}</span></div>' for tool in ['tylertoo', 'tippecanoe']], '</div>',
+        '<p class="tutorial-map-caption">Base map: <a href="https://openfreemap.org/">OpenFreeMap</a>, '
+        '© <a href="https://www.openmaptiles.org/">OpenMapTiles</a>, '
+        '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>.</p>']
+    return '\n'.join([*out, '</select>', '', *maps, '',
+                      '<details markdown><summary>Download the archives</summary>', '',
+                      table(['Dataset', 'tylertoo archive', 'tippecanoe archive'], rows), '',
+                      f'_Run: {run_text(r)}._', '', '</details>'])
 
 
 RENDERERS = {
