@@ -64,8 +64,9 @@ for recognized schemas.
 
 Use [`--magnitude-ladder`](cli.md#option-magnitude-ladder) with [`--ladder-step`](cli.md#option-ladder-step) when property values should
 enter at successive zooms. Use [`--entry-zoom`](cli.md#option-entry-zoom) when you need explicit entry
-zooms per value. Promoted features bypass ordinary thinning; check that the
-result still fits your tile budget.
+zooms per value. These features skip the visibility gate and cell thinning,
+so check that the result still fits your tile budget. The density budget can
+still drop them unless `--sort-key` ranks on the same column.
 
 ## Geometry detail
 
