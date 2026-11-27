@@ -41,7 +41,12 @@ Where a section below disagrees with this section, this section wins.
 - **Writing order in Phase 2.** Code-side prerequisites, tutorials, guides and
   deletions, tuning page, then benchmarks. One PR, one commit per section.
 
-### Needs the maintainer
+### Decided by the maintainer on 2026-11-27
+
+Rows 1, 2, 4, 6, 7, and 8 below are approved as recommended. For row 8, the
+memory preflight message prints the calculation for the user's data from the
+constants, and the tuning page explains the remedies in words only. The other
+rows follow their recommendation unless the maintainer says otherwise.
 
 | # | Section | Decision | Recommendation |
 |---|---|---|---|
