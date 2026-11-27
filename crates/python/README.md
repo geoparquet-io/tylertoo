@@ -18,12 +18,12 @@ pip install tylertoo      # Python API, and the CLI as `tylertoo` or `python -m 
 
 ## Quickstart
 
-Tile 17,465 Madagascar boundary polygons (28 MB) into a PMTiles archive:
+Tile 17,465 Madagascar boundary polygons (17 MB) into a PMTiles archive:
 
 ```bash
 cargo install tylertoo
 repo=https://github.com/geoparquet-io/tylertoo
-file=fieldmaps-madagascar-adm4.parquet
+file=fieldmaps-madagascar-adm4-hilbert.parquet
 curl -LO "$repo/releases/download/fixtures-v1/$file"
 tylertoo "$file" madagascar.pmtiles --max-zoom 10
 ```
@@ -33,7 +33,7 @@ Or in Python:
 ```python
 import tylertoo
 
-tylertoo.overview("fieldmaps-madagascar-adm4.parquet", "madagascar-ov.parquet", max_zoom=10)
+tylertoo.overview("fieldmaps-madagascar-adm4-hilbert.parquet", "madagascar-ov.parquet", max_zoom=10)
 tylertoo.export_pmtiles("madagascar-ov.parquet", "madagascar.pmtiles")
 ```
 

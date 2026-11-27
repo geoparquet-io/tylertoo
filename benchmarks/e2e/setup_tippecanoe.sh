@@ -9,8 +9,8 @@
 # 2.79.0 installed but shadowed. Two tippecanoes, eight years of tiling changes
 # between them, and the harness would silently have picked the wrong one.
 #
-# So: clone felt/tippecanoe at a pinned TAG, verify the commit SHA matches the
-# one recorded here, build it into the repo-root .tools/ (next to go-pmtiles;
+# So: fetch felt/tippecanoe at a pinned commit SHA (TAG is its version label),
+# verify the checkout is that commit, build it into the repo-root .tools/ (next to go-pmtiles;
 # TIPPECANOE_TOOLS_DIR overrides), and record version + SHA in
 # tippecanoe.lock.json, which run_e2e.py copies into every result file.
 #
@@ -42,10 +42,13 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 TOOLS="${TIPPECANOE_TOOLS_DIR:-$ROOT/.tools}"
 
 # --- the pin -----------------------------------------------------------------
-# felt/tippecanoe 2.79.0, published 2025-07-24, the latest release as of
-# 2026-09-26. Verified: `gh api repos/felt/tippecanoe/git/ref/tags/2.79.0`.
-DEFAULT_TAG="2.79.0"
-DEFAULT_SHA="68ab8dcc229f95b8b25877697d5e8d66783af503"
+# felt/tippecanoe v2.82.0: commit 4f26211 (2026-08-14) sets VERSION to
+# v2.82.0 in version.hpp, and felt published no git tag for it, so the pin is
+# the commit and "2.82.0" is only its label. The tippecanoe preset
+# (crates/core/src/overview/config/preset.rs) cites this commit. Verified:
+# `gh api "repos/felt/tippecanoe/commits?path=version.hpp"`.
+DEFAULT_TAG="2.82.0"
+DEFAULT_SHA="4f2621186acfec33b63ddf636f665623c0fef2dd"
 if [ -n "${TIPPECANOE_TAG:-}" ] && [ -z "${TIPPECANOE_SHA:-}" ]; then
   echo "ERROR: TIPPECANOE_TAG=$TIPPECANOE_TAG was set without TIPPECANOE_SHA." >&2
   echo "       A re-pin must name the commit it expects the tag to resolve to:" >&2
@@ -106,7 +109,10 @@ else
   if [ ! -d "$SRC/.git" ]; then
     echo "cloning $TIPPECANOE_REPO @ $TIPPECANOE_TAG ..."
     rm -rf "$SRC"
-    git clone --quiet --depth 1 --branch "$TIPPECANOE_TAG" "$TIPPECANOE_REPO" "$SRC"
+    # Fetch the pinned commit itself: a release need not have a git tag.
+    git init --quiet "$SRC"
+    git -C "$SRC" fetch --quiet --depth 1 "$TIPPECANOE_REPO" "$TIPPECANOE_SHA"
+    git -C "$SRC" checkout --quiet --detach FETCH_HEAD
   fi
 
   # Verify BEFORE building: nothing from an unverified checkout gets compiled.

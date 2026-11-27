@@ -647,7 +647,7 @@ own archives go through `pmtiles verify`. The tippecanoe-made
 
 `.github/workflows/tippecanoe-compare.yml` runs on every PR, on each
 push to `main`, and weekly. It tiles the fixtures-v1 inputs with tylertoo
-and with tippecanoe 2.79.0, built from source at a pinned tag and commit.
+and with tippecanoe 2.82.0, built from source at a pinned commit.
 It decodes both archives with independent readers and gates the per-zoom
 ratios of tiles, features, distinct IDs, vertices, and bytes against
 `benchmarks/e2e/tippecanoe_tolerances.toml`.
