@@ -270,6 +270,10 @@ fn pyramid_error_to_py(e: PyramidError) -> PyErr {
 
 /// The cause chain is kept, since `DecodeError` leaves it out of its own
 /// `Display` (#396).
+fn bake_error_to_py(e: tylertoo_core::BakeError) -> PyErr {
+    to_py(e.kind(), with_sources(&e), Some("bake"))
+}
+
 fn decode_error_to_py(e: DecodeError) -> PyErr {
     to_py(e.kind(), with_sources(&e), Some("decode"))
 }
@@ -603,6 +607,29 @@ fn decode(
 }
 }
 
+signature_bake! {
+fn bake(py: Python<'_>, geoparquet: &str, archive: &str, output: &str) -> PyResult<Py<PyDict>> {
+    enter(py);
+    let (geoparquet, archive, output) =
+        (PathBuf::from(geoparquet), PathBuf::from(archive), PathBuf::from(output));
+    let report = py
+        .detach(|| tylertoo_core::bake(&geoparquet, &archive, &output))
+        .map_err(bake_error_to_py)?;
+    report_dict(py, &report)
+}
+}
+
+signature_strip! {
+fn strip(py: Python<'_>, baked: &str, output: &str) -> PyResult<Py<PyDict>> {
+    enter(py);
+    let (baked, output) = (PathBuf::from(baked), PathBuf::from(output));
+    let report = py
+        .detach(|| tylertoo_core::strip(&baked, &output))
+        .map_err(bake_error_to_py)?;
+    report_dict(py, &report)
+}
+}
+
 signature_stats! {
 fn stats(
     py: Python<'_>,
@@ -760,6 +787,8 @@ fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(export_pmtiles, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(decode, m)?)?;
+    m.add_function(wrap_pyfunction!(bake, m)?)?;
+    m.add_function(wrap_pyfunction!(strip, m)?)?;
     m.add_function(wrap_pyfunction!(pyramid, m)?)?;
     m.add_function(wrap_pyfunction!(stats, m)?)?;
     m.add_function(wrap_pyfunction!(serve, m)?)?;

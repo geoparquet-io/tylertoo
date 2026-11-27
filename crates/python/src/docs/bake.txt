@@ -1,0 +1,27 @@
+Bake a PMTiles archive into a copy of a GeoParquet file.
+
+The archive goes between the data and the footer, and the footer gains
+a `geo:pmtiles` entry that points at it. Nothing before the archive
+moves, so Parquet readers (DuckDB, GDAL, `pyarrow`) see the original
+GeoParquet, while `stats()`, `decode()`, and `serve()` read the tiles.
+`strip()` gives back the original file. The output is overwritten if
+it exists.
+
+Args:
+    geoparquet: GeoParquet file to copy.
+    archive: PMTiles archive to bake in.
+    output: GeoParquet file to write.
+
+Returns:
+    Where the archive sits in the output (`offset`, `length`), and the
+    output's size.
+
+Raises:
+    ValueError: Not a GeoParquet file, or a file that already holds a
+        baked archive.
+    RuntimeError: Not a PMTiles archive, or reading or writing failed.
+
+Example:
+    >>> report = bake("buildings.parquet", "buildings.pmtiles", "baked.parquet")
+    >>> report["archive"]["offset"] > 0
+    True

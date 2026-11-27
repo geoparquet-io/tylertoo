@@ -319,6 +319,12 @@ pub struct TilesOptions {
     #[cfg_attr(feature = "cli", arg(long, value_name = "PATH"))]
     #[cfg_attr(feature = "cli", arg(help = "Save the intermediate overview GeoParquet to PATH after export. Does not change the PMTiles output", long_help = None))]
     pub keep_overview: Option<PathBuf>,
+    /// Also write a copy of the input GeoParquet with the archive baked in
+    /// (`geo:pmtiles`) at this path, so one file serves both analysis and
+    /// the map. Needs a single local input file; see [`crate::bake`].
+    #[cfg_attr(feature = "cli", arg(long, value_name = "PATH"))]
+    #[cfg_attr(feature = "cli", arg(help = "Also write a copy of the input GeoParquet with the PMTiles archive baked in to PATH. Parquet readers see the original file; `serve`, `stats` and `decode` read the tiles. Needs a single local input file", long_help = None))]
+    pub bake: Option<PathBuf>,
     /// The codec of the temporary intermediate overview. Default
     /// [`OverviewCodec::Lz4`]: 5-7% less user CPU than ZSTD for a file
     /// 1.4-1.6x larger. [`OverviewCodec::Zstd`] suits a host short of temp
@@ -350,6 +356,7 @@ with_setters!(TilesOptions {
     with_layer_name => layer_name: Option<String>,
     with_layer_column => layer_column: Option<String>,
     with_keep_overview => keep_overview: Option<PathBuf>,
+    with_bake => bake: Option<PathBuf>,
     with_temp_compression => temp_compression: OverviewCodec,
     with_shard => shard: Option<TilesShard>,
     with_cell_bands => cell_bands: Vec<CellBand>,
@@ -369,6 +376,7 @@ impl Default for TilesOptions {
             layer_name: None,
             layer_column: None,
             keep_overview: None,
+            bake: None,
             temp_compression: OverviewCodec::Lz4,
             shard: None,
             cell_bands: Vec::new(),
@@ -523,6 +531,7 @@ impl TilesOptions {
             ("--feature-order", e.feature_order != defaults.feature_order),
             ("--feature-id", e.feature_id.is_some()),
             ("--keep-overview", self.keep_overview.is_some()),
+            ("--bake", self.bake.is_some()),
             ("--tile-range", e.tile_range.is_some()),
         ]
         .into_iter()
@@ -600,6 +609,9 @@ impl TilesOptions {
             self.check_layer_column(column)?;
         }
         check_keep_overview(self.keep_overview.as_deref())?;
+        if self.bake.is_some() && self.shard.is_some() {
+            return Err(ConfigError::BakeSharded.into());
+        }
         // #386/#443: the property selection is applied at convert, so an
         // excluded column is already gone from the intermediate before export
         // would sort or id by it.
@@ -965,6 +977,9 @@ pub enum TilesError {
     /// The [`TilesOptions::layer_column`] split failed (#821).
     #[error(transparent)]
     LayerColumn(#[from] super::layer_column::LayerColumnError),
+    /// Baking the archive into the input ([`TilesOptions::bake`]) failed.
+    #[error("bake failed: {0}")]
+    Bake(#[from] crate::baked::BakeError),
     /// One layer of a [`TilesOptions::layer_column`] run failed.
     #[error("layer {layer:?}: {source}")]
     #[non_exhaustive]
@@ -1008,6 +1023,7 @@ impl crate::error::Classify for TilesError {
             TilesError::LayerColumn(e) => e.kind(),
             TilesError::Layer { source, .. } | TilesError::CellBand { source, .. } => source.kind(),
             TilesError::Merge(e) => e.kind(),
+            TilesError::Bake(e) => e.kind(),
             _ => crate::error::fallback_kind(self),
         }
     }
@@ -1156,13 +1172,51 @@ pub fn convert_to_pmtiles_observed(
     observer: &mut dyn TilesObserver,
 ) -> Result<TilesOutcome, TilesError> {
     let config = options.validate()?;
-    if let Some(column) = &options.layer_column {
-        return super::layer_column::convert_by_layer(input, output, options, column);
+    let bake = options
+        .bake
+        .as_deref()
+        .map(|target| bake_source(input, output, target))
+        .transpose()?;
+    let outcome = if let Some(column) = &options.layer_column {
+        super::layer_column::convert_by_layer(input, output, options, column)
+    } else if !options.cell_bands.is_empty() {
+        convert_with_cells(input, || input.source(), output, options, observer)
+    } else {
+        convert_to_pmtiles_validated(input, || input.source(), output, &config, observer)
+    }?;
+    if let (Some(source), Some(target)) = (bake, options.bake.as_deref()) {
+        crate::baked::bake(source, output, target)?;
     }
-    if !options.cell_bands.is_empty() {
-        return convert_with_cells(input, || input.source(), output, options, observer);
+    Ok(outcome)
+}
+
+/// The GeoParquet file a [`TilesOptions::bake`] copy is made from, checked
+/// before any work: a single local file, distinct from both outputs, whose
+/// bake target can be written.
+fn bake_source<'a>(
+    input: &'a TilesInput,
+    output: &Path,
+    target: &Path,
+) -> Result<&'a Path, TilesError> {
+    let refuse = |input: &Path| ConfigError::BakeNeedsLocalFile {
+        input: input.to_path_buf(),
+    };
+    let path = match input {
+        TilesInput::Path(p) if p.is_file() && !p.to_string_lossy().contains("://") => p.as_path(),
+        TilesInput::Path(p) | TilesInput::Manifest(p) => return Err(refuse(p).into()),
+    };
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if same(target, path) || same(target, output) {
+        return Err(ConfigError::BakeOverwritesInput {
+            path: target.to_path_buf(),
+        }
+        .into());
     }
-    convert_to_pmtiles_validated(input, || input.source(), output, &config, observer)
+    crate::atomic_output::check_writable(target)?;
+    Ok(path)
 }
 
 /// The facade over `open`'s source (the test seam: [`TilesInput::source`]

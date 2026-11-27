@@ -62,6 +62,9 @@ use parquet::schema::types::SchemaDescriptor;
 
 use crate::Error as InputError;
 
+mod key_values;
+pub use key_values::{footer_key_values, FooterKeyValue, FooterKeyValues};
+
 // ============================================================================
 // Panic boundary
 // ============================================================================

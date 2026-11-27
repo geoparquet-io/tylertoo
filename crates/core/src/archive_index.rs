@@ -204,6 +204,10 @@ pub fn usable_bounds(header: &Header) -> Option<TileBounds> {
 )]
 pub(crate) struct FileBytes {
     file: File,
+    /// Where the archive starts in the file: 0 for a PMTiles file, the
+    /// `geo:pmtiles` offset for an archive baked into GeoParquet.
+    base: u64,
+    /// The archive's length, which is the file's for a PMTiles file.
     len: u64,
     bytes_read: atomic::AtomicU64,
 }
@@ -217,11 +221,52 @@ impl FileBytes {
     pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
+        let (base, len) = match baked_window(&file, path, len)? {
+            Some(archive) => (archive.offset, archive.length),
+            None => (0, len),
+        };
         Ok(FileBytes {
             file,
+            base,
             len,
             bytes_read: atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Where the archive sits in the file: `(offset, length)`.
+    pub(crate) fn window(&self) -> (u64, u64) {
+        (self.base, self.len)
+    }
+}
+
+/// The archive baked into `file` when it is Parquet (it starts with `PAR1`,
+/// which no PMTiles archive does), else `None`: every PMTiles reader in the
+/// crate opens through [`FileBytes`], so each reads a baked GeoParquet file
+/// like the archive it carries.
+fn baked_window(
+    file: &File,
+    path: &Path,
+    len: u64,
+) -> std::io::Result<Option<crate::baked::BakedArchive>> {
+    let mut magic = [0u8; 4];
+    if len < 4 || read_exact_at(file, &mut magic, 0).is_err() || &magic != b"PAR1" {
+        return Ok(None);
+    }
+    let mut read_at = |offset, buf: &mut [u8]| read_exact_at(file, buf, offset);
+    match crate::baked::locate_with(path, len, &mut read_at) {
+        Ok(Some(archive)) => Ok(Some(archive)),
+        Ok(None) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "a Parquet file without a baked PMTiles archive (no \"{}\" footer entry); \
+                 bake one with `tylertoo bake`",
+                crate::baked::BAKED_KEY
+            ),
+        )),
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.to_string(),
+        )),
     }
 }
 
@@ -273,7 +318,7 @@ impl ArchiveBytes for FileBytes {
 
     fn read_range(&self, offset: usize, len: usize) -> Result<std::borrow::Cow<'_, [u8]>> {
         let mut buf = vec![0u8; len];
-        read_exact_at(&self.file, &mut buf, offset as u64)?;
+        read_exact_at(&self.file, &mut buf, self.base + offset as u64)?;
         self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
         Ok(std::borrow::Cow::Owned(buf))
     }
@@ -384,6 +429,13 @@ impl ArchiveIndex {
             metadata_raw,
             bounds,
         })
+    }
+
+    /// Where the archive sits in its file, as `(offset, length)`: `(0, file
+    /// length)` for a PMTiles file, the `geo:pmtiles` entry's for an archive
+    /// baked into GeoParquet.
+    pub fn window(&self) -> (u64, u64) {
+        self.src.window()
     }
 
     /// The archive's path, for error messages.

@@ -92,6 +92,13 @@ enum Command {
     ExportPmtiles(Box<ExportPmtilesArgs>),
     /// Decode a PMTiles vector-tile archive back to GeoParquet.
     Decode(DecodeArgs),
+    /// Bake a PMTiles archive into a GeoParquet file, or strip it back out.
+    ///
+    /// The archive goes between the data and the footer, and the footer
+    /// gains a `geo:pmtiles` entry that points at it. Parquet readers see
+    /// the original GeoParquet; `serve`, `stats`, `decode` and `merge` read
+    /// the tiles. `--strip` gives back the original file, byte for byte.
+    Bake(BakeArgs),
     /// Report per-zoom tile sizes and optional per-layer stats for a PMTiles archive.
     Stats(StatsArgs),
     /// Build one archive from several inputs, each owning a zoom range.
@@ -281,6 +288,31 @@ struct DecodeArgs {
     files_from: Option<PathBuf>,
 }
 
+/// Arguments for `tylertoo bake`.
+#[derive(Parser, Debug)]
+struct BakeArgs {
+    /// GeoParquet file to bake the archive into, or with `--strip`, a
+    /// baked file.
+    #[arg(value_name = "GEOPARQUET")]
+    input: PathBuf,
+
+    /// PMTiles archive to bake. Omit it with `--strip`.
+    #[arg(value_name = "ARCHIVE", required_unless_present = "strip")]
+    archive: Option<PathBuf>,
+
+    /// Output GeoParquet file.
+    #[arg(short, long, value_name = "OUTPUT")]
+    output: PathBuf,
+
+    /// Remove the baked archive instead, giving back the original file.
+    #[arg(long, conflicts_with = "archive")]
+    strip: bool,
+
+    /// Overwrite the output if it exists.
+    #[arg(short, long)]
+    force: bool,
+}
+
 /// Arguments for `tylertoo shard-plan`, step 0 of a sharded build.
 ///
 /// Reads Parquet footers only, so planning a large input takes seconds.
@@ -454,6 +486,7 @@ where
         Command::Validate(args) => run_validate(args),
         Command::ExportPmtiles(args) => run_export_pmtiles(*args),
         Command::Decode(args) => run_decode(args),
+        Command::Bake(args) => run_bake(&args),
         Command::Stats(args) => run_stats(args),
         Command::Pyramid(args) => run_pyramid(*args),
         Command::Merge(args) => run_merge(args),
@@ -1113,6 +1146,9 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // which on a large input runs for minutes before the export would
     // otherwise refuse a knob; core re-checks inside the facade.
     let mut tiles_options = tiles_options(&args)?;
+    if let Some(bake) = &tiles_options.bake {
+        config::check_output(bake, OutputKind::GeoParquet, args.force)?;
+    }
     resolve_tiles_job(&args, &spec, &mut tiles_options)?;
     let squares = makes_placeholder_squares(&tiles_options.convert);
     let input = tiles_input(&spec);
@@ -1207,6 +1243,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             TilesOutcome::Layered(report) => {
                 let name = output.file_name().unwrap_or_default().to_string_lossy();
                 print_layered(&report, &spec.label(), &name);
+                say_baked(tiles_options.bake.as_deref(), &output);
                 if let Some(report_path) = &args.report {
                     write_report(report_path, &*report)?;
                 }
@@ -1279,6 +1316,8 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         }
     }
 
+    say_baked(tiles_options.bake.as_deref(), &output);
+
     // The combined report so the one-step run captures both halves the
     // two-step chain would write (`overview --report` + `export-pmtiles
     // --report`). Core owns its shape ({"convert", "export"}).
@@ -1287,6 +1326,22 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The `tiles --bake` line: where the baked copy went and where its
+/// archive sits in it.
+fn say_baked(bake: Option<&Path>, archive: &Path) {
+    let Some(bake) = bake else { return };
+    match tylertoo_core::locate_baked(bake) {
+        Ok(Some(at)) => say!(
+            "✓ Baked {} into {} ({} at byte {})",
+            archive.file_name().unwrap_or_default().to_string_lossy(),
+            bake.display(),
+            HumanBytes(at.length),
+            format_number(at.offset)
+        ),
+        _ => say!("✓ Baked {} into {}", archive.display(), bake.display()),
+    }
 }
 
 /// The `tiles --layer-column` summary (#821): a line per layer, then totals.
@@ -1852,6 +1907,28 @@ fn run_merge(args: MergeArgs) -> Result<()> {
 
 /// Run `tylertoo decode`: PMTiles → GeoParquet (thin facade over
 /// `tylertoo_core::internal::decode::decode_pmtiles`).
+fn run_bake(args: &BakeArgs) -> Result<()> {
+    config::check_output(&args.output, OutputKind::GeoParquet, args.force)?;
+    require_single_local_file(&args.input, "bake")?;
+    let report = match &args.archive {
+        Some(archive) if !args.strip => {
+            require_single_local_file(archive, "bake")?;
+            tylertoo_core::bake(&args.input, archive, &args.output)?
+        }
+        _ => tylertoo_core::strip(&args.input, &args.output)?,
+    };
+    let verb = if args.strip { "Stripped" } else { "Baked" };
+    say!(
+        "✓ {verb} {} → {} ({} archive at byte {}, {} written)",
+        args.input.display(),
+        args.output.display(),
+        HumanBytes(report.archive.length),
+        format_number(report.archive.offset),
+        HumanBytes(report.output_bytes)
+    );
+    Ok(())
+}
+
 fn run_decode(args: DecodeArgs) -> Result<()> {
     use tylertoo_core::internal::decode::{decode_pmtiles, DecodeOptions};
 
@@ -1925,14 +2002,20 @@ fn run_stats(args: StatsArgs) -> Result<()> {
 
     let archive = ArchiveIndex::open(&args.archive).map_err(|e| {
         // `ArchiveIndex` reports read failures as "Failed to read PMTiles:
-        // ..."; for a file that is not an archive at all, say so plainly.
-        let not_pmtiles = std::fs::File::open(&args.archive)
-            .and_then(|mut f| {
-                let mut magic = [0u8; 7];
-                std::io::Read::read_exact(&mut f, &mut magic).map(|()| magic != *b"PMTiles")
-            })
-            .unwrap_or(args.archive.is_file());
-        if not_pmtiles {
+        // ..."; for a file that is not an archive at all, say so plainly. A
+        // Parquet file may carry one baked in, and the error says why not.
+        let magic = std::fs::File::open(&args.archive).and_then(|mut f| {
+            let mut magic = [0u8; 7];
+            std::io::Read::read_exact(&mut f, &mut magic).map(|()| magic)
+        });
+        let parquet = magic.as_ref().is_ok_and(|m| m[..4] == *b"PAR1");
+        let not_pmtiles = magic.map_or(args.archive.is_file(), |m| m != *b"PMTiles");
+        if parquet {
+            anyhow::anyhow!(
+                "{} is not a PMTiles v3 archive: {e}",
+                args.archive.display()
+            )
+        } else if not_pmtiles {
             anyhow::anyhow!(
                 "{} is not a PMTiles v3 archive (missing the PMTiles magic): {e}",
                 args.archive.display()
