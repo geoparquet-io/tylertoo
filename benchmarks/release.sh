@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Manual release tier. Estimated box wall: build 3 min; tippecanoe 0-10 min;
-# corpus ~40 min; cells ~20 min; Africa ~54 min; upload ~5 min; docs ~1 min.
+# corpus ~40 min; cells ~20 min; Africa ~54 min; tutorial-map 20-35 min (untimed);
+# upload ~5 min; docs ~1 min. About 2.5 h in all; --skip africa saves about 1 h.
 # Corpus: one warm-up + three alternating rounds per tool (median of three).
 # Cells: manifest defaults. Africa: one default-profile run, no warm-up.
 # All scratch I/O lives under --data (default: ${TYLERTOO_BENCH_DATA:-$HOME/bench-data}).
