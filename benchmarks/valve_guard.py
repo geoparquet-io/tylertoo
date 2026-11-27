@@ -78,6 +78,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import run_manifest as rm  # noqa: E402
+from run_manifest import host_class_key  # noqa: E402
 BASELINE = HERE / "baseline" / "valve_guard.json"
 
 RATIO_WALL_MAX = 1.8
@@ -125,11 +126,6 @@ CELLS = {
     "moldova-tiles": ("mim", "moldova", []),
 }
 RATIO_PAIRS = [("792-def", "792-drop"), ("792-def-glibc", "792-drop-glibc")]
-
-
-def host_class_key(host: dict) -> str:
-    """The baseline file's key for a host class (run_manifest.host_class)."""
-    return f"{host['machine']}/{host['cpu_model']}/{host['cpus']}"
 
 
 def command(cell: str, bins: dict, work: Path, prepared: dict) -> list[str]:

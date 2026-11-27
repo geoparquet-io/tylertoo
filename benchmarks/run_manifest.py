@@ -104,7 +104,11 @@ LOAD_OWN_S = 240.0  # how long our own run keeps the 1-min load average up
 GATE_SAMPLE_S = 3.0
 GATE_POLL_S = 15.0
 MIN_PAIRS = 3
+BASELINE_WALL_MAX = 1.40
+BASELINE_RSS_MAX = 1.20
 CLK_TCK = os.sysconf("SC_CLK_TCK")
+PROVENANCE_KEYS = ("commit", "tylertoo_version", "host", "nproc", "kernel", "allocator",
+                   "tool_versions", "inputs", "date", "git_describe", "host_class", "release_version")
 
 
 # --- manifest ---------------------------------------------------------------
@@ -180,7 +184,7 @@ def zoom_flags(spec: dict) -> list[str]:
 
 
 def expand(template: list[str], subs: dict[str, str]) -> list[str]:
-    """Fill `{input}`, `{files_from}`, `{out}` and `{setup}` in each argument."""
+    """Fill the manifest's input, file-list, directory, output, and setup placeholders."""
     out = []
     for arg in template:
         for key, val in subs.items():
@@ -422,6 +426,50 @@ def host_class() -> dict:
     return {"machine": platform.machine(), "cpu_model": model, "cpus": os.cpu_count()}
 
 
+def host_class_key(host: dict | None = None) -> str:
+    """The baseline file's key for a host class; defaults to this runner."""
+    host = host if host is not None else host_class()
+    return f"{host['machine']}/{host['cpu_model']}/{host['cpus']}"
+
+
+def release_version(root: Path) -> str | None:
+    """Workspace version at its release tag or in a clean release candidate."""
+    with (root / "Cargo.toml").open("rb") as f:
+        version = tomllib.load(f)["workspace"]["package"]["version"]
+
+    def git(*args: str) -> str | None:
+        try:
+            res = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                                 text=True, timeout=30, check=False)  # noqa: S603
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return res.stdout if res.returncode == 0 else None
+
+    head = git("rev-parse", "HEAD")
+    status = git("status", "--porcelain", "-z", "--untracked-files=all")
+    if not head or status is None:
+        return None
+    # NUL-delimited porcelain preserves spaces and exposes both paths of a rename.
+    entries = iter(status.split("\0"))
+    paths = []
+    for entry in entries:
+        if not entry:
+            continue
+        paths.append(entry[3:])
+        if "R" in entry[:2] or "C" in entry[:2]:
+            paths.append(next(entries, ""))
+    if any(not (p.startswith(("benchmarks/results/", "docs/")) or p == "README.md"
+                or re.fullmatch(r"crates/[^/]+/README\.md", p)) for p in paths):
+        return None
+    tags = git("tag", "--list", f"v{version}")
+    if tags is None:
+        return None
+    if not tags.strip():
+        return version
+    tag = git("rev-parse", "--verify", f"refs/tags/v{version}^{{commit}}")
+    return version if tag is not None and tag.strip() == head.strip() else None
+
+
 def _out(argv: list[str]) -> str | None:
     """First line of a command's output, or None when it cannot run."""
     try:
@@ -440,6 +488,7 @@ def provenance(bins: list[dict], inputs: dict) -> dict:
     Unknown values are null."""
     head = bins[-1]
     h = host_class()
+    versions = {b["label"]: _out([b["path"], "--version"]) for b in bins}
     ins = []
     for name, inp in inputs.items():
         rec = {"name": name, "sha256": inp["sha256"]}
@@ -451,14 +500,17 @@ def provenance(bins: list[dict], inputs: dict) -> dict:
         ins.append(rec)
     return {
         "commit": _out(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"]),
-        "tylertoo_version": _out([head["path"], "--version"]),
+        "tylertoo_version": versions[head["label"]],
         "host": f"{h['machine']}, CPU {h['cpu_model'] or 'unknown'}, {h['cpus']} CPUs",
         "nproc": os.cpu_count(),
         "kernel": platform.release(),
         "allocator": head["allocator"],
-        "tool_versions": {b["label"]: _out([b["path"], "--version"]) for b in bins},
+        "tool_versions": versions,
         "inputs": ins,
         "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "git_describe": _out(["git", "-C", str(ROOT), "describe", "--tags", "--always", "--dirty"]),
+        "host_class": host_class_key(h),
+        "release_version": release_version(ROOT),
     }
 
 
@@ -962,14 +1014,24 @@ class Runner:
         write_report(self.results)
 
     def substitutions(self, name: str, local: list[Path], server: Server | None) -> dict:
-        """`{input}` and `{files_from}`: local paths, or served URLs."""
+        """Input paths or URLs, a file list, and a scratch directory of input symlinks."""
         if server:
             refs = [server.url(p.name) for p in local]
         else:
             refs = [str(p) for p in local]
         lists = self.results / name / "files_from.txt"
         lists.write_text("".join(r + "\n" for r in refs))
-        return {"input": refs[0], "files_from": str(lists)}
+        subs = {"input": refs[0], "files_from": str(lists)}
+        cell = self.m["cells"][name]
+        if any("{inputs_dir}" in arg for arg in cell["args"] + cell["flags"]):
+            directory = self.bench_out / self.args.name / name / "inputs"
+            directory.mkdir(parents=True, exist_ok=True)
+            for inp, path in zip(cell_input_names(cell), local, strict=True):
+                link = directory / self.m["inputs"][inp]["file"]
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(path.resolve())
+            subs["inputs_dir"] = str(directory)
+        return subs
 
     def setup(self, name: str, cell: dict, subs: dict, sdir: Path) -> Path:
         """Run the cell's untimed setup with the first binary, in the cell's
@@ -1231,8 +1293,13 @@ def write_results_json(results: Path, out: Path) -> None:
     provenance and, per cell, the summary of every binary."""
     bins = json.loads((results / "binaries.json").read_text())
     prov_path = results / "provenance.json"
+    # Older runs have no release identity. Leave unknown fields null rather than
+    # assigning the checkout or host that happens to generate their report.
+    prov = dict.fromkeys(PROVENANCE_KEYS)
+    if prov_path.exists():
+        prov.update(json.loads(prov_path.read_text()))
     doc = {
-        "provenance": json.loads(prov_path.read_text()) if prov_path.exists() else None,
+        "provenance": prov,
         "run": results.name,
         "binaries": [{k: b.get(k) for k in BUILD_KEYS} for b in bins],
         "cells": {c.name: summarize(runs, bins)
@@ -1243,15 +1310,68 @@ def write_results_json(results: Path, out: Path) -> None:
     out.write_text(json.dumps(doc, indent=2) + "\n")
 
 
+def gate(args: argparse.Namespace) -> int:
+    """Compare head medians with base and the baseline for this runner's class."""
+    results = results_dir(args)
+    bins = json.loads((results / "binaries.json").read_text())
+    if not {args.base, args.head} <= {b["label"] for b in bins}:
+        raise ManifestError("gate requires both base and head binary labels")
+    baseline = json.loads(Path(args.baseline).read_text())
+    key = host_class_key()
+    matched = baseline.get("hosts", {}).get(key, {})
+    rows, recorded = [], {}
+    failed = False
+    for cdir in sorted(p for p in results.iterdir() if p.is_dir()):
+        runs = load_runs(cdir)
+        summary = summarize(runs, bins)
+        base, head = summary[args.base], summary[args.head]
+        bw, hw = (s["wall_s"]["median"] for s in (base, head))
+        bp, hp = (s["peak_rss_mib"]["median"] for s in (base, head))
+        bp, hp = (p * (1 << 20) if p is not None else None for p in (bp, hp))
+        valid = all(v is not None and v > 0 for v in (bw, hw, bp, hp))
+        wr, rr = (hw / bw, hp / bp) if valid else (None, None)
+        reasons = []
+        if not valid or any(s["statuses"] != ["ok"] for s in (base, head)):
+            reasons.append("measurements")
+        if valid and wr > args.wall_max:
+            reasons.append("wall")
+        if valid and rr > args.rss_max:
+            reasons.append("RSS")
+        if valid and cdir.name in matched:
+            entry = matched[cdir.name]
+            if hw > entry["wall_s"] * BASELINE_WALL_MAX:
+                reasons.append("baseline wall")
+            if hp > entry["peak_rss_bytes"] * BASELINE_RSS_MAX:
+                reasons.append("baseline RSS")
+        if valid and head["statuses"] == ["ok"]:
+            recorded[cdir.name] = {"wall_s": hw, "peak_rss_bytes": hp}
+        failed |= bool(reasons)
+        verdict = "FAIL (" + ", ".join(reasons) + ")" if reasons else "PASS"
+        values = [f"{v:.3f}" if v is not None else "-" for v in (bw, hw, wr, bp, hp, rr)]
+        rows.append((wr if wr is not None else float("inf"), f"| {cdir.name} | "
+                     + " | ".join(values) + f" | {verdict} |"))
+    print("| cell | base wall s | head wall s | ratio | base peak bytes | head peak bytes | ratio | verdict |")
+    print("|---|---:|---:|---:|---:|---:|---:|---|")
+    for _, row in sorted(rows, key=lambda r: r[0], reverse=True):
+        print(row)
+    if args.record_baseline:
+        baseline.setdefault("hosts", {}).setdefault(key, {}).update(recorded)
+        out = Path(args.record_baseline)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(baseline, indent=2) + "\n")
+    return int(failed or not rows)
+
+
 # --- CLI --------------------------------------------------------------------
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Subcommands: list, fetch, run, report."""
+    """List, fetch, run, report, gate, or identify a release candidate."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manifest", default=str(MANIFEST))
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="cells, inputs and sets")
+    sub.add_parser("release-version", help="print the workspace version for a release candidate")
     for name in ("fetch", "run", "report"):
         p = sub.add_parser(name)
         p.add_argument("--data", default="~/bench-data/manifest", help="inputs/, setup/, results/")
@@ -1284,7 +1404,24 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--no-gate", action="store_true",
                      help="record the load but never wait (dry runs on a busy host)")
     run.add_argument("--bench-out", default=str(ROOT / ".bench-out"), help="scratch for outputs, emptied per run")
+    g = sub.add_parser("gate", help="compare head medians against base and a matching host baseline")
+    g.add_argument("--data", default="~/bench-data/manifest")
+    g.add_argument("--name", required=True)
+    g.add_argument("--results")
+    g.add_argument("--wall-max", type=float, required=True)
+    g.add_argument("--rss-max", type=float, required=True)
+    g.add_argument("--baseline", required=True)
+    g.add_argument("--record-baseline")
+    g.add_argument("--base", default="base")
+    g.add_argument("--head", default="head")
     args = ap.parse_args(argv)
+    if args.cmd == "release-version":
+        version = release_version(ROOT)
+        if version is not None:
+            print(version)
+        return 0
+    if args.cmd == "gate":
+        return gate(args)
     manifest = load_manifest(Path(args.manifest))
     if args.cmd == "list":
         for name, c in manifest["cells"].items():
